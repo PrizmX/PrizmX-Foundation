@@ -220,3 +220,18 @@ private let expectedNodeCount = 2
     #expect(singRouter.rules.contains { $0.matcher == .geosite(tag: "cn") })
     #expect(singRouter.rules.contains { $0.matcher == .geoIP(code: "CN") })
 }
+
+@Test func engineFactoryFiltersNodeHostsFromFakeIP() throws {
+    let yaml = """
+    proxies:
+      - {name: HK01, type: anytls, server: node.example.sbs, port: 5868, password: x, sni: a.com}
+    proxy-groups:
+      - {name: Proxies, type: select, proxies: [HK01]}
+    rules:
+      - MATCH,Proxies
+    """
+    let engine = try EngineFactory.make(configText: yaml)
+    #expect(engine.dns.settings.fakeIPFilter.contains("node.example.sbs"))
+    // Built-ins stay.
+    #expect(engine.dns.settings.fakeIPFilter.contains("*.lan"))
+}

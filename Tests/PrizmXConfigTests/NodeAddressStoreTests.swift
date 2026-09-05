@@ -34,3 +34,35 @@ import PrizmXProtocols
     #expect(endpoints["other.example.sbs"] == [443])
     #expect(NodeAddressStore.nodeHostnames(in: yaml) == ["node.example.sbs", "other.example.sbs"])
 }
+
+@Test func orderedCandidatesPreferProvenGood() {
+    let good = PrizmXProtocols.IPv4Address(218, 245, 102, 118)
+    let oldPin = PrizmXProtocols.IPv4Address(203, 0, 113, 9)
+    let poisoned = PrizmXProtocols.IPv4Address(155, 254, 102, 209)
+    let ordered = NodeAddressStore.orderedCandidates(
+        good: [good],
+        previous: [oldPin],
+        publicAnswers: [poisoned],
+        captured: [poisoned],
+        system: [poisoned, good]
+    )
+    #expect(ordered == [good, oldPin, poisoned])
+}
+
+@Test func persistedGoodNodeAddressesReadsProxyServerPlane() throws {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dns-good-test-\(UUID().uuidString).json")
+    let payload = [
+        "proxy-server|node.example.sbs": ["218.245.102.118", "203.0.113.9"],
+        "direct|www.apple.com": ["17.1.1.1"],
+    ]
+    try JSONEncoder().encode(payload).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let good = DNSClient.persistedGoodNodeAddresses(url: url)
+    #expect(good["node.example.sbs"] == [
+        PrizmXProtocols.IPv4Address(218, 245, 102, 118),
+        PrizmXProtocols.IPv4Address(203, 0, 113, 9),
+    ])
+    #expect(good["www.apple.com"] == nil)
+}

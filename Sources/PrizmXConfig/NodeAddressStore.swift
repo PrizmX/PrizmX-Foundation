@@ -64,11 +64,12 @@ public enum NodeAddressStore: Sendable {
 
     /// Resolves every node hostname in `configText` from the **app** process.
     ///
-    /// Candidates are the union of three channels — public resolvers,
-    /// captured system DNS over UDP, and the process resolver — public
-    /// answers first. Like Clash/Surge, startup never probes: liveness is
-    /// established by url-test probing after the tunnel is up, and a stale
-    /// pin is healed by the extension's last-resort re-resolution.
+    /// Candidate order per host: proven-good dials (persisted by the
+    /// extension) → the previous pin file → public resolvers → captured
+    /// system DNS → process resolver. DNS answers are just candidates — a
+    /// proven address survives rotation / poisoning, and a fresh-but-dead
+    /// generation never displaces it. Like Clash/Surge, startup never
+    /// probes: liveness comes from url-test probing after the tunnel is up.
     public static func refresh(
         configText: String,
         nameservers: [String]
@@ -77,6 +78,8 @@ public enum NodeAddressStore: Sendable {
         guard !hosts.isEmpty else { return [:] }
         let publicDNS = DNSClient(settings: .bootstrap(physicalIPs: [], fallbackIPs: fallbackResolverIPs))
         let capturedDNS = DNSClient(settings: .bootstrap(physicalIPs: nameservers, fallbackIPs: []))
+        let good = DNSClient.persistedGoodNodeAddresses()
+        let previous = load()
         var map: [String: [PrizmXProtocols.IPv4Address]] = [:]
         await withTaskGroup(of: (String, [PrizmXProtocols.IPv4Address]).self) { group in
             for host in hosts {
@@ -84,13 +87,14 @@ public enum NodeAddressStore: Sendable {
                     async let publicAnswers = (try? await publicDNS.resolveAll(host, role: .proxyServer)) ?? []
                     async let capturedAnswers = (try? await capturedDNS.resolveAll(host, role: .proxyServer)) ?? []
                     async let systemAnswers = HostResolver.ipv4(host)
-                    var candidates: [PrizmXProtocols.IPv4Address] = []
-                    for list in [await publicAnswers, await capturedAnswers, await systemAnswers] {
-                        for address in list where !candidates.contains(address) {
-                            candidates.append(address)
-                        }
-                    }
-                    return (host, candidates)
+                    let ordered = orderedCandidates(
+                        good: good[host] ?? [],
+                        previous: previous[host] ?? [],
+                        publicAnswers: await publicAnswers,
+                        captured: await capturedAnswers,
+                        system: await systemAnswers
+                    )
+                    return (host, ordered)
                 }
             }
             for await (host, addresses) in group where !addresses.isEmpty {
@@ -101,6 +105,24 @@ public enum NodeAddressStore: Sendable {
         let preview = map.map { "\($0.key)→\($0.value.map(\.description))" }.sorted().joined(separator: ",")
         TunnelLog.write(.info, "app resolved \(map.count) node hosts \(preview)")
         return map
+    }
+
+    /// Candidate ordering for one node host: proven-good → previous pins →
+    /// public → captured → system, deduplicated, order preserved.
+    public static func orderedCandidates(
+        good: [PrizmXProtocols.IPv4Address],
+        previous: [PrizmXProtocols.IPv4Address],
+        publicAnswers: [PrizmXProtocols.IPv4Address],
+        captured: [PrizmXProtocols.IPv4Address],
+        system: [PrizmXProtocols.IPv4Address]
+    ) -> [PrizmXProtocols.IPv4Address] {
+        var merged: [PrizmXProtocols.IPv4Address] = []
+        for list in [good, previous, publicAnswers, captured, system] {
+            for address in list where !merged.contains(address) {
+                merged.append(address)
+            }
+        }
+        return merged
     }
 
     public static func nodeHostnames(in configText: String) -> [String] {

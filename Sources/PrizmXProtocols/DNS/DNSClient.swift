@@ -92,6 +92,27 @@ public final class DNSClient: Sendable {
         loadPersisted()
     }
 
+    /// Reads the persisted last-known-good node addresses (proxy-server
+    /// plane) written by the tunnel extension after successful dials.
+    /// The app's pin refresh leads with these: DNS answers are just
+    /// candidates — a proven address survives rotation / poisoning.
+    public static func persistedGoodNodeAddresses(
+        url: URL? = defaultPersistenceURL
+    ) -> [String: [IPv4Address]] {
+        guard let url,
+              let data = try? Data(contentsOf: url),
+              let dict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return [:] }
+        var result: [String: [IPv4Address]] = [:]
+        for (key, raw) in dict {
+            guard key.hasPrefix("proxy-server|") else { continue }
+            let addresses = raw.compactMap { IPv4Address(parsing: $0) }
+            if !addresses.isEmpty {
+                result[String(key.dropFirst("proxy-server|".count))] = addresses
+            }
+        }
+        return result
+    }
+
     /// App Group persistence used by the tunnel providers (survives process
     /// restarts; a proven edge outlives any single tunnel session).
     public static var defaultPersistenceURL: URL? {

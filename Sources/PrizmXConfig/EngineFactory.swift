@@ -28,8 +28,19 @@ public enum EngineFactory: Sendable {
         }
 
         let dnsSection = configText.flatMap { ClashDNSSection.parse(from: $0) }
+        var dnsSettings = DNSSettings.fromClash(section: dnsSection, systemDNS: systemDNS)
+        // Node server domains never receive fake IPs: an app-side lookup
+        // (node ping, subscription refresh) must not loop into the tunnel.
+        let nodeHosts = parsed.1.nodesByID.values.compactMap { node -> String? in
+            guard case .domain(let domain) = node.probeEndpoint?.host else { return nil }
+            return domain.lowercased()
+        }
+        var seenFilters = Set(dnsSettings.fakeIPFilter)
+        dnsSettings.fakeIPFilter.append(
+            contentsOf: nodeHosts.filter { seenFilters.insert($0).inserted }
+        )
         let dns = DNSClient(
-            settings: .fromClash(section: dnsSection, systemDNS: systemDNS),
+            settings: dnsSettings,
             persistenceURL: DNSClient.defaultPersistenceURL,
             pinnedNodeAddresses: pinnedNodeAddresses
         )
