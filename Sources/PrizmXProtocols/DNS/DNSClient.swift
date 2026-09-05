@@ -48,6 +48,13 @@ public final class DNSClient: Sendable {
     /// *successful dial*, so forged/poisoned answers can never get in.
     private let good = OSAllocatedUnfairLock<[CacheKey: (addresses: [IPv4Address], touched: Date)]>(initialState: [:])
     private let persistenceURL: URL?
+    /// Test seam: replaces the nameserver transport factory (the real one
+    /// rejects loopback nameservers, which local test responders need).
+    var transportFactory: (@Sendable (NameserverEndpoint) -> (any NameserverTransport)?)? {
+        get { transportFactoryLock.withLock { $0 } }
+        set { transportFactoryLock.withLock { $0 = newValue } }
+    }
+    private let transportFactoryLock = OSAllocatedUnfairLock<(@Sendable (NameserverEndpoint) -> (any NameserverTransport)?)?>(initialState: nil)
     /// Hostnames resolved in the **app** process (system DNS). First-class
     /// candidates for node dials — the extension must not re-guess them.
     private let pinned: [String: [IPv4Address]]
@@ -56,12 +63,24 @@ public final class DNSClient: Sendable {
     /// domains (the only answer gets filtered out forever).
     private let bad = OSAllocatedUnfairLock<[CacheKey: [IPv4Address: Date]]>(initialState: [:])
     private let badTTL: TimeInterval
+    /// Clean public resolvers queried when every pinned / configured answer
+    /// for a node hostname was marked bad — the Clash
+    /// `proxy-server-nameserver` safety net. Overrides are a test seam.
+    public let lastResortNameservers: [NameserverEndpoint]
+
+    /// CN-public resolvers that answer node hostnames without the carrier's
+    /// GeoDNS/poisoned view. UDP only: reachable from the extension without
+    /// bootstrap resolution.
+    public static var defaultLastResortNameservers: [NameserverEndpoint] {
+        ["223.5.5.5", "119.29.29.29"].compactMap { NameserverEndpoint.udp(ip: $0) }
+    }
 
     public init(
         settings: DNSSettings,
         persistenceURL: URL? = nil,
         pinnedNodeAddresses: [String: [IPv4Address]] = [:],
-        badTTL: TimeInterval = 60
+        badTTL: TimeInterval = 60,
+        lastResortNameservers: [NameserverEndpoint]? = nil
     ) {
         self.settings = settings
         self.persistenceURL = persistenceURL
@@ -69,6 +88,7 @@ public final class DNSClient: Sendable {
             ($0.key.lowercased(), $0.value)
         })
         self.badTTL = badTTL
+        self.lastResortNameservers = lastResortNameservers ?? Self.defaultLastResortNameservers
         loadPersisted()
     }
 
@@ -94,14 +114,29 @@ public final class DNSClient: Sendable {
             Task { _ = try? await lookupCached(key) }
             return preferred
         }
-        let answers = try await lookupCached(key)
-        let filtered = answers.filter { !isBad(key, $0) }
-        if filtered.isEmpty, !answers.isEmpty {
-            // Every candidate was marked bad recently; retry anyway — a
-            // transient failure must not brick the domain.
-            TunnelLog.write(.debug, "dns \(role) \(domain) all \(answers.count) candidates were marked bad, retrying")
+        do {
+            let answers = try await lookupCached(key)
+            let filtered = answers.filter { !isBad(key, $0) }
+            if !filtered.isEmpty {
+                return Self.mergeGoodFirst(good: preferred, answers: filtered)
+            }
+            // Every candidate was marked bad recently. Node planes re-query
+            // the clean last-resort resolvers (pin + poisoned channels are
+            // bypassed) instead of retrying a dead answer in place.
+            if let fresh = try await lastResortAnswers(domain: domain, key: key, role: role) {
+                return fresh
+            }
+            if !answers.isEmpty {
+                TunnelLog.write(.debug, "dns \(role) \(domain) all \(answers.count) candidates were marked bad, retrying")
+            }
+            return Self.mergeGoodFirst(good: preferred, answers: filtered.isEmpty ? answers : filtered)
+        } catch {
+            // Configured channels failed outright (e.g. a dead DoH): same net.
+            if let fresh = try await lastResortAnswers(domain: domain, key: key, role: role) {
+                return fresh
+            }
+            throw error
         }
-        return Self.mergeGoodFirst(good: preferred, answers: filtered.isEmpty ? answers : filtered)
     }
 
     func preferredAddresses(domain: String, role: DNSRole) -> [IPv4Address] {
@@ -285,10 +320,38 @@ public final class DNSClient: Sendable {
 
     // MARK: - Lookup
 
+    /// Last-resort re-query for node hostnames whose pinned / configured
+    /// answers all failed. Returns nil when the role is not `.proxyServer`,
+    /// no last-resort nameservers exist, or the fresh answers are also all
+    /// bad-marked. A successful answer is cached briefly so the next dial
+    /// skips the failed-channel timeout dance.
+    private func lastResortAnswers(domain: String, key: CacheKey, role: DNSRole) async throws -> [IPv4Address]? {
+        guard role == .proxyServer, !lastResortNameservers.isEmpty else { return nil }
+        guard let (answers, ttl) = try? await query(
+            endpoints: lastResortNameservers,
+            domain: domain,
+            role: role
+        ) else { return nil }
+        let clean = answers.filter { !isBad(key, $0) }
+        guard !clean.isEmpty else { return nil }
+        TunnelLog.write(.info, "dns \(role) \(domain) last-resort → \(clean.map(\.description))")
+        cache.withLock {
+            $0[key] = CachedEntry(addresses: clean, expires: Date().addingTimeInterval(min(ttl, 120)))
+        }
+        return clean
+    }
+
     private func lookup(domain: String, role: DNSRole) async throws -> ([IPv4Address], TimeInterval) {
         let endpoints = settings.endpoints(for: role)
         guard !endpoints.isEmpty else { throw DNSError.noNameserver }
+        return try await query(endpoints: endpoints, domain: domain, role: role)
+    }
 
+    private func query(
+        endpoints: [NameserverEndpoint],
+        domain: String,
+        role: DNSRole
+    ) async throws -> ([IPv4Address], TimeInterval) {
         var merged: [IPv4Address] = []
         var minTTL: UInt32?
         var sawTimeout = false
@@ -321,6 +384,7 @@ public final class DNSClient: Sendable {
     }
 
     private func makeTransport(_ endpoint: NameserverEndpoint) -> (any NameserverTransport)? {
+        if let override = transportFactory { return override(endpoint) }
         switch endpoint {
         case .udp:
             return try? NameserverFactory.make(endpoint)

@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import PrizmXProtocols
+import Network
 
 @Test func fakeIPAndLoopbackAreNotNameservers() {
     #expect(NameserverEndpoint.udp(ip: "198.18.0.2") == nil)
@@ -156,4 +157,118 @@ import Testing
     // After the TTL the edge is retried instead of bricking the domain.
     try await Task.sleep(for: .milliseconds(80))
     #expect(client.preferredAddresses(domain: "node.example.sbs", role: .proxyServer) == [edge])
+}
+
+// MARK: - Last-resort self-heal
+
+/// Minimal UDP DNS responder: answers every A query with a fixed address.
+private final class LocalUDPDNS: @unchecked Sendable {
+    private let listener: NWListener
+    private let answer: PrizmXProtocols.IPv4Address
+
+    var port: UInt16 { listener.port?.rawValue ?? 0 }
+
+    init(answer: PrizmXProtocols.IPv4Address) throws {
+        self.answer = answer
+        listener = try NWListener(using: .udp, on: .any)
+        listener.newConnectionHandler = { connection in
+            connection.start(queue: .global(qos: .utility))
+            Self.receive(on: connection, answer: answer)
+        }
+    }
+
+    func start() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready: continuation.resume()
+                case .failed(let error): continuation.resume(throwing: error)
+                default: break
+                }
+            }
+            listener.start(queue: .global(qos: .utility))
+        }
+    }
+
+    func stop() { listener.cancel() }
+
+    private static func receive(on connection: NWConnection, answer: PrizmXProtocols.IPv4Address) {
+        connection.receiveMessage { data, _, _, _ in
+            if let data, let response = Self.response(to: data, answer: answer) {
+                connection.send(content: response, completion: .contentProcessed { _ in })
+            }
+            receive(on: connection, answer: answer)
+        }
+    }
+
+    /// Query bytes with the response flags set plus one A answer (name
+    /// pointer back to the question). Returns nil for malformed queries.
+    private static func response(to query: Data, answer: PrizmXProtocols.IPv4Address) -> Data? {
+        guard query.count >= 12 else { return nil }
+        var response = query
+        response[2] = 0x81  // QR + RD
+        response[3] = 0x80  // RA
+        response[6] = 0     // ANCOUNT hi
+        response[7] = 1     // ANCOUNT lo
+        var record = Data([0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4])
+        var bigEndian = answer.rawValue.bigEndian
+        withUnsafeBytes(of: &bigEndian) { record.append(contentsOf: $0) }
+        response.append(record)
+        return response
+    }
+}
+
+@Test func proxyServerFallsBackToLastResortWhenPinnedBad() async throws {
+    let good = PrizmXProtocols.IPv4Address(203, 0, 113, 7)
+    let pinnedBad = PrizmXProtocols.IPv4Address(192, 0, 2, 9)
+    let dns = try LocalUDPDNS(answer: good)
+    try await dns.start()
+    defer { dns.stop() }
+
+    let client = DNSClient(
+        settings: DNSSettings(
+            defaultNameservers: [.udp(address: "127.0.0.1", port: 9)]  // refused: dead channel
+        ),
+        pinnedNodeAddresses: ["node.test": [pinnedBad]],
+        badTTL: 600,
+        lastResortNameservers: [.udp(address: "127.0.0.1", port: dns.port)]
+    )
+    // The real factory rejects loopback nameservers; the tests drive local
+    // responders, so the transport is built directly.
+    client.transportFactory = { endpoint in
+        guard case .udp(let address, let port) = endpoint else { return nil }
+        return UDPNameserver(address: address, port: port)
+    }
+
+    // Pin is preferred while clean.
+    #expect(try await client.resolveAll("node.test", role: .proxyServer) == [pinnedBad])
+
+    // Dial fails → pin marked bad → the next resolve heals via last resort
+    // instead of retrying the dead pin in place.
+    client.markBad(domain: "node.test", role: .proxyServer, address: pinnedBad)
+    let healed = try await client.resolveAll("node.test", role: .proxyServer)
+    #expect(healed == [good])
+
+    // The healed answer is cached briefly — no last-resort storm per dial.
+    #expect(try await client.resolveAll("node.test", role: .proxyServer) == [good])
+}
+
+@Test func directRoleNeverUsesLastResort() async throws {
+    let dns = try LocalUDPDNS(answer: PrizmXProtocols.IPv4Address(203, 0, 113, 7))
+    try await dns.start()
+    defer { dns.stop() }
+
+    let client = DNSClient(
+        settings: DNSSettings(
+            defaultNameservers: [.udp(address: "127.0.0.1", port: 9)]
+        ),
+        lastResortNameservers: [.udp(address: "127.0.0.1", port: dns.port)]
+    )
+    client.transportFactory = { endpoint in
+        guard case .udp(let address, let port) = endpoint else { return nil }
+        return UDPNameserver(address: address, port: port)
+    }
+    await #expect(throws: (any Error).self) {
+        try await client.resolveAll("node.test", role: .direct)
+    }
 }
