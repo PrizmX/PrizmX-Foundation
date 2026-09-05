@@ -1,6 +1,4 @@
 import Foundation
-import Network
-import os
 import PrizmXNodes
 import PrizmXProtocols
 
@@ -60,50 +58,39 @@ public enum NodeAddressStore: Sendable {
 
     /// Public resolvers queried alongside the system resolver — the Clash
     /// `proxy-server-nameserver` idea: node hostnames never trust a single
-    /// (possibly GeoDNS-split / poisoned) channel.
+    /// (possibly GeoDNS-split / poisoned) channel. Their answers are pinned
+    /// FIRST so a poisoned system answer is never dialed first.
     public static let fallbackResolverIPs = ["223.5.5.5", "119.29.29.29"]
 
     /// Resolves every node hostname in `configText` from the **app** process.
     ///
-    /// Candidates are the union of three channels — process resolver,
-    /// captured system DNS over UDP, and public resolvers — then **TCP-probed
-    /// against the node's ports**: only answers that accept a connection are
-    /// pinned, so a split / poisoned answer can never brick a node.
+    /// Candidates are the union of three channels — public resolvers,
+    /// captured system DNS over UDP, and the process resolver — public
+    /// answers first. Like Clash/Surge, startup never probes: liveness is
+    /// established by url-test probing after the tunnel is up, and a stale
+    /// pin is healed by the extension's last-resort re-resolution.
     public static func refresh(
         configText: String,
-        nameservers: [String],
-        probeTimeout: Duration = .seconds(1)
+        nameservers: [String]
     ) async -> [String: [PrizmXProtocols.IPv4Address]] {
-        let endpoints = nodeEndpoints(in: configText)
-        guard !endpoints.isEmpty else { return [:] }
+        let hosts = nodeHostnames(in: configText)
+        guard !hosts.isEmpty else { return [:] }
         let publicDNS = DNSClient(settings: .bootstrap(physicalIPs: [], fallbackIPs: fallbackResolverIPs))
         let capturedDNS = DNSClient(settings: .bootstrap(physicalIPs: nameservers, fallbackIPs: []))
         var map: [String: [PrizmXProtocols.IPv4Address]] = [:]
         await withTaskGroup(of: (String, [PrizmXProtocols.IPv4Address]).self) { group in
-            for (host, ports) in endpoints {
+            for host in hosts {
                 group.addTask {
-                    async let systemAnswers = HostResolver.ipv4(host)
-                    async let capturedAnswers = (try? await capturedDNS.resolveAll(host, role: .proxyServer)) ?? []
                     async let publicAnswers = (try? await publicDNS.resolveAll(host, role: .proxyServer)) ?? []
+                    async let capturedAnswers = (try? await capturedDNS.resolveAll(host, role: .proxyServer)) ?? []
+                    async let systemAnswers = HostResolver.ipv4(host)
                     var candidates: [PrizmXProtocols.IPv4Address] = []
-                    for list in [await systemAnswers, await capturedAnswers, await publicAnswers] {
+                    for list in [await publicAnswers, await capturedAnswers, await systemAnswers] {
                         for address in list where !candidates.contains(address) {
                             candidates.append(address)
                         }
                     }
-                    guard !candidates.isEmpty else { return (host, []) }
-                    let alive = await probeAlive(
-                        addresses: candidates,
-                        ports: ports,
-                        timeout: probeTimeout
-                    )
-                    if alive.isEmpty {
-                        TunnelLog.write(.warn, "app resolved \(host): all \(candidates.count) candidates unreachable")
-                    } else if alive.count < candidates.count {
-                        let dead = candidates.filter { !alive.contains($0) }
-                        TunnelLog.write(.info, "app resolved \(host): dropped unreachable \(dead.map(\.description))")
-                    }
-                    return (host, alive)
+                    return (host, candidates)
                 }
             }
             for await (host, addresses) in group where !addresses.isEmpty {
@@ -131,71 +118,5 @@ public enum NodeAddressStore: Sendable {
             portsByHost[domain.lowercased(), default: []].insert(probe.port)
         }
         return portsByHost.mapValues { Array($0.sorted().prefix(4)) }
-    }
-
-    /// TCP-connects every (address, port) pair concurrently; an address is
-    /// alive when any of its ports accepts. Order follows `addresses`.
-    /// Test seam: localhost ports.
-    static func probeAlive(
-        addresses: [PrizmXProtocols.IPv4Address],
-        ports: [UInt16],
-        timeout: Duration
-    ) async -> [PrizmXProtocols.IPv4Address] {
-        await withTaskGroup(of: (PrizmXProtocols.IPv4Address, Bool).self) { group in
-            for address in addresses {
-                for port in ports {
-                    group.addTask {
-                        (address, await tcpProbe(address, port: port, timeout: timeout))
-                    }
-                }
-            }
-            var aliveSet = Set<PrizmXProtocols.IPv4Address>()
-            for await (address, ok) in group where ok {
-                aliveSet.insert(address)
-            }
-            return addresses.filter { aliveSet.contains($0) }
-        }
-    }
-
-    private static func tcpProbe(
-        _ address: PrizmXProtocols.IPv4Address,
-        port: UInt16,
-        timeout: Duration
-    ) async -> Bool {
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return false }
-        let parameters = NWParameters.tcp
-        parameters.preferNoProxies = true
-        let connection = NWConnection(
-            host: NWEndpoint.Host(address.description),
-            port: nwPort,
-            using: parameters
-        )
-        defer { connection.cancel() }
-        return await withCheckedContinuation { continuation in
-            let gate = OSAllocatedUnfairLock(initialState: false)
-            @Sendable func finish(_ value: Bool) {
-                let first = gate.withLock { done -> Bool in
-                    if done { return false }
-                    done = true
-                    return true
-                }
-                if first { continuation.resume(returning: value) }
-            }
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    finish(true)
-                case .failed, .cancelled:
-                    finish(false)
-                default:
-                    break
-                }
-            }
-            connection.start(queue: .global(qos: .userInitiated))
-            Task {
-                try? await Task.sleep(for: timeout)
-                finish(false)
-            }
-        }
     }
 }
