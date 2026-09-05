@@ -133,29 +133,27 @@ public enum NodeAddressStore: Sendable {
         return portsByHost.mapValues { Array($0.sorted().prefix(4)) }
     }
 
-    /// TCP-connects each candidate on the node's ports (fan-out per address);
-    /// an address is alive when any port accepts. Test seam: localhost ports.
+    /// TCP-connects every (address, port) pair concurrently; an address is
+    /// alive when any of its ports accepts. Order follows `addresses`.
+    /// Test seam: localhost ports.
     static func probeAlive(
         addresses: [PrizmXProtocols.IPv4Address],
         ports: [UInt16],
         timeout: Duration
     ) async -> [PrizmXProtocols.IPv4Address] {
-        await withTaskGroup(of: PrizmXProtocols.IPv4Address?.self) { group in
+        await withTaskGroup(of: (PrizmXProtocols.IPv4Address, Bool).self) { group in
             for address in addresses {
-                group.addTask {
-                    for port in ports {
-                        if await tcpProbe(address, port: port, timeout: timeout) {
-                            return address
-                        }
+                for port in ports {
+                    group.addTask {
+                        (address, await tcpProbe(address, port: port, timeout: timeout))
                     }
-                    return nil
                 }
             }
-            var alive: [PrizmXProtocols.IPv4Address] = []
-            for await address in group {
-                if let address { alive.append(address) }
+            var aliveSet = Set<PrizmXProtocols.IPv4Address>()
+            for await (address, ok) in group where ok {
+                aliveSet.insert(address)
             }
-            return alive
+            return addresses.filter { aliveSet.contains($0) }
         }
     }
 
