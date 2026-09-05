@@ -316,23 +316,69 @@ public final class NodeManager: Sendable {
         return result
     }
 
-    /// TCP-connects each `urlTest` member's server and records RTT.
-    public func probeURLTestGroups() async {
+    /// url-test probe targets deduplicated by server: a large catalog is
+    /// usually a handful of hosts, so each server is probed once and the
+    /// result attributed to every node/group sharing it.
+    func urlTestProbeTargets() -> [(endpoint: Endpoint, members: [(group: String, nodeID: String)])] {
+        var order: [String] = []
+        var byServer: [String: (endpoint: Endpoint, members: [(group: String, nodeID: String)])] = [:]
         for group in groupsByName.values where group.mode == .urlTest {
             for nodeID in group.nodeIDs {
                 guard let node = nodesByID[nodeID], let endpoint = node.probeEndpoint else {
                     continue
                 }
-                let connection = DirectOutboundConnection(endpoint: endpoint, role: .proxyServer)
-                let start = ContinuousClock.now
-                do {
-                    try await connection.open()
-                    let latency = ContinuousClock.now - start
-                    await connection.close()
-                    recordLatency(latency, nodeID: nodeID, inGroup: group.name)
-                } catch {
-                    await connection.close()
+                let key = endpoint.description
+                if byServer[key] == nil {
+                    order.append(key)
+                    byServer[key] = (endpoint: endpoint, members: [])
                 }
+                byServer[key]?.members.append((group.name, nodeID))
+            }
+        }
+        return order.compactMap { byServer[$0] }
+    }
+
+    /// TCP-connects each url-test server once (bounded fan-out) and records
+    /// the RTT for every node sharing that server.
+    public func probeURLTestGroups(maxConcurrent: Int = 6) async {
+        let targets = urlTestProbeTargets()
+        guard !targets.isEmpty else { return }
+
+        await withTaskGroup(of: (Int, Duration?).self) { group in
+            var next = 0
+            var inFlight = 0
+            func enqueue() {
+                while inFlight < maxConcurrent, !Task.isCancelled, next < targets.count {
+                    let index = next
+                    next += 1
+                    inFlight += 1
+                    group.addTask {
+                        let connection = DirectOutboundConnection(
+                            endpoint: targets[index].endpoint,
+                            role: .proxyServer
+                        )
+                        let start = ContinuousClock.now
+                        do {
+                            try await connection.open()
+                            let latency = ContinuousClock.now - start
+                            await connection.close()
+                            return (index, latency)
+                        } catch {
+                            await connection.close()
+                            return (index, nil)
+                        }
+                    }
+                }
+            }
+            enqueue()
+            for await (index, latency) in group {
+                inFlight -= 1
+                if let latency {
+                    for member in targets[index].members {
+                        recordLatency(latency, nodeID: member.nodeID, inGroup: member.group)
+                    }
+                }
+                enqueue()
             }
         }
     }
