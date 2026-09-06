@@ -171,17 +171,8 @@ public final class Router: Sendable {
         return match(endpoint: Endpoint(domain: String(host), port: port))
     }
 
-    /// Alias of `match(endpoint:)` kept for existing call sites.
-    public func decide(endpoint: Endpoint) -> Policy {
-        match(endpoint: endpoint)
-    }
-
-    public func decide(host: some StringProtocol, port: UInt16) -> Policy {
-        match(host: host, port: port)
-    }
-
     /// Queries a policy given a URL. Returns `nil` when the URL has no host.
-    public func decide(url: URL, defaultPort: UInt16) -> Policy? {
+    public func match(url: URL, defaultPort: UInt16) -> Policy? {
         guard let host = url.host else { return nil }
         let port = UInt16(clamping: url.port ?? Int(defaultPort))
         return match(host: host, port: port)

@@ -205,7 +205,7 @@ public final class DNSClient: Sendable {
         }
     }
 
-    /// First A record (compatibility for single-dial call sites).
+    /// First A record for single-dial call sites.
     public func resolve(_ domain: String, role: DNSRole) async throws -> IPv4Address {
         guard let first = try await resolveAll(domain, role: role).first else {
             throw DNSError.noRecord(domain)

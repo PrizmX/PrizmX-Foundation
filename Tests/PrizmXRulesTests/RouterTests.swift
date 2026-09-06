@@ -8,10 +8,10 @@ import PrizmXProtocols
         rules: [RouteRule(.domain("ads.example.com"), policy: .reject)],
         default: .direct
     )
-    #expect(router.decide(host: "ads.example.com", port: 80) == .reject)
-    #expect(router.decide(host: "ADS.EXAMPLE.COM", port: 80) == .reject)
-    #expect(router.decide(host: "other.example.com", port: 80) == .direct)
-    #expect(router.decide(host: "xads.example.com", port: 80) == .direct)
+    #expect(router.match(host: "ads.example.com", port: 80) == .reject)
+    #expect(router.match(host: "ADS.EXAMPLE.COM", port: 80) == .reject)
+    #expect(router.match(host: "other.example.com", port: 80) == .direct)
+    #expect(router.match(host: "xads.example.com", port: 80) == .direct)
 }
 
 @Test func domainSuffixMatch() {
@@ -23,14 +23,14 @@ import PrizmXProtocols
         default: .reject
     )
     // The suffix matches the domain itself and any subdomain.
-    #expect(router.decide(host: "example.com", port: 443) == .proxy(targetGroup: "PROXY"))
-    #expect(router.decide(host: "cdn.example.com", port: 443) == .proxy(targetGroup: "PROXY"))
-    #expect(router.decide(host: "a.b.example.com", port: 443) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "example.com", port: 443) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "cdn.example.com", port: 443) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "a.b.example.com", port: 443) == .proxy(targetGroup: "PROXY"))
     // Similar-but-different domains must not be matched.
-    #expect(router.decide(host: "notexample.com", port: 443) == .reject)
-    #expect(router.decide(host: "example.com.evil.net", port: 443) == .reject)
+    #expect(router.match(host: "notexample.com", port: 443) == .reject)
+    #expect(router.match(host: "example.com.evil.net", port: 443) == .reject)
     // Longest suffix only wins when it is listed first (Clash order).
-    #expect(router.decide(host: "cdn.fast.example.com", port: 443) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "cdn.fast.example.com", port: 443) == .proxy(targetGroup: "PROXY"))
 }
 
 @Test func firstMatchingSuffixWinsByListOrder() {
@@ -41,8 +41,8 @@ import PrizmXProtocols
         ],
         default: .reject
     )
-    #expect(specificFirst.decide(host: "a.direct.example.com", port: 0) == .direct)
-    #expect(specificFirst.decide(host: "a.other.example.com", port: 0) == .proxy(targetGroup: "PROXY"))
+    #expect(specificFirst.match(host: "a.direct.example.com", port: 0) == .direct)
+    #expect(specificFirst.match(host: "a.other.example.com", port: 0) == .proxy(targetGroup: "PROXY"))
 
     let broadFirst = Router(
         rules: [
@@ -51,7 +51,7 @@ import PrizmXProtocols
         ],
         default: .reject
     )
-    #expect(broadFirst.decide(host: "a.direct.example.com", port: 0) == .proxy(targetGroup: "PROXY"))
+    #expect(broadFirst.match(host: "a.direct.example.com", port: 0) == .proxy(targetGroup: "PROXY"))
 }
 
 @Test func portScopedRulesFallThrough() {
@@ -62,10 +62,10 @@ import PrizmXProtocols
         ],
         default: .direct
     )
-    #expect(router.decide(host: "example.com", port: 80) == .direct)
+    #expect(router.match(host: "example.com", port: 80) == .direct)
     // An exact rule not matching the port falls back to the suffix rule.
-    #expect(router.decide(host: "example.com", port: 443) == .proxy(targetGroup: "PROXY"))
-    #expect(router.decide(host: "example.com", port: 8080) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "example.com", port: 443) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "example.com", port: 8080) == .proxy(targetGroup: "PROXY"))
 }
 
 @Test func ipv4AndCIDRMatch() {
@@ -79,10 +79,10 @@ import PrizmXProtocols
         ],
         default: .proxy(targetGroup: "PROXY")
     )
-    #expect(router.decide(host: "10.1.2.3", port: 1) == .reject)
-    #expect(router.decide(host: "192.168.5.5", port: 1) == .direct)
-    #expect(router.decide(host: "192.169.0.1", port: 1) == .proxy(targetGroup: "PROXY"))
-    #expect(router.decide(host: "10.1.2.4", port: 1) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "10.1.2.3", port: 1) == .reject)
+    #expect(router.match(host: "192.168.5.5", port: 1) == .direct)
+    #expect(router.match(host: "192.169.0.1", port: 1) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "10.1.2.4", port: 1) == .proxy(targetGroup: "PROXY"))
 }
 
 @Test func ipv6ExactMatch() {
@@ -91,40 +91,40 @@ import PrizmXProtocols
         rules: [RouteRule(.ipv6(loopback), policy: .direct)],
         default: .proxy(targetGroup: "PROXY")
     )
-    #expect(router.decide(host: "::1", port: 1) == .direct)
-    #expect(router.decide(host: "::2", port: 1) == .proxy(targetGroup: "PROXY"))
+    #expect(router.match(host: "::1", port: 1) == .direct)
+    #expect(router.match(host: "::2", port: 1) == .proxy(targetGroup: "PROXY"))
 }
 
 @Test func emptyRulesReturnDefault() {
     let router = Router(default: .reject)
-    #expect(router.decide(host: "anything.example.com", port: 443) == .reject)
+    #expect(router.match(host: "anything.example.com", port: 443) == .reject)
 }
 
-@Test func decideViaEndpoint() {
+@Test func matchViaEndpoint() {
     let router = Router(
         rules: [RouteRule(.domainSuffix("example.com"), policy: .reject)],
         default: .proxy(targetGroup: "PROXY")
     )
     #expect(
-        router.decide(endpoint: .init(domain: "api.example.com", port: 443)) == .reject
+        router.match(endpoint: .init(domain: "api.example.com", port: 443)) == .reject
     )
     #expect(
-        router.decide(
+        router.match(
             endpoint: .init(host: .ipv4(IPv4Address(1, 1, 1, 1)), port: 53)
         ) == .proxy(targetGroup: "PROXY")
     )
 }
 
-@Test func decideViaURL() throws {
+@Test func matchViaURL() throws {
     let router = Router(
         rules: [RouteRule(.domainSuffix("example.com"), policy: .reject)],
         default: .proxy(targetGroup: "PROXY")
     )
     let url = try #require(URL(string: "https://api.example.com/v1"))
-    #expect(router.decide(url: url, defaultPort: 443) == .reject)
+    #expect(router.match(url: url, defaultPort: 443) == .reject)
 
     let noHost = try #require(URL(string: "file:///tmp/prizmx"))
-    #expect(router.decide(url: noHost, defaultPort: 443) == nil)
+    #expect(router.match(url: noHost, defaultPort: 443) == nil)
 }
 
 @Test func routerIsConcurrencySafe() async {
@@ -136,7 +136,7 @@ import PrizmXProtocols
     await withTaskGroup(of: Policy.self) { group in
         for index in 0..<1000 {
             group.addTask {
-                router.decide(host: "host\(index).example.com", port: 443)
+                router.match(host: "host\(index).example.com", port: 443)
             }
         }
         for await decision in group {

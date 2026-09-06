@@ -3,7 +3,6 @@ import os
 import PrizmXProtocols
 
 /// Per-label byte counts (cumulative since tunnel start).
-/// Field-optional decoding so older IPC payloads still decode.
 public struct TrafficByteCount: Sendable, Hashable, Codable, Equatable {
     public var up: UInt64
     public var down: UInt64
@@ -12,15 +11,9 @@ public struct TrafficByteCount: Sendable, Hashable, Codable, Equatable {
         self.up = up
         self.down = down
     }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        up = try container.decodeIfPresent(UInt64.self, forKey: .up) ?? 0
-        down = try container.decodeIfPresent(UInt64.self, forKey: .down) ?? 0
-    }
 }
 
-/// IPC-compatible throughput snapshot (same keys as Kit `VPNMetrics`).
+/// Throughput snapshot exchanged over tunnel IPC.
 public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     public var uploadBytesPerSecond: Double
     public var downloadBytesPerSecond: Double
@@ -55,19 +48,6 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         self.directDownlinkBytes = directDownlinkBytes
         self.policyBytes = policyBytes
         self.domainBytes = domainBytes
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        uploadBytesPerSecond = try container.decodeIfPresent(Double.self, forKey: .uploadBytesPerSecond) ?? 0
-        downloadBytesPerSecond = try container.decodeIfPresent(Double.self, forKey: .downloadBytesPerSecond) ?? 0
-        uplinkBytes = try container.decodeIfPresent(UInt64.self, forKey: .uplinkBytes) ?? 0
-        downlinkBytes = try container.decodeIfPresent(UInt64.self, forKey: .downlinkBytes) ?? 0
-        activeConnections = try container.decodeIfPresent(Int.self, forKey: .activeConnections) ?? 0
-        directUplinkBytes = try container.decodeIfPresent(UInt64.self, forKey: .directUplinkBytes) ?? 0
-        directDownlinkBytes = try container.decodeIfPresent(UInt64.self, forKey: .directDownlinkBytes) ?? 0
-        policyBytes = try container.decodeIfPresent([String: TrafficByteCount].self, forKey: .policyBytes) ?? [:]
-        domainBytes = try container.decodeIfPresent([String: TrafficByteCount].self, forKey: .domainBytes) ?? [:]
     }
 
     public static let zero = TrafficSnapshot()

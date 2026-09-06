@@ -73,19 +73,15 @@ public enum TunnelIPC: Sendable {
         try JSONDecoder().decode(Request.self, from: data)
     }
 
-    /// Accepts a wrapped `Response` or a bare `TrafficSnapshot` payload so
-    /// older providers that only returned throughput JSON still decode.
     public static func decodeResponse(from data: Data?) throws -> Response {
         guard let data, !data.isEmpty else {
             throw TunnelIPCError.ipcFailed("empty provider response")
         }
-        if let response = try? JSONDecoder().decode(Response.self, from: data) {
-            return response
+        do {
+            return try JSONDecoder().decode(Response.self, from: data)
+        } catch {
+            throw TunnelIPCError.ipcFailed("unrecognized provider payload")
         }
-        if let metrics = try? JSONDecoder().decode(TrafficSnapshot.self, from: data) {
-            return .success(metrics: metrics)
-        }
-        throw TunnelIPCError.ipcFailed("unrecognized provider payload")
     }
 
     public static func metrics(from data: Data?) throws -> TrafficSnapshot {
