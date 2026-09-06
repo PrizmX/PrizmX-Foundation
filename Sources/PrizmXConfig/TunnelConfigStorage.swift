@@ -1,10 +1,11 @@
 import Foundation
+import PrizmXProtocols
 
 /// Stores tunnel config text in the App Group container so the
 /// NetworkExtension profile only carries a small relative path.
 /// (Profiles are limited to 512 KB; subscription configs routinely exceed it.)
 public enum TunnelConfigStorage: Sendable {
-    public static let defaultAppGroupIdentifier = "group.app.prizmx"
+    public static let defaultAppGroupIdentifier = PrizmXAppGroup.identifier
     public static let defaultDirectoryName = "PrizmXKit"
     /// Relative path (inside the container directory) of the active config.
     public static let activeConfigRelativePath = "tunnel/active.conf"

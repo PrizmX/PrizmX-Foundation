@@ -11,7 +11,7 @@ public enum TunnelLog: Sendable {
         case error
     }
 
-    public static let defaultAppGroupIdentifier = "group.app.prizmx"
+    public static let defaultAppGroupIdentifier = PrizmXAppGroup.identifier
     public static let defaultDirectoryName = "PrizmXKit"
     public static let relativePath = "logs/tunnel.log"
 

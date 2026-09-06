@@ -1,4 +1,5 @@
 import Foundation
+import PrizmXProtocols
 
 /// Records why the tunnel process ended, shared with the app via App Group
 /// UserDefaults. macOS has no `fetchLastDisconnectReason`; instead:
@@ -8,7 +9,7 @@ import Foundation
 /// So a clean stop whose `stoppedAt` is newer than `startedAt` with reason
 /// userInitiated means "the user turned it off" — the app must not reconnect.
 public enum TunnelLifecycleStore {
-    private static let suite = "group.app.prizmx"
+    private static let suite = PrizmXAppGroup.identifier
     private static let startedAtKey = "tunnel.startedAt"
     private static let stoppedAtKey = "tunnel.stoppedAt"
     private static let stopReasonKey = "tunnel.lastStopReason"
