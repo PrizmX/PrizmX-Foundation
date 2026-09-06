@@ -1,5 +1,7 @@
 import Foundation
+#if os(macOS)
 import SystemConfiguration
+#endif
 
 /// Which outbound plane is asking for a real A record.
 ///
@@ -181,6 +183,7 @@ public enum PhysicalDNSSnapshot: Sendable {
     /// Precedence matches mDNSResponder: manual DNS on the primary service
     /// (Setup scope) beats the DHCP-provided State lists.
     public static func capture() -> [String] {
+        #if os(macOS)
         guard let store = SCDynamicStoreCreate(nil, "PrizmX.DNS" as CFString, nil, nil) else {
             return []
         }
@@ -207,6 +210,9 @@ public enum PhysicalDNSSnapshot: Sendable {
         }
         TunnelLog.write(.debug, "dns snapshot empty")
         return []
+        #else
+        return []
+        #endif
     }
 }
 
