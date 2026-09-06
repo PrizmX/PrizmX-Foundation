@@ -47,4 +47,40 @@ import PrizmXProtocols
     let snapshot = counter.snapshot()
     #expect(snapshot.domainBytes == ["github.com": TrafficByteCount(up: 1_000, down: 9_000)])
     #expect(snapshot.activeConnections == 0)
+    #expect(snapshot.recentFlows.count == 2)
+    #expect(snapshot.activeFlows.isEmpty)
+}
+
+@Test func trafficCounterTracksOpenAndClearsRecent() {
+    let counter = TrafficCounter()
+    let open = FlowRecord(
+        endpoint: Endpoint(domain: "example.com", port: 443),
+        via: "Proxies",
+        closed: false
+    )
+    counter.flowDidBegin(open)
+    counter.addFlowBytes(id: open.id, up: 10, down: 20)
+    var snapshot = counter.snapshot()
+    #expect(snapshot.activeFlows.count == 1)
+    #expect(snapshot.activeFlows[0].uplinkBytes == 10)
+    #expect(snapshot.activeConnections == 1)
+
+    counter.flowDidClose(
+        FlowRecord(
+            id: open.id,
+            startedAt: open.startedAt,
+            endpoint: open.endpoint,
+            via: "Proxies",
+            uplinkBytes: 10,
+            downlinkBytes: 20,
+            milliseconds: 5,
+            clientEnd: "eof",
+            remoteEnd: "eof"
+        )
+    )
+    snapshot = counter.snapshot()
+    #expect(snapshot.activeFlows.isEmpty)
+    #expect(snapshot.recentFlows.count == 1)
+    counter.clearRecent()
+    #expect(counter.snapshot().recentFlows.isEmpty)
 }

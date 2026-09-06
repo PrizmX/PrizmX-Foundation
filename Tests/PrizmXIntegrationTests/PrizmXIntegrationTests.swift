@@ -57,7 +57,7 @@ private func makeEngine() throws -> Engine {
     // Multi-member select group: per-flow failover wrapper, selected first.
     let failover = try #require(connection as? FailoverGroupConnection)
     #expect(failover.endpoint == target)
-    #expect(failover.candidateNames == ["vless-us", "ss-us"])
+    #expect(failover.candidateNames == ["vless-us"])
     #expect(failover.state == .idle)
 }
 
@@ -85,6 +85,36 @@ private func makeEngine() throws -> Engine {
     }
 }
 
+@Test func outboundDirectBypassesRules() async throws {
+    let engine = try makeEngine()
+    engine.setOutboundMode(.direct)
+    #expect(engine.policy(for: Endpoint(domain: "google.com", port: 443)) == .direct)
+    let connection = try engine.dispatch(target: Endpoint(domain: "google.com", port: 443))
+    #expect(connection is DirectOutboundConnection)
+    #expect(await engine.dnsPolicy(host: "google.com") == .direct)
+}
+
+@Test func outboundGlobalPinsEveryFlowToSelectedGroup() async throws {
+    let engine = try makeEngine()
+    engine.setOutboundMode(.global, globalGroup: "US-Group")
+    let target = Endpoint(domain: "baidu.com", port: 443)
+    #expect(engine.router.match(endpoint: target) == .direct)
+    #expect(engine.policy(for: target) == .proxy(targetGroup: "US-Group"))
+    let connection = try engine.dispatch(target: target)
+    let failover = try #require(connection as? FailoverGroupConnection)
+    #expect(failover.candidateNames.first == "vless-us")
+    #expect(await engine.dnsPolicy(host: "baidu.com") == .proxy(targetGroup: "US-Group"))
+}
+
+@Test func outboundModeHotSwapRestoresRuleRouting() async throws {
+    let engine = try makeEngine()
+    engine.setOutboundMode(.direct)
+    engine.setOutboundMode(.rule)
+    let target = Endpoint(domain: "google.com", port: 443)
+    #expect(engine.policy(for: target) == .proxy(targetGroup: "US-Group"))
+    #expect(await engine.dnsPolicy(host: "ads.example") == .reject)
+}
+
 @Test func selectModeCanSwitchToShadowsocksNode() async throws {
     let engine = try makeEngine()
     try engine.nodeManager.select(nodeID: "ss-us", inGroup: "US-Group")
@@ -94,7 +124,7 @@ private func makeEngine() throws -> Engine {
     )
     // Selection sticks first, the other member is the failover leg.
     let failover = try #require(connection as? FailoverGroupConnection)
-    #expect(failover.candidateNames == ["ss-us", "vless-us"])
+    #expect(failover.candidateNames == ["ss-us"])
 }
 
 @Test func urlTestPicksLowestLatencyNode() throws {
@@ -175,7 +205,7 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
     )
     let connection = try engine.dispatch(target: Endpoint(domain: "www.google.com", port: 443))
     let failover = try #require(connection as? FailoverGroupConnection)
-    #expect(failover.candidateNames == ["info", "hk02"])
+    #expect(failover.candidateNames == ["info"])
 }
 
 @Test func selectedNodeWalksNestedGroups() {
@@ -227,7 +257,7 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
     #expect(manager.selectedNode(inGroup: "Final") == nil)
 }
 
-@Test func dnsPolicyWalksSelectGroupToDirect() {
+@Test func dnsPolicyWalksSelectGroupToDirect() async {
     let leaf = OutboundNode(
         id: "hk01",
         name: "hk01",
@@ -253,8 +283,8 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
         ),
         nodeManager: manager
     )
-    #expect(engine.dnsPolicy(host: "api.kimi.com") == .direct)
-    #expect(engine.dnsPolicy(host: "www.google.com") == .proxy(targetGroup: "Google"))
+    #expect(await engine.dnsPolicy(host: "api.kimi.com") == .direct)
+    #expect(await engine.dnsPolicy(host: "www.google.com") == .proxy(targetGroup: "Google"))
 }
 
 @Test func trafficCounterTracksFlowsAndSnapshot() {

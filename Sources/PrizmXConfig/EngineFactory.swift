@@ -11,9 +11,12 @@ public enum EngineFactory: Sendable {
     public static func make(
         configText: String?,
         geoIPURL: URL? = nil,
+        geositeURL: URL? = nil,
         geositeJSON: String? = nil,
         systemDNS: [String] = [],
-        pinnedNodeAddresses: [String: [IPv4Address]] = [:]
+        pinnedNodeAddresses: [String: [IPv4Address]] = [:],
+        outboundMode: OutboundMode? = nil,
+        globalGroup: String? = nil
     ) throws -> Engine {
         let parsed: (Router, NodeManager)
         if let configText {
@@ -45,8 +48,12 @@ public enum EngineFactory: Sendable {
             pinnedNodeAddresses: pinnedNodeAddresses
         )
 
-        let geoIP = try geoIPURL.map { try GeoIPMatcher(contentsOf: $0) }
-        let geosite = try geositeJSON.map(Self.parseGeosite)
+        let geoIP = Self.loadGeoIP(geoIPURL)
+        let geositeTags = Set(parsed.0.rules.compactMap { rule -> String? in
+            if case .geosite(let tag) = rule.matcher { return tag }
+            return nil
+        })
+        let geosite = Self.loadGeosite(url: geositeURL, json: geositeJSON, tags: geositeTags)
         let router = Router(
             rules: parsed.0.rules,
             default: parsed.0.defaultPolicy,
@@ -59,7 +66,19 @@ public enum EngineFactory: Sendable {
         if !selections.isEmpty {
             TunnelLog.write(.info, "policy selections \(selections)")
         }
-        return Engine(router: router, nodeManager: nodeManager, dns: dns)
+        let stored = OutboundModeStore.load()
+        let mode = outboundMode ?? stored.mode
+        let group = globalGroup ?? stored.globalGroup
+        if mode != .rule {
+            TunnelLog.write(.info, "outbound mode \(mode.rawValue) group=\(group ?? "-")")
+        }
+        return Engine(
+            router: router,
+            nodeManager: nodeManager,
+            dns: dns,
+            outboundMode: mode,
+            globalGroup: group
+        )
     }
 
     private static func directOnly() -> (Router, NodeManager) {
@@ -70,6 +89,41 @@ public enum EngineFactory: Sendable {
             ),
             NodeManager(nodes: [], groups: [])
         )
+    }
+
+    private static func loadGeoIP(_ url: URL?) -> GeoIPMatcher? {
+        guard let url else { return nil }
+        do {
+            let matcher = try GeoIPMatcher(contentsOf: url)
+            TunnelLog.write(.info, "geoip loaded \(url.lastPathComponent)")
+            return matcher
+        } catch {
+            TunnelLog.write(.error, "geoip load failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private static func loadGeosite(url: URL?, json: String?, tags: Set<String>) -> GeositeMatcher? {
+        if let json {
+            do {
+                return try parseGeosite(json)
+            } catch {
+                TunnelLog.write(.error, "geosite json failed: \(error.localizedDescription)")
+            }
+        }
+        guard let url, !tags.isEmpty else { return nil }
+        do {
+            let data = try Data(contentsOf: url)
+            if data.first == UInt8(ascii: "{") {
+                return try parseGeosite(String(decoding: data, as: UTF8.self))
+            }
+            let matcher = try GeositeDatParser.parse(data: data, includeTags: tags)
+            TunnelLog.write(.info, "geosite loaded \(url.lastPathComponent) tags=\(tags.sorted())")
+            return matcher
+        } catch {
+            TunnelLog.write(.error, "geosite load failed: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     private static func parseGeosite(_ json: String) throws -> GeositeMatcher {

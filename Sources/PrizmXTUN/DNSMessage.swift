@@ -21,21 +21,29 @@ enum DNSMessage {
         return (id, Question(name: name, type: type, qClass: classValue))
     }
 
-    /// Builds a response with a single A record (`type == 1`). AAAA queries get NODATA.
-    static func response(id: UInt16, question: Question, ipv4: IPv4Address?, ttl: UInt32 = 30) -> Data {
+    /// A record when `ipv4` is set; AAAA when `ipv6` is set. Otherwise NODATA
+    /// (Clash `dns.ipv6: false` / proxied names with IPv4-only FakeIP).
+    static func response(
+        id: UInt16,
+        question: Question,
+        ipv4: IPv4Address? = nil,
+        ipv6: IPv6Address? = nil,
+        ttl: UInt32 = 30
+    ) -> Data {
         var data = Data()
         data.append(UInt8(truncatingIfNeeded: id >> 8))
         data.append(UInt8(truncatingIfNeeded: id))
         data.append(0x81) // QR + RD + RA later
         data.append(0x80) // RA
         data.append(contentsOf: [0x00, 0x01]) // QDCOUNT
-        let hasAnswer = question.type == 1 && ipv4 != nil
-        data.append(contentsOf: hasAnswer ? [0x00, 0x01] : [0x00, 0x00]) // ANCOUNT
+        let answerA = question.type == 1 && ipv4 != nil
+        let answerAAAA = question.type == 28 && ipv6 != nil
+        data.append(contentsOf: (answerA || answerAAAA) ? [0x00, 0x01] : [0x00, 0x00]) // ANCOUNT
         data.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // NS / AR
         appendName(question.name, into: &data)
         appendUInt16(question.type, into: &data)
         appendUInt16(question.qClass, into: &data)
-        if hasAnswer, let ipv4 {
+        if answerA, let ipv4 {
             data.append(contentsOf: [0xC0, 0x0C]) // pointer to QNAME
             appendUInt16(1, into: &data)
             appendUInt16(1, into: &data)
@@ -46,8 +54,25 @@ enum DNSMessage {
             data.append(UInt8(truncatingIfNeeded: raw >> 16))
             data.append(UInt8(truncatingIfNeeded: raw >> 8))
             data.append(UInt8(truncatingIfNeeded: raw))
+        } else if answerAAAA, let ipv6 {
+            data.append(contentsOf: [0xC0, 0x0C])
+            appendUInt16(28, into: &data)
+            appendUInt16(1, into: &data)
+            appendUInt32(ttl, into: &data)
+            appendUInt16(16, into: &data)
+            appendIPv6(ipv6, into: &data)
         }
         return data
+    }
+
+    private static func appendIPv6(_ address: IPv6Address, into data: inout Data) {
+        func append64(_ value: UInt64) {
+            for shift in [56, 48, 40, 32, 24, 16, 8, 0] {
+                data.append(UInt8(truncatingIfNeeded: value >> shift))
+            }
+        }
+        append64(address.high)
+        append64(address.low)
     }
 
     private static func decodeName(_ data: Data, offset: inout Int) -> String? {

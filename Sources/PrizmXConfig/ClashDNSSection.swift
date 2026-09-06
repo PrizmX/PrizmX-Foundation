@@ -11,6 +11,8 @@ public struct ClashDNSSection: Sendable, Equatable {
     public var proxyServerNameservers: [String] = []
     public var directNameservers: [String] = []
     public var fakeIPFilter: [String] = []
+    /// Clash `dns.ipv6`. Default false — FakeIP stays IPv4-only.
+    public var ipv6: Bool = false
 
     public init() {}
 
@@ -27,6 +29,7 @@ public struct ClashDNSSection: Sendable, Equatable {
         section.directNameservers = strings(dns, "direct-nameserver")
         section.fallback = strings(dns, "fallback")
         section.fakeIPFilter = strings(dns, "fake-ip-filter")
+        section.ipv6 = dns.bool(for: "ipv6", default: false)
         return section
     }
 
@@ -69,6 +72,7 @@ extension DNSSettings {
             directNameservers: direct,
             systemNameservers: system,
             fakeIPFilter: (section?.fakeIPFilter ?? []) + ["*.lan", "*.local", "*.localhost"],
+            ipv6: section?.ipv6 ?? false,
             cacheTTL: 60
         )
     }

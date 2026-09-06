@@ -35,6 +35,8 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
                 groups.append(makeGroup(outbound, mode: .select))
             case "urltest":
                 groups.append(makeGroup(outbound, mode: .urlTest))
+            case "loadbalance", "load-balance":
+                groups.append(makeGroup(outbound, mode: .loadBalance))
             default:
                 continue
             }
@@ -147,7 +149,11 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
             name: name,
             mode: mode,
             nodeIDs: members,
-            selectedNodeID: members.first
+            selectedNodeID: members.first,
+            testURL: outbound.url ?? PolicyGroup.defaultTestURL,
+            interval: outbound.interval?.duration ?? .seconds(300),
+            tolerance: ConfigMapping.toleranceMilliseconds(outbound.tolerance),
+            loadBalanceStrategy: ConfigMapping.loadBalanceStrategy(outbound.strategy)
         )
     }
 
@@ -193,9 +199,13 @@ struct SingboxOutbound: Codable, Sendable {
     var uuid: String?
     var tls: SingboxTLS?
     var outbounds: [String]?
+    var url: String?
+    var interval: SingboxInterval?
+    var tolerance: Int?
+    var strategy: String?
 
     enum CodingKeys: String, CodingKey {
-        case type, tag, server, method, password, uuid, tls, outbounds
+        case type, tag, server, method, password, uuid, tls, outbounds, url, interval, tolerance, strategy
         case serverPort = "server_port"
     }
 
@@ -212,6 +222,23 @@ struct SingboxOutbound: Codable, Sendable {
     func requirePort() throws -> Int {
         guard let serverPort else { throw ConfigError.missingField("server_port") }
         return serverPort
+    }
+}
+
+struct SingboxInterval: Codable, Sendable {
+    var duration: Duration
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let seconds = try? container.decode(Int.self) {
+            duration = .seconds(max(1, seconds))
+            return
+        }
+        if let seconds = try? container.decode(Double.self) {
+            duration = .seconds(max(1, Int(seconds)))
+            return
+        }
+        duration = ConfigMapping.interval(try container.decode(String.self))
     }
 }
 

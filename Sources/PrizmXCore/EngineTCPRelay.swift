@@ -1,10 +1,11 @@
 import Foundation
+import os
 import PrizmXProtocols
 
 /// Byte stream accepted by `EngineTCPRelay.pipe`.
 ///
-/// Packet Tunnel SwiftTCP stream (`TUNTCPStream`) and macOS Transparent Proxy
-/// (`NEAppProxyTCPFlow` wrapper) both conform so splice logic stays in Core.
+/// Packet Tunnel SwiftTCP stream (`TUNTCPStream`) and mixed-port
+/// (`NWInboundStream`) both conform so splice logic stays in Core.
 public protocol InboundStream: Sendable {
     var endpoint: Endpoint { get }
     func read() async throws -> Data?
@@ -14,32 +15,52 @@ public protocol InboundStream: Sendable {
 
 /// Splices an inbound TCP stream through `Engine.dispatch`, recording traffic
 /// (`TrafficCounter`) and one `FlowRecord` per closed flow. Used by both the
-/// Packet Tunnel (SwiftTCP) and the App Proxy paths.
+/// Packet Tunnel (SwiftTCP) and mixed-port paths.
 public enum EngineTCPRelay: Sendable {
     public static func pipe(stream: some InboundStream, engine: Engine) async {
+        let prepared = await Self.prepare(stream: stream)
+        let inbound = prepared.stream
+        let target = prepared.endpoint
+        let ipv4 = await engine.resolveIPv4(for: target)
         let outbound: any OutboundConnection
+        let rule: String
         do {
-            outbound = try engine.dispatch(target: stream.endpoint)
+            let dispatched = try engine.dispatchDetailed(target: target, resolvedIPv4: ipv4)
+            outbound = dispatched.connection
+            rule = dispatched.rule
             try await DNSClient.$current.withValue(engine.dns) {
                 try await outbound.open()
             }
         } catch {
-            TunnelLog.write(.error, "open \(stream.endpoint) failed: \(error.localizedDescription)")
-            await stream.close()
+            TunnelLog.write(.error, "open \(target) failed: \(error.localizedDescription)")
+            await inbound.close()
             return
         }
         let via = outbound.routingLabel
-        engine.traffic.flowDidOpen()
-        TunnelLog.write(.debug, "flow opened \(stream.endpoint) via \(via)")
+        let flowID = UUID()
+        let startedAt = Date()
+        engine.traffic.flowDidBegin(
+            FlowRecord(
+                id: flowID,
+                startedAt: startedAt,
+                endpoint: target,
+                via: via,
+                closed: false,
+                rule: rule
+            )
+        )
+        TunnelLog.write(.debug, "flow opened \(target) via \(via)")
         let started = ContinuousClock.now
         let tally = FlowTally()
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
                 do {
-                    while let chunk = try await stream.read() {
+                    while let chunk = try await inbound.read() {
                         try await outbound.writeAll(chunk)
                         tally.addUp(chunk.count)
-                        engine.traffic.addBytes(up: UInt64(chunk.count), down: 0, via: via)
+                        let bytes = UInt64(chunk.count)
+                        engine.traffic.addBytes(up: bytes, down: 0, via: via)
+                        engine.traffic.addFlowBytes(id: flowID, up: bytes, down: 0)
                     }
                     tally.clientEnded("eof")
                 } catch {
@@ -55,14 +76,16 @@ public enum EngineTCPRelay: Sendable {
                             tally.remoteEnded("eof")
                             break
                         }
-                        try await stream.write(data)
+                        try await inbound.write(data)
                         tally.addDown(data.count)
-                        engine.traffic.addBytes(up: 0, down: UInt64(data.count), via: via)
+                        let bytes = UInt64(data.count)
+                        engine.traffic.addBytes(up: 0, down: bytes, via: via)
+                        engine.traffic.addFlowBytes(id: flowID, up: 0, down: bytes)
                     }
                 } catch {
                     tally.remoteEnded("error")
                 }
-                await stream.close()
+                await inbound.close()
             }
             await group.waitForAll()
         }
@@ -71,20 +94,114 @@ public enum EngineTCPRelay: Sendable {
         let snapshot = tally.snapshot()
         engine.traffic.flowDidClose(
             FlowRecord(
-                endpoint: stream.endpoint,
+                id: flowID,
+                startedAt: startedAt,
+                endpoint: target,
                 via: via,
                 uplinkBytes: UInt64(snapshot.up),
                 downlinkBytes: UInt64(snapshot.down),
                 milliseconds: ms,
                 clientEnd: snapshot.client,
-                remoteEnd: snapshot.remote
+                remoteEnd: snapshot.remote,
+                closed: true,
+                rule: rule
             )
         )
         TunnelLog.write(
             .debug,
-            "flow closed \(stream.endpoint) via \(via) up=\(snapshot.up) down=\(snapshot.down) client=\(snapshot.client) remote=\(snapshot.remote) ms=\(ms)"
+            "flow closed \(target) via \(via) up=\(snapshot.up) down=\(snapshot.down) client=\(snapshot.client) remote=\(snapshot.remote) ms=\(ms)"
         )
     }
+
+    /// Peek at the first client bytes on IP destinations so DOMAIN / GEOSITE
+    /// rules can match (Clash sniffing). Domain endpoints (FakeIP) skip this.
+    private static func prepare(stream: some InboundStream) async -> PreparedStream {
+        if case .domain = stream.endpoint.host {
+            return PreparedStream(stream: stream, endpoint: stream.endpoint)
+        }
+        var prefix = Data()
+        let deadline = ContinuousClock.now + .milliseconds(400)
+        while prefix.count < TrafficSniffer.maxPrefix {
+            switch TrafficSniffer.sniff(prefix) {
+            case .hostname(let name):
+                return PreparedStream(
+                    stream: PrefixedInboundStream(inner: stream, prefix: prefix),
+                    endpoint: Endpoint(domain: name, port: stream.endpoint.port)
+                )
+            case .none:
+                return PreparedStream(
+                    stream: PrefixedInboundStream(inner: stream, prefix: prefix),
+                    endpoint: stream.endpoint
+                )
+            case .needMore:
+                break
+            }
+            let remaining = deadline - ContinuousClock.now
+            if remaining <= .zero { break }
+            let chunk: Data?
+            do {
+                chunk = try await read(stream, timeout: remaining)
+            } catch {
+                break
+            }
+            guard let chunk, !chunk.isEmpty else { break }
+            prefix.append(chunk)
+        }
+        if case .hostname(let name) = TrafficSniffer.sniff(prefix) {
+            return PreparedStream(
+                stream: PrefixedInboundStream(inner: stream, prefix: prefix),
+                endpoint: Endpoint(domain: name, port: stream.endpoint.port)
+            )
+        }
+        return PreparedStream(
+            stream: PrefixedInboundStream(inner: stream, prefix: prefix),
+            endpoint: stream.endpoint
+        )
+    }
+
+    private static func read(_ stream: some InboundStream, timeout: Duration) async throws -> Data? {
+        try await withThrowingTaskGroup(of: Data?.self) { group in
+            group.addTask { try await stream.read() }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                return nil
+            }
+            let first = try await group.next() ?? nil
+            group.cancelAll()
+            return first ?? nil
+        }
+    }
+}
+
+private struct PreparedStream: Sendable {
+    var stream: any InboundStream
+    var endpoint: Endpoint
+}
+
+private final class PrefixedInboundStream: InboundStream, @unchecked Sendable {
+    let endpoint: Endpoint
+    private let inner: any InboundStream
+    private let leftover = OSAllocatedUnfairLock<Data>(initialState: Data())
+
+    init(inner: some InboundStream, prefix: Data) {
+        self.endpoint = inner.endpoint
+        self.inner = inner
+        leftover.withLock { $0 = prefix }
+    }
+
+    func read() async throws -> Data? {
+        let pending = leftover.withLock { buffer -> Data? in
+            guard !buffer.isEmpty else { return nil }
+            let data = buffer
+            buffer = Data()
+            return data
+        }
+        if let pending { return pending.isEmpty ? try await inner.read() : pending }
+        return try await inner.read()
+    }
+
+    func write(_ data: Data) async throws { try await inner.write(data) }
+    func close() async { await inner.close() }
 }
 
 private final class FlowTally: @unchecked Sendable {

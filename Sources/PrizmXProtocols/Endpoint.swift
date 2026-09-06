@@ -44,8 +44,6 @@ public struct Endpoint: Hashable, Sendable, CustomStringConvertible, Codable {
     }
 
     /// Parses a hostname that may be a dotted IPv4, IPv6 literal, or domain.
-    /// Used by Transparent Proxy flows where the system provides host and port
-    /// separately (and may already have resolved a domain to `remoteHostname`).
     public init?(hostname: String, port: UInt16) {
         guard port > 0 else { return nil }
         let trimmed = hostname.trimmingCharacters(in: .whitespacesAndNewlines)

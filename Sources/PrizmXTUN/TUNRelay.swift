@@ -39,7 +39,8 @@ private actor UDPRelayState {
         )
         if sessions[key] == nil {
             guard sessions.count < MemoryWatchdog.maxUDPSessions else { return }
-            switch engine.router.match(endpoint: datagram.destination) {
+            let ipv4 = await engine.resolveIPv4(for: datagram.destination)
+            switch engine.policy(for: datagram.destination, resolvedIPv4: ipv4) {
             case .reject:
                 await dropUDP(datagram, onceKey: "udp-reject", reason: "UDP dropped: reject")
             case .direct:
@@ -104,7 +105,11 @@ private actor UDPRelayState {
         tasks[key] = Task { await session.pump() }
     }
 
-    private func openProxy(key: UDPFlowKey, datagram: TUNUDPDatagram, group: String) async {
+    private func openProxy(
+        key: UDPFlowKey,
+        datagram: TUNUDPDatagram,
+        group: String
+    ) async {
         let leaf = engine.nodeManager.selectedLeaf(inGroup: group)
         switch leaf {
         case .direct:
@@ -129,10 +134,17 @@ private actor UDPRelayState {
             await openDirect(key: key, datagram: datagram)
         case .vless:
             do {
-                let outbound = try engine.dispatch(target: datagram.destination, command: .udp)
+                // Use the leaf picked above; dispatching through the group
+                // again would re-pick (load-balance round-robin skew).
+                let outbound = try NodeFactory.makeConnection(
+                    from: node,
+                    to: datagram.destination,
+                    command: .udp
+                )
                 try await outbound.open()
                 let session = StreamUDPSession(
                     outbound: outbound,
+                    via: group,
                     client: key.client,
                     clientPort: key.clientPort,
                     destinationPort: key.destinationPort,
@@ -173,6 +185,7 @@ private actor UDPRelayState {
                 connection: connection,
                 preSharedKey: cipher.masterKey(fromPassword: password),
                 cipher: cipher,
+                via: group,
                 client: key.client,
                 clientPort: key.clientPort,
                 destinationPort: key.destinationPort,
@@ -246,7 +259,7 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
 }
 
 private final class StreamUDPSession: UDPSession, @unchecked Sendable {
-    var via: String { outbound.routingLabel }
+    let via: String
     private let outbound: any OutboundConnection
     private let client: IPv4Address
     private let clientPort: UInt16
@@ -256,6 +269,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
 
     init(
         outbound: any OutboundConnection,
+        via: String,
         client: IPv4Address,
         clientPort: UInt16,
         destinationPort: UInt16,
@@ -263,6 +277,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
         traffic: TrafficCounter
     ) {
         self.outbound = outbound
+        self.via = via
         self.client = client
         self.clientPort = clientPort
         self.destinationPort = destinationPort
@@ -302,7 +317,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
 }
 
 private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
-    let via = "proxy"
+    let via: String
     private let connection: NWConnection
     private let preSharedKey: [UInt8]
     private let cipher: ShadowsocksCipher
@@ -316,6 +331,7 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
         connection: NWConnection,
         preSharedKey: [UInt8],
         cipher: ShadowsocksCipher,
+        via: String,
         client: IPv4Address,
         clientPort: UInt16,
         destinationPort: UInt16,
@@ -325,6 +341,7 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
         self.connection = connection
         self.preSharedKey = preSharedKey
         self.cipher = cipher
+        self.via = via
         self.client = client
         self.clientPort = clientPort
         self.destinationPort = destinationPort

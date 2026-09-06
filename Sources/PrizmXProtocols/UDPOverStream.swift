@@ -5,7 +5,7 @@ extension NWConnection {
     /// One datagram (or chunk) from a started UDP connection.
     ///
     /// Returns `nil` on completion or error so pump loops can `guard let`.
-    /// Used by the TUN and App Proxy UDP relays.
+    /// Used by the TUN UDP relay.
     public func receiveDatagram(maximumLength: Int = 64 * 1024) async -> Data? {
         await withCheckedContinuation { continuation in
             receive(minimumIncompleteLength: 1, maximumLength: maximumLength) { data, _, isComplete, _ in

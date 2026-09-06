@@ -72,4 +72,21 @@ rules:
     let settings = DNSSettings.fromClash(section: nil, systemDNS: ["114.114.114.114"])
     #expect(settings.defaultNameservers == [.udp(address: "114.114.114.114", port: 53)])
     #expect(settings.endpoints(for: .proxyServer) == settings.defaultNameservers)
+    #expect(settings.ipv6 == false)
+}
+
+@Test func clashDNSIPv6FlagParses() throws {
+    let yaml = """
+    dns:
+      ipv6: true
+      nameserver:
+        - 223.5.5.5
+    proxies: []
+    rules:
+      - MATCH,DIRECT
+    """
+    let section = try #require(ClashDNSSection.parse(from: yaml))
+    #expect(section.ipv6)
+    let settings = DNSSettings.fromClash(section: section, systemDNS: [])
+    #expect(settings.ipv6)
 }

@@ -165,7 +165,11 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
             }
             return Endpoint(host: .ipv4(ipv4), port: port)
         case .v6(let high, let low):
-            return Endpoint(host: .ipv6(IPv6Address(high: high, low: low)), port: port)
+            let ipv6 = IPv6Address(high: high, low: low)
+            if let fakeIP, let domain = fakeIP.domain(for: ipv6) {
+                return Endpoint(domain: domain, port: port)
+            }
+            return Endpoint(host: .ipv6(ipv6), port: port)
         }
     }
 }

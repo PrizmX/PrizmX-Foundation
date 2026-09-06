@@ -5,6 +5,7 @@ import os
 /// Wire transport for one nameserver endpoint.
 public protocol NameserverTransport: Sendable {
     func query(_ domain: String) async throws -> [DNSWire.Record]
+    func queryAAAA(_ domain: String) async throws -> [DNSWire.AAAARecord]
 }
 
 public enum NameserverFactory: Sendable {
@@ -80,6 +81,22 @@ struct UDPNameserver: NameserverTransport {
         try await send(connection, DNSWire.makeQuery(id: queryID, domain: domain))
         let answer = try await receiveMessage(connection, timeout: .seconds(3))
         return DNSWire.aRecords(in: answer, expectedID: queryID)
+    }
+
+    func queryAAAA(_ domain: String) async throws -> [DNSWire.AAAARecord] {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return [] }
+        let parameters = NWParameters.udp
+        parameters.preferNoProxies = true
+        let connection = NWConnection(host: NWEndpoint.Host(address), port: nwPort, using: parameters)
+        defer { connection.cancel() }
+        try await NWReady.wait(connection, timeout: .seconds(2))
+        let queryID = UInt16.random(in: .min ... .max)
+        try await send(
+            connection,
+            DNSWire.makeQuery(id: queryID, domain: domain, type: DNSWire.typeAAAA)
+        )
+        let answer = try await receiveMessage(connection, timeout: .seconds(3))
+        return DNSWire.aaaaRecords(in: answer, expectedID: queryID)
     }
 
     private func send(_ connection: NWConnection, _ data: Data) async throws {

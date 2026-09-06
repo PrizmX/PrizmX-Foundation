@@ -213,6 +213,30 @@ public final class DNSClient: Sendable {
         return first
     }
 
+    /// AAAA records for DIRECT FakeDNS when Clash `dns.ipv6` is on.
+    /// Proxy names never call this — FakeIP is IPv4-only, AAAA is NODATA.
+    public func resolveAAAA(_ domain: String, role: DNSRole) async throws -> [IPv6Address] {
+        let endpoints = settings.endpoints(for: role)
+        guard !endpoints.isEmpty else { throw DNSError.noNameserver }
+        var merged: [IPv6Address] = []
+        var lastError: Error?
+        for endpoint in endpoints {
+            guard let transport = makeTransport(endpoint) else { continue }
+            do {
+                for record in try await transport.queryAAAA(domain) where !merged.contains(record.address) {
+                    merged.append(record.address)
+                }
+            } catch {
+                lastError = error
+            }
+        }
+        guard !merged.isEmpty else {
+            if let lastError { throw lastError }
+            throw DNSError.noRecord(domain)
+        }
+        return merged
+    }
+
     /// Good addresses for a key (test seam + fake-ip-filter callers).
     func goodAddresses(domain: String, role: DNSRole) -> [IPv4Address] {
         good.withLock { $0[CacheKey(domain: domain.lowercased(), role: role)]?.addresses ?? [] }

@@ -2,7 +2,7 @@ import Foundation
 import PrizmXCore
 
 /// Versioned JSON IPC between the host app and the tunnel extensions
-/// (`NEPacketTunnelProvider` / `NETransparentProxyProvider`).
+/// (`NEPacketTunnelProvider`).
 ///
 /// The contract lives in Foundation so both sides — the app (via Kit) and
 /// the network extensions — encode/decode the same types. Providers must not
@@ -13,6 +13,9 @@ public enum TunnelIPC: Sendable {
     public enum Method: String, Sendable, Codable {
         case fetchMetrics
         case selectNode
+        case setOutboundMode
+        case setCaptureMode
+        case clearFlows
     }
 
     public struct Request: Sendable, Codable, Equatable {
@@ -20,17 +23,29 @@ public enum TunnelIPC: Sendable {
         public var method: Method
         public var nodeID: String?
         public var groupName: String?
+        public var outboundMode: String?
+        public var fakeIP: Bool?
+        public var systemProxy: Bool?
+        public var allowLAN: Bool?
 
         public init(
             method: Method,
             nodeID: String? = nil,
             groupName: String? = nil,
+            outboundMode: String? = nil,
+            fakeIP: Bool? = nil,
+            systemProxy: Bool? = nil,
+            allowLAN: Bool? = nil,
             version: Int = TunnelIPC.protocolVersion
         ) {
             self.version = version
             self.method = method
             self.nodeID = nodeID
             self.groupName = groupName
+            self.outboundMode = outboundMode
+            self.fakeIP = fakeIP
+            self.systemProxy = systemProxy
+            self.allowLAN = allowLAN
         }
     }
 

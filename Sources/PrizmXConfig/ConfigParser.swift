@@ -85,10 +85,46 @@ enum ConfigMapping {
 
     static func groupMode(clashType: String) -> PolicyGroup.Mode {
         switch clashType.lowercased() {
-        case "url-test", "fallback", "load-balance", "urltest":
+        case "url-test", "urltest":
             return .urlTest
+        case "fallback":
+            return .fallback
+        case "load-balance", "loadbalance":
+            return .loadBalance
         default:
             return .select
         }
+    }
+
+    static func loadBalanceStrategy(_ raw: String?) -> PolicyGroup.LoadBalanceStrategy {
+        switch raw?.lowercased() {
+        case "round-robin", "roundrobin":
+            return .roundRobin
+        default:
+            return .consistentHashing
+        }
+    }
+
+    static func interval(_ raw: String?, defaultSeconds: Int = 300) -> Duration {
+        guard let raw, !raw.isEmpty else { return .seconds(defaultSeconds) }
+        if let seconds = Int(raw) { return .seconds(max(1, seconds)) }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.hasSuffix("ms"), let value = Int(trimmed.dropLast(2)) {
+            return .milliseconds(max(1, value))
+        }
+        if trimmed.hasSuffix("s"), let value = Int(trimmed.dropLast()) {
+            return .seconds(max(1, value))
+        }
+        if trimmed.hasSuffix("m"), let value = Int(trimmed.dropLast()) {
+            return .seconds(max(1, value) * 60)
+        }
+        if trimmed.hasSuffix("h"), let value = Int(trimmed.dropLast()) {
+            return .seconds(max(1, value) * 3_600)
+        }
+        return .seconds(defaultSeconds)
+    }
+
+    static func toleranceMilliseconds(_ raw: Int?, default defaultValue: Int = 50) -> Duration {
+        .milliseconds(max(0, raw ?? defaultValue))
     }
 }

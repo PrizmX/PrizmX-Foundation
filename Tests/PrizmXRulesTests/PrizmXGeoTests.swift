@@ -66,6 +66,36 @@ private func sampleGeoIPData() -> Data {
     )
 }
 
+@Test func geoIPMatchesDomainWhenResolvedIPv4Provided() throws {
+    let matcher = try GeoIPMatcher(data: sampleGeoIPData())
+    let router = Router(
+        rules: [
+            RouteRule(type: .geoIP(code: "CN"), policy: .direct),
+            RouteRule(type: .matchAll, policy: .proxy(targetGroup: "PROXY")),
+        ],
+        default: .direct,
+        geoIP: matcher
+    )
+    let baidu = Endpoint(domain: "baidu.com", port: 443)
+    #expect(router.match(endpoint: baidu) == .proxy(targetGroup: "PROXY"))
+    #expect(
+        router.match(endpoint: baidu, resolvedIPv4: IPv4Address(parsing: "220.181.38.148")!)
+            == .direct
+    )
+    let skipped = Router(
+        rules: [
+            RouteRule(type: .geoIP(code: "CN"), policy: .direct, noResolve: true),
+            RouteRule(type: .matchAll, policy: .proxy(targetGroup: "PROXY")),
+        ],
+        default: .direct,
+        geoIP: matcher
+    )
+    #expect(
+        skipped.match(endpoint: baidu, resolvedIPv4: IPv4Address(parsing: "220.181.38.148")!)
+            == .proxy(targetGroup: "PROXY")
+    )
+}
+
 // MARK: - Geosite trie
 
 @Test func geositeExactSuffixAndKeyword() {

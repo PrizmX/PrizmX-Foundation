@@ -183,7 +183,13 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             mode: ConfigMapping.groupMode(clashType: type),
             nodeIDs: members,
             selectedNodeID: members.first,
-            iconURL: icon.flatMap(URL.init(string:))
+            iconURL: icon.flatMap(URL.init(string:)),
+            testURL: node.string(for: "url") ?? PolicyGroup.defaultTestURL,
+            interval: ConfigMapping.interval(node.string(for: "interval")),
+            tolerance: ConfigMapping.toleranceMilliseconds(
+                node.int(for: "tolerance", default: 50)
+            ),
+            loadBalanceStrategy: ConfigMapping.loadBalanceStrategy(node.string(for: "strategy"))
         )
     }
 
@@ -325,11 +331,22 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         guard let type = parts.first else { return nil }
         let members = Array(parts.dropFirst()).filter { !$0.contains("=") && !$0.isEmpty }
         guard !members.isEmpty else { return nil }
+        func named(_ key: String) -> String? {
+            for part in parts {
+                let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+                if pair.count == 2, pair[0].lowercased() == key { return pair[1] }
+            }
+            return nil
+        }
         return PolicyGroup(
             name: String(name),
             mode: ConfigMapping.groupMode(clashType: type),
             nodeIDs: members,
-            selectedNodeID: members.first
+            selectedNodeID: members.first,
+            testURL: named("url") ?? PolicyGroup.defaultTestURL,
+            interval: ConfigMapping.interval(named("interval")),
+            tolerance: ConfigMapping.toleranceMilliseconds(named("tolerance").flatMap(Int.init)),
+            loadBalanceStrategy: ConfigMapping.loadBalanceStrategy(named("strategy"))
         )
     }
 
@@ -358,18 +375,19 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         guard parts.count >= 3 else { throw ConfigError.malformedRule(raw) }
         let payload = parts[1]
         let policy = ConfigMapping.policy(named: parts[2])
+        let noResolve = parts.dropFirst(3).contains { $0.lowercased() == "no-resolve" }
 
         switch kind {
         case "DOMAIN":
-            return RouteRule(type: .domain(payload), policy: policy)
+            return RouteRule(type: .domain(payload), policy: policy, noResolve: noResolve)
         case "DOMAIN-SUFFIX", "DOMAINSUFFIX":
-            return RouteRule(type: .domainSuffix(payload), policy: policy)
+            return RouteRule(type: .domainSuffix(payload), policy: policy, noResolve: noResolve)
         case "DOMAIN-KEYWORD", "DOMAINKEYWORD":
-            return RouteRule(type: .domainKeyword(payload), policy: policy)
+            return RouteRule(type: .domainKeyword(payload), policy: policy, noResolve: noResolve)
         case "IP-CIDR", "IP-CIDR6", "IPCIDR":
-            return RouteRule(type: .ipCIDR(payload), policy: policy)
+            return RouteRule(type: .ipCIDR(payload), policy: policy, noResolve: noResolve)
         case "GEOIP":
-            return RouteRule(type: .geoIP(code: payload), policy: policy)
+            return RouteRule(type: .geoIP(code: payload), policy: policy, noResolve: noResolve)
         case "GEOSITE":
             return RouteRule(type: .geosite(tag: payload), policy: policy)
         default:

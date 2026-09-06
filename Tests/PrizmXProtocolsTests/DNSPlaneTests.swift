@@ -100,6 +100,21 @@ import Network
     #expect(records.map(\.ttl) == [60])
 }
 
+@Test func dnsWireParsesAAAARecords() {
+    let queryID: UInt16 = 0x2222
+    let query = DNSWire.makeQuery(id: queryID, domain: "example.com", type: DNSWire.typeAAAA)
+    #expect(query.suffix(4) == Data([0x00, 0x1C, 0x00, 0x01]))
+    var wire = Data()
+    wire.append(contentsOf: [0x22, 0x22, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00])
+    wire.append(query.subdata(in: 12..<query.count))
+    wire.append(contentsOf: [0xC0, 0x0C, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x10])
+    wire.append(Data(repeating: 0, count: 15))
+    wire.append(1)
+    let records = DNSWire.aaaaRecords(in: wire, expectedID: queryID)
+    #expect(records.map(\.address) == [.loopback])
+    #expect(records.first?.ttl == 60)
+}
+
 @Test func goodFirstOrderingAndBadEviction() async {
     let good = [IPv4Address(218, 245, 102, 118)]
     let answers = [IPv4Address(155, 254, 102, 209), IPv4Address(218, 245, 102, 118)]

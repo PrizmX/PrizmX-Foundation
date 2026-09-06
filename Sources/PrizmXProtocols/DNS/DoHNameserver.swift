@@ -14,13 +14,23 @@ struct DoHNameserver: NameserverTransport {
     var resolveHost: @Sendable (String) async throws -> [IPv4Address]
 
     func query(_ domain: String) async throws -> [DNSWire.Record] {
+        let (body, queryID) = try await queryWire(domain: domain, type: DNSWire.typeA)
+        return DNSWire.aRecords(in: body, expectedID: queryID)
+    }
+
+    func queryAAAA(_ domain: String) async throws -> [DNSWire.AAAARecord] {
+        let (body, queryID) = try await queryWire(domain: domain, type: DNSWire.typeAAAA)
+        return DNSWire.aaaaRecords(in: body, expectedID: queryID)
+    }
+
+    private func queryWire(domain: String, type: UInt16) async throws -> (Data, UInt16) {
         guard let host = url.host else { throw DNSError.noRecord(url.absoluteString) }
         let port = UInt16(url.port ?? 443)
         let addresses = try await resolveHost(host)
         guard let address = addresses.first else { throw DNSError.noRecord(host) }
 
         let queryID = UInt16.random(in: .min ... .max)
-        let wireQuery = DNSWire.makeQuery(id: queryID, domain: domain)
+        let wireQuery = DNSWire.makeQuery(id: queryID, domain: domain, type: type)
         var target = url.path.isEmpty ? "/" : url.path
         target += url.query.map { _ in "&dns=" } ?? "?dns="
         target += DNSWire.base64url(wireQuery)
@@ -32,7 +42,9 @@ struct DoHNameserver: NameserverTransport {
 
         let parameters = TLSClient.parameters(serverName: host)
         parameters.preferNoProxies = true
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return [] }
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw DNSError.noRecord(host)
+        }
         let connection = NWConnection(
             host: NWEndpoint.Host(address.description),
             port: nwPort,
@@ -42,10 +54,14 @@ struct DoHNameserver: NameserverTransport {
         try await NWReady.wait(connection, timeout: .seconds(4))
         try await send(connection, Data(request.utf8))
         let response = try await receiveAll(connection, timeout: .seconds(5))
-        return try Self.parse(response: response, expectedID: queryID)
+        return (try Self.dnsMessage(from: response), queryID)
     }
 
     static func parse(response: Data, expectedID: UInt16) throws -> [DNSWire.Record] {
+        DNSWire.aRecords(in: try dnsMessage(from: response), expectedID: expectedID)
+    }
+
+    static func dnsMessage(from response: Data) throws -> Data {
         guard let headerEnd = response.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) else {
             throw DNSError.noRecord("malformed DoH response")
         }
@@ -54,10 +70,9 @@ struct DoHNameserver: NameserverTransport {
             throw DNSError.noRecord("DoH non-200")
         }
         // NB: `response.suffix(from:)` shares storage and keeps the original
-        // (non-zero) indices — `Data` is its own SubSequence. `aRecords`
-        // indexes from 0, so a fresh, rebased copy is mandatory here.
-        let body = response.subdata(in: headerEnd.upperBound..<response.count)
-        return DNSWire.aRecords(in: body, expectedID: expectedID)
+        // (non-zero) indices — `Data` is its own SubSequence. Record parsers
+        // index from 0, so a fresh, rebased copy is mandatory here.
+        return response.subdata(in: headerEnd.upperBound..<response.count)
     }
 
     private func send(_ connection: NWConnection, _ data: Data) async throws {

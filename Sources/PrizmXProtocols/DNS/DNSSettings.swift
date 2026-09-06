@@ -95,6 +95,11 @@ public struct DNSSettings: Sendable, Hashable {
     public var systemNameservers: [NameserverEndpoint]
     /// Clash `fake-ip-filter` — these domains never receive fake IPs.
     public var fakeIPFilter: [String]
+    /// Clash `dns.ipv6`. When false (default), FakeDNS answers AAAA with
+    /// NODATA so clients use IPv4 FakeIP. When true, DIRECT / filter names
+    /// get real AAAA (kernel NIC) and proxied names get FakeIPv6
+    /// (`fd11:4514:1919:6472::/64`).
+    public var ipv6: Bool
     /// Fallback positive-cache lifetime when the answer carries no TTL.
     public var cacheTTL: TimeInterval
 
@@ -105,6 +110,7 @@ public struct DNSSettings: Sendable, Hashable {
         directNameservers: [NameserverEndpoint] = [],
         systemNameservers: [NameserverEndpoint] = [],
         fakeIPFilter: [String] = [],
+        ipv6: Bool = false,
         cacheTTL: TimeInterval = 60
     ) {
         self.defaultNameservers = defaultNameservers
@@ -113,6 +119,7 @@ public struct DNSSettings: Sendable, Hashable {
         self.directNameservers = directNameservers
         self.systemNameservers = systemNameservers
         self.fakeIPFilter = fakeIPFilter
+        self.ipv6 = ipv6
         self.cacheTTL = cacheTTL
     }
 

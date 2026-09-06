@@ -212,6 +212,27 @@ private let expectedNodeCount = 2
     #expect(engine.router.match(host: "example.com", port: 443) == .direct)
 }
 
+@Test func engineFactoryHonorsOutboundMode() throws {
+    let yaml = """
+    proxies:
+      - {name: HK01, type: ss, server: 1.1.1.1, port: 8388, cipher: aes-256-gcm, password: x}
+    proxy-groups:
+      - {name: Proxies, type: select, proxies: [HK01]}
+    rules:
+      - DOMAIN-SUFFIX,google.com,Proxies
+      - MATCH,DIRECT
+    """
+    let global = try EngineFactory.make(
+        configText: yaml,
+        outboundMode: .global,
+        globalGroup: "Proxies"
+    )
+    #expect(global.policy(for: Endpoint(domain: "baidu.com", port: 443)) == .proxy(targetGroup: "Proxies"))
+
+    let direct = try EngineFactory.make(configText: yaml, outboundMode: .direct)
+    #expect(direct.policy(for: Endpoint(domain: "google.com", port: 443)) == .direct)
+}
+
 @Test func geositeAndGeoIPArePreservedOnRouter() throws {
     let (clashRouter, _) = try ClashConfigParser().parse(rawString: clashYAML)
     #expect(clashRouter.rules.contains { $0.matcher == .geoIP(code: "CN") })
@@ -234,4 +255,151 @@ private let expectedNodeCount = 2
     #expect(engine.dns.settings.fakeIPFilter.contains("node.example.sbs"))
     // Built-ins stay.
     #expect(engine.dns.settings.fakeIPFilter.contains("*.lan"))
+}
+
+@Test func engineFactoryAppliesGeositeMatcher() throws {
+    let yaml = """
+    proxies: []
+    proxy-groups: []
+    rules:
+      - GEOSITE,cn,DIRECT
+      - MATCH,PROXY
+    """
+    let json = """
+    {"cn":{"exact":[],"suffixes":["baidu.com"],"keywords":[]}}
+    """
+    let engine = try EngineFactory.make(configText: yaml, geositeJSON: json)
+    #expect(engine.router.match(host: "www.baidu.com", port: 443) == .direct)
+    #expect(engine.router.match(host: "google.com", port: 443) == .proxy(targetGroup: "PROXY"))
+}
+
+@Test func engineFactoryLoadsGeositeDatFromFile() throws {
+    var list = Data()
+    var site = Data()
+    func appendVarint(_ data: inout Data, _ value: UInt64) {
+        var current = value
+        while current > 127 {
+            data.append(UInt8(current & 0x7F) | 0x80)
+            current >>= 7
+        }
+        data.append(UInt8(current))
+    }
+    func appendBytes(_ data: inout Data, field: Int, _ value: Data) {
+        appendVarint(&data, UInt64((field << 3) | 2))
+        appendVarint(&data, UInt64(value.count))
+        data.append(value)
+    }
+    var domain = Data()
+    appendVarint(&domain, 8) // field 1 varint type=2 (suffix)
+    appendVarint(&domain, 2)
+    appendBytes(&domain, field: 2, Data("baidu.com".utf8))
+    appendBytes(&site, field: 1, Data("cn".utf8))
+    appendBytes(&site, field: 2, domain)
+    appendBytes(&list, field: 1, site)
+
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("prizmx-geosite-\(UUID().uuidString).dat")
+    try list.write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let yaml = """
+    proxies: []
+    proxy-groups: []
+    rules:
+      - GEOSITE,cn,DIRECT
+      - MATCH,PROXY
+    """
+    let engine = try EngineFactory.make(configText: yaml, geositeURL: url)
+    #expect(engine.router.match(host: "tieba.baidu.com", port: 443) == .direct)
+    #expect(engine.router.match(host: "google.com", port: 443) == .proxy(targetGroup: "PROXY"))
+}
+
+@Test func geoAssetStoreReusesExistingFilesWithoutDownload() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("prizmx-geo-\(UUID().uuidString)", isDirectory: true)
+    let geoDir = root.appendingPathComponent("geo", isDirectory: true)
+    try FileManager.default.createDirectory(at: geoDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Data(repeating: 1, count: 2_048).write(to: geoDir.appendingPathComponent("geoip.metadb"))
+    try Data(repeating: 2, count: 2_048).write(to: geoDir.appendingPathComponent("geosite.dat"))
+
+    let prepared = await GeoAssetStore.prepare(
+        root: root,
+        geoIP: true,
+        geosite: true,
+        sources: .none
+    )
+    #expect(prepared.geoIPPath == GeoAssetStore.geoIPRelativePath)
+    #expect(prepared.geositePath == GeoAssetStore.geositeRelativePath)
+    #expect(
+        GeoAssetStore.resolve(prepared.geoIPPath, root: root)
+            == root.appendingPathComponent(GeoAssetStore.geoIPRelativePath)
+    )
+}
+
+@Test func clashAndSingboxParseHealthCheckGroupSettings() throws {
+    let clash = """
+    proxies:
+      - {name: HK01, type: ss, server: 1.1.1.1, port: 8388, cipher: aes-256-gcm, password: x}
+      - {name: JP01, type: ss, server: 2.2.2.2, port: 8388, cipher: aes-256-gcm, password: x}
+    proxy-groups:
+      - name: Auto
+        type: url-test
+        url: http://www.gstatic.com/generate_204
+        interval: 120
+        tolerance: 80
+        proxies: [HK01, JP01]
+      - name: Backup
+        type: fallback
+        url: http://cp.cloudflare.com/generate_204
+        interval: 60
+        proxies: [HK01, JP01]
+      - name: Spread
+        type: load-balance
+        strategy: round-robin
+        proxies: [HK01, JP01]
+    rules:
+      - MATCH,Auto
+    """
+    let (_, nodes) = try ClashConfigParser().parse(rawString: clash)
+    let auto = try #require(nodes.group(named: "Auto"))
+    #expect(auto.mode == .urlTest)
+    #expect(auto.interval == .seconds(120))
+    #expect(auto.tolerance == .milliseconds(80))
+    #expect(auto.testURL.contains("gstatic"))
+    #expect(nodes.group(named: "Backup")?.mode == .fallback)
+    #expect(nodes.group(named: "Spread")?.mode == .loadBalance)
+    #expect(nodes.group(named: "Spread")?.loadBalanceStrategy == .roundRobin)
+
+    let singbox = """
+    {
+      "outbounds": [
+        {"type":"shadowsocks","tag":"HK01","server":"1.1.1.1","server_port":8388,"method":"aes-256-gcm","password":"x"},
+        {"type":"urltest","tag":"Auto","outbounds":["HK01"],"url":"http://www.gstatic.com/generate_204","interval":"2m","tolerance":40}
+      ]
+    }
+    """
+    let (_, sb) = try SingboxConfigParser().parse(rawString: singbox)
+    let urlTest = try #require(sb.group(named: "Auto"))
+    #expect(urlTest.mode == .urlTest)
+    #expect(urlTest.interval == .seconds(120))
+    #expect(urlTest.tolerance == .milliseconds(40))
+}
+
+@Test func clashParsesNoResolveOnGeoIP() throws {
+    let yaml = """
+    proxies: []
+    proxy-groups: []
+    rules:
+      - GEOIP,CN,DIRECT,no-resolve
+      - MATCH,PROXY
+    """
+    let (router, _) = try ClashConfigParser().parse(rawString: yaml)
+    let geo = try #require(router.rules.first)
+    #expect(geo.noResolve)
+    if case .geoIP(let code) = geo.matcher {
+        #expect(code == "CN")
+    } else {
+        Issue.record("expected GEOIP")
+    }
 }

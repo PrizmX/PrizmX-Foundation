@@ -59,4 +59,64 @@ struct UDPDatagram: Sendable {
             )
         }
     }
+
+    func encode(source: IPv6Address, destination: IPv6Address) -> Data {
+        let udpLength = 8 + payload.count
+        var udp = Data(count: udpLength)
+        udp[0] = UInt8(truncatingIfNeeded: sourcePort >> 8)
+        udp[1] = UInt8(truncatingIfNeeded: sourcePort)
+        udp[2] = UInt8(truncatingIfNeeded: destinationPort >> 8)
+        udp[3] = UInt8(truncatingIfNeeded: destinationPort)
+        udp[4] = UInt8(truncatingIfNeeded: udpLength >> 8)
+        udp[5] = UInt8(truncatingIfNeeded: udpLength)
+        if !payload.isEmpty {
+            udp.replaceSubrange(8..<udpLength, with: payload)
+        }
+        var pseudo = Data()
+        appendIPv6(source, into: &pseudo)
+        appendIPv6(destination, into: &pseudo)
+        pseudo.append(contentsOf: [
+            0, 0,
+            UInt8(truncatingIfNeeded: udpLength >> 8),
+            UInt8(truncatingIfNeeded: udpLength),
+            0, 0, 0, 17,
+        ])
+        let checksum = udp.withUnsafeBytes { raw -> UInt16 in
+            var total = InternetChecksum.sum(pseudo.withUnsafeBytes { $0 })
+            total = InternetChecksum.sum(UnsafeRawBufferPointer(raw), initial: total)
+            let folded = InternetChecksum.fold(total)
+            return folded == 0 ? 0xFFFF : folded
+        }
+        udp[6] = UInt8(truncatingIfNeeded: checksum >> 8)
+        udp[7] = UInt8(truncatingIfNeeded: checksum)
+
+        var ip = Data(count: 40)
+        ip[0] = 0x60
+        ip[4] = UInt8(truncatingIfNeeded: udpLength >> 8)
+        ip[5] = UInt8(truncatingIfNeeded: udpLength)
+        ip[6] = 17
+        ip[7] = 64
+        var offset = 8
+        appendIPv6(source, into: &ip, at: &offset)
+        appendIPv6(destination, into: &ip, at: &offset)
+        ip.append(udp)
+        return ip
+    }
+}
+
+private func appendIPv6(_ address: IPv6Address, into data: inout Data) {
+    var offset = data.count
+    data.append(contentsOf: repeatElement(0, count: 16))
+    appendIPv6(address, into: &data, at: &offset)
+}
+
+private func appendIPv6(_ address: IPv6Address, into data: inout Data, at offset: inout Int) {
+    func write64(_ value: UInt64) {
+        for shift in [56, 48, 40, 32, 24, 16, 8, 0] {
+            data[offset] = UInt8(truncatingIfNeeded: value >> shift)
+            offset += 1
+        }
+    }
+    write64(address.high)
+    write64(address.low)
 }

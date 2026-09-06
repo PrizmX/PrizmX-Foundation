@@ -41,9 +41,20 @@ public struct PolicyGroup: Sendable, Hashable {
     public enum Mode: Sendable, Hashable {
         /// Use `selectedNodeID` (or the first member if unset).
         case select
-        /// Use the member with the lowest recorded latency; falls back to the first member.
+        /// Lowest HTTP RTT to `testURL`, with `tolerance` hysteresis.
         case urlTest
+        /// First member that last probed successfully (list order).
+        case fallback
+        /// Spread flows across live members (`loadBalanceStrategy`).
+        case loadBalance
     }
+
+    public enum LoadBalanceStrategy: Sendable, Hashable {
+        case consistentHashing
+        case roundRobin
+    }
+
+    public static let defaultTestURL = "http://www.gstatic.com/generate_204"
 
     public let name: String
     public let mode: Mode
@@ -52,19 +63,41 @@ public struct PolicyGroup: Sendable, Hashable {
     public let selectedNodeID: String?
     /// Optional Clash `icon` URL for the group.
     public let iconURL: URL?
+    /// Clash `url` — HTTP(S) endpoint probed through each member.
+    public let testURL: String
+    /// Clash `interval`.
+    public let interval: Duration
+    /// Clash `tolerance` (url-test hysteresis).
+    public let tolerance: Duration
+    public let loadBalanceStrategy: LoadBalanceStrategy
+
+    public var usesHealthCheck: Bool {
+        switch mode {
+        case .urlTest, .fallback, .loadBalance: true
+        case .select: false
+        }
+    }
 
     public init(
         name: String,
         mode: Mode,
         nodeIDs: [String],
         selectedNodeID: String? = nil,
-        iconURL: URL? = nil
+        iconURL: URL? = nil,
+        testURL: String = PolicyGroup.defaultTestURL,
+        interval: Duration = .seconds(300),
+        tolerance: Duration = .milliseconds(50),
+        loadBalanceStrategy: LoadBalanceStrategy = .consistentHashing
     ) {
         self.name = name
         self.mode = mode
         self.nodeIDs = nodeIDs
         self.selectedNodeID = selectedNodeID
         self.iconURL = iconURL
+        self.testURL = testURL.isEmpty ? PolicyGroup.defaultTestURL : testURL
+        self.interval = interval
+        self.tolerance = tolerance
+        self.loadBalanceStrategy = loadBalanceStrategy
     }
 }
 
@@ -143,6 +176,7 @@ public final class NodeManager: Sendable {
     private struct GroupRuntime: Sendable {
         var selectedNodeID: String?
         var latencies: [String: Duration]
+        var rrIndex: UInt64 = 0
     }
 
     private let runtime: OSAllocatedUnfairLock<[String: GroupRuntime]>
@@ -158,7 +192,8 @@ public final class NodeManager: Sendable {
             groupsByName[group.name] = group
             runtime[group.name] = GroupRuntime(
                 selectedNodeID: group.selectedNodeID,
-                latencies: [:]
+                latencies: [:],
+                rrIndex: 0
             )
         }
         self.nodesByID = nodesByID
@@ -207,7 +242,7 @@ public final class NodeManager: Sendable {
         if let node = nodesByID[name] { return .node(node) }
         guard let group = groupsByName[name] else { return nil }
         guard visited.insert(name).inserted else { return nil }
-        guard let next = pickNodeID(in: group) else { return nil }
+        guard let next = pickNodeID(in: group, target: Endpoint(domain: group.name, port: 0), advance: false) else { return nil }
         return resolveLeaf(name: next, visited: &visited)
     }
 
@@ -219,7 +254,7 @@ public final class NodeManager: Sendable {
             throw NodeError.unknownNode(nodeID)
         }
         runtime.withLock { state in
-            state[groupName, default: GroupRuntime(selectedNodeID: nil, latencies: [:])]
+            state[groupName, default: GroupRuntime(selectedNodeID: nil, latencies: [:], rrIndex: 0)]
                 .selectedNodeID = nodeID
         }
     }
@@ -232,16 +267,23 @@ public final class NodeManager: Sendable {
     }
 
     /// Currently chosen member id (node, nested group, or DIRECT) in `groupName`.
+    /// Display-only: never advances load-balance state.
     public func selectedMemberID(inGroup groupName: String) -> String? {
         guard let group = groupsByName[groupName] else { return nil }
-        return pickNodeID(in: group)
+        return pickNodeID(in: group, target: Endpoint(domain: group.name, port: 0), advance: false)
     }
 
     /// Records a probe RTT used by `.urlTest` groups.
     public func recordLatency(_ latency: Duration, nodeID: String, inGroup groupName: String) {
         runtime.withLock { state in
-            state[groupName, default: GroupRuntime(selectedNodeID: nil, latencies: [:])]
+            state[groupName, default: GroupRuntime(selectedNodeID: nil, latencies: [:], rrIndex: 0)]
                 .latencies[nodeID] = latency
+        }
+    }
+
+    public func clearLatency(nodeID: String, inGroup groupName: String) {
+        runtime.withLock { state in
+            state[groupName]?.latencies[nodeID] = nil
         }
     }
 
@@ -279,14 +321,13 @@ public final class NodeManager: Sendable {
         guard !visited.contains(name) else {
             throw NodeError.emptyGroup(name)
         }
-        let members = orderedMembers(in: group)
+        let members = orderedMembers(in: group, target: target)
         guard !members.isEmpty else {
             throw NodeError.emptyGroup(name)
         }
         let nextVisited = visited.union([name])
-        // Every group (even single-member) is wrapped so the routing label
-        // stays the policy name for per-policy traffic ranking. Clash
-        // `select` groups stay sticky; failover only retries on open failure.
+        // Clash `select` is sticky (no per-flow failover). url-test / fallback
+        // / load-balance still wrap extra members so a dead dial can retry.
         let makers: [(String, () throws -> any OutboundConnection)] = members.map { member in
             (member, { [self] in
                 try resolveConnection(name: member, target: target, command: command, visited: nextVisited)
@@ -297,8 +338,9 @@ public final class NodeManager: Sendable {
 
     /// Selected / first member first, then other members with a **distinct**
     /// server:port (display-only aliases that clone the same endpoint are skipped).
-    private func orderedMembers(in group: PolicyGroup) -> [String] {
-        guard let picked = pickNodeID(in: group) else { return [] }
+    private func orderedMembers(in group: PolicyGroup, target: Endpoint) -> [String] {
+        guard let picked = pickNodeID(in: group, target: target) else { return [] }
+        if group.mode == .select { return [picked] }
         var seen: Set<String> = []
         var result: [String] = []
         for id in [picked] + group.nodeIDs.filter({ $0 != picked }) {
@@ -316,32 +358,39 @@ public final class NodeManager: Sendable {
         return result
     }
 
-    /// url-test probe targets deduplicated by server: a large catalog is
-    /// usually a handful of hosts, so each server is probed once and the
-    /// result attributed to every node/group sharing it.
-    func urlTestProbeTargets() -> [(endpoint: Endpoint, members: [(group: String, nodeID: String)])] {
-        var order: [String] = []
-        var byServer: [String: (endpoint: Endpoint, members: [(group: String, nodeID: String)])] = [:]
-        for group in groupsByName.values where group.mode == .urlTest {
-            for nodeID in group.nodeIDs {
-                guard let node = nodesByID[nodeID], let endpoint = node.probeEndpoint else {
-                    continue
-                }
-                let key = endpoint.description
-                if byServer[key] == nil {
-                    order.append(key)
-                    byServer[key] = (endpoint: endpoint, members: [])
-                }
-                byServer[key]?.members.append((group.name, nodeID))
-            }
-        }
-        return order.compactMap { byServer[$0] }
+    public func healthCheckGroups() -> [PolicyGroup] {
+        groupsByName.values.filter(\.usesHealthCheck).sorted { $0.name < $1.name }
     }
 
-    /// TCP-connects each url-test server once (bounded fan-out) and records
-    /// the RTT for every node sharing that server.
-    public func probeURLTestGroups(maxConcurrent: Int = 6) async {
-        let targets = urlTestProbeTargets()
+    /// Probe jobs keyed by `(nodeID, testURL)` so two groups sharing a node
+    /// and URL only dial once.
+    func urlTestProbeTargets(
+        groupNames: Set<String>? = nil
+    ) -> [(nodeID: String, url: URL, members: [(group: String, nodeID: String)])] {
+        var order: [String] = []
+        var byKey: [String: (nodeID: String, url: URL, members: [(group: String, nodeID: String)])] = [:]
+        for group in healthCheckGroups() {
+            if let groupNames, !groupNames.contains(group.name) { continue }
+            guard let url = URL(string: group.testURL), url.host != nil else { continue }
+            for nodeID in group.nodeIDs {
+                guard nodesByID[nodeID] != nil else { continue }
+                let key = "\(nodeID)|\(group.testURL)"
+                if byKey[key] == nil {
+                    order.append(key)
+                    byKey[key] = (nodeID: nodeID, url: url, members: [])
+                }
+                byKey[key]?.members.append((group.name, nodeID))
+            }
+        }
+        return order.compactMap { byKey[$0] }
+    }
+
+    /// HTTP(S) url-test through each member (Clash `url` / `interval`).
+    public func probeURLTestGroups(
+        groupNames: Set<String>? = nil,
+        maxConcurrent: Int = 6
+    ) async {
+        let targets = urlTestProbeTargets(groupNames: groupNames)
         guard !targets.isEmpty else { return }
 
         await withTaskGroup(of: (Int, Duration?).self) { group in
@@ -353,29 +402,22 @@ public final class NodeManager: Sendable {
                     next += 1
                     inFlight += 1
                     group.addTask {
-                        let connection = DirectOutboundConnection(
-                            endpoint: targets[index].endpoint,
-                            role: .proxyServer
-                        )
-                        let start = ContinuousClock.now
-                        do {
-                            try await connection.open()
-                            let latency = ContinuousClock.now - start
-                            await connection.close()
-                            return (index, latency)
-                        } catch {
-                            await connection.close()
+                        guard let node = self.nodesByID[targets[index].nodeID] else {
                             return (index, nil)
                         }
+                        let latency = await URLTestProber.probe(node: node, url: targets[index].url)
+                        return (index, latency)
                     }
                 }
             }
             enqueue()
             for await (index, latency) in group {
                 inFlight -= 1
-                if let latency {
-                    for member in targets[index].members {
+                for member in targets[index].members {
+                    if let latency {
                         recordLatency(latency, nodeID: member.nodeID, inGroup: member.group)
+                    } else {
+                        clearLatency(nodeID: member.nodeID, inGroup: member.group)
                     }
                 }
                 enqueue()
@@ -383,7 +425,7 @@ public final class NodeManager: Sendable {
         }
     }
 
-    private func pickNodeID(in group: PolicyGroup) -> String? {
+    private func pickNodeID(in group: PolicyGroup, target: Endpoint, advance: Bool = true) -> String? {
         let snapshot = runtime.withLock { $0[group.name] }
         switch group.mode {
         case .select:
@@ -392,16 +434,77 @@ public final class NodeManager: Sendable {
             }
             return group.nodeIDs.first
         case .urlTest:
+            return pickURLTest(group: group, snapshot: snapshot)
+        case .fallback:
             let latencies = snapshot?.latencies ?? [:]
-            let ranked = group.nodeIDs.compactMap { id -> (String, Duration)? in
-                guard let latency = latencies[id] else { return nil }
-                return (id, latency)
-            }
-            if let best = ranked.min(by: { $0.1 < $1.1 }) {
-                return best.0
-            }
+            return group.nodeIDs.first { latencies[$0] != nil } ?? group.nodeIDs.first
+        case .loadBalance:
+            return pickLoadBalance(group: group, snapshot: snapshot, target: target, advance: advance)
+        }
+    }
+
+    private func pickURLTest(group: PolicyGroup, snapshot: GroupRuntime?) -> String? {
+        let latencies = snapshot?.latencies ?? [:]
+        let ranked = group.nodeIDs.compactMap { id -> (String, Duration)? in
+            guard let latency = latencies[id] else { return nil }
+            return (id, latency)
+        }
+        guard let best = ranked.min(by: { $0.1 < $1.1 }) else {
             return group.nodeIDs.first
         }
+        if let current = snapshot?.selectedNodeID,
+           group.nodeIDs.contains(current),
+           let currentRTT = latencies[current],
+           currentRTT <= best.1 + group.tolerance {
+            return current
+        }
+        runtime.withLock { $0[group.name]?.selectedNodeID = best.0 }
+        return best.0
+    }
+
+    private func pickLoadBalance(
+        group: PolicyGroup,
+        snapshot: GroupRuntime?,
+        target: Endpoint,
+        advance: Bool
+    ) -> String? {
+        let latencies = snapshot?.latencies ?? [:]
+        let alive = group.nodeIDs.filter { latencies[$0] != nil }
+        let pool = alive.isEmpty ? group.nodeIDs : alive
+        guard !pool.isEmpty else { return nil }
+        switch group.loadBalanceStrategy {
+        case .roundRobin:
+            let index = runtime.withLock { state -> Int in
+                let current = state[group.name] ?? GroupRuntime(
+                    selectedNodeID: nil,
+                    latencies: [:],
+                    rrIndex: 0
+                )
+                let slot = Int(current.rrIndex % UInt64(pool.count))
+                if advance {
+                    var next = current
+                    next.rrIndex += 1
+                    state[group.name] = next
+                }
+                return slot
+            }
+            return pool[index]
+        case .consistentHashing:
+            // Display calls pass the group name as `target`; show the first
+            // live member instead of hashing a placeholder.
+            guard advance else { return pool.first }
+            let hash = Self.fnv(target.host.description)
+            return pool[Int(hash % UInt64(pool.count))]
+        }
+    }
+
+    private static func fnv(_ string: String) -> UInt64 {
+        var hash: UInt64 = 14695981039346656037
+        for byte in string.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 1099511628211
+        }
+        return hash
     }
 }
 

@@ -1,15 +1,23 @@
 import Foundation
 
-/// Shared minimal DNS wire codec (one A question) used by the UDP and DoH
-/// nameserver transports.
+/// Shared minimal DNS wire codec used by the UDP and DoH nameserver transports.
 public enum DNSWire {
+    public static let typeA: UInt16 = 1
+    public static let typeAAAA: UInt16 = 28
+
     /// One A answer with its TTL.
     public struct Record: Sendable, Equatable {
         public var address: IPv4Address
         public var ttl: UInt32
     }
 
-    static func makeQuery(id queryID: UInt16, domain: String) -> Data {
+    /// One AAAA answer with its TTL.
+    public struct AAAARecord: Sendable, Equatable {
+        public var address: IPv6Address
+        public var ttl: UInt32
+    }
+
+    static func makeQuery(id queryID: UInt16, domain: String, type: UInt16 = typeA) -> Data {
         var data = Data()
         data.append(UInt8(truncatingIfNeeded: queryID >> 8))
         data.append(UInt8(truncatingIfNeeded: queryID))
@@ -21,7 +29,9 @@ public enum DNSWire {
             data.append(contentsOf: bytes)
         }
         data.append(0)
-        data.append(contentsOf: [0x00, 0x01, 0x00, 0x01]) // A IN
+        data.append(UInt8(truncatingIfNeeded: type >> 8))
+        data.append(UInt8(truncatingIfNeeded: type))
+        data.append(contentsOf: [0x00, 0x01]) // IN
         return data
     }
 
@@ -55,7 +65,7 @@ public enum DNSWire {
             let length = Int(data[nameEnd + 8]) << 8 | Int(data[nameEnd + 9])
             let rdata = nameEnd + 10
             guard rdata + length <= data.count else { break }
-            if type == 1, length == 4 {
+            if type == Int(typeA), length == 4 {
                 results.append(
                     Record(
                         address: IPv4Address(data[rdata], data[rdata + 1], data[rdata + 2], data[rdata + 3]),
@@ -66,6 +76,47 @@ public enum DNSWire {
             cursor = rdata + length
         }
         return results
+    }
+
+    static func aaaaRecords(in data: Data, expectedID: UInt16) -> [AAAARecord] {
+        guard data.count >= 12 else { return [] }
+        let id = UInt16(data[0]) << 8 | UInt16(data[1])
+        guard id == expectedID else { return [] }
+        let questionCount = Int(data[4]) << 8 | Int(data[5])
+        let answerCount = Int(data[6]) << 8 | Int(data[7])
+        guard answerCount > 0 else { return [] }
+        var offset = 12
+        for _ in 0..<questionCount {
+            guard let next = skipName(data, offset), next + 4 <= data.count else { return [] }
+            offset = next + 4
+        }
+        var results: [AAAARecord] = []
+        var cursor = offset
+        for _ in 0..<answerCount {
+            guard let nameEnd = skipName(data, cursor), nameEnd + 10 <= data.count else { break }
+            let type = Int(data[nameEnd]) << 8 | Int(data[nameEnd + 1])
+            let ttl = UInt32(data[nameEnd + 4]) << 24 | UInt32(data[nameEnd + 5]) << 16
+                | UInt32(data[nameEnd + 6]) << 8 | UInt32(data[nameEnd + 7])
+            let length = Int(data[nameEnd + 8]) << 8 | Int(data[nameEnd + 9])
+            let rdata = nameEnd + 10
+            guard rdata + length <= data.count else { break }
+            if type == Int(typeAAAA), length == 16 {
+                results.append(AAAARecord(address: ipv6(data, at: rdata), ttl: ttl))
+            }
+            cursor = rdata + length
+        }
+        return results
+    }
+
+    private static func ipv6(_ data: Data, at offset: Int) -> IPv6Address {
+        func word(_ index: Int) -> UInt64 {
+            var value: UInt64 = 0
+            for byte in 0..<8 {
+                value = (value << 8) | UInt64(data[offset + index + byte])
+            }
+            return value
+        }
+        return IPv6Address(high: word(0), low: word(8))
     }
 
     private static func skipName(_ data: Data, _ offset: Int) -> Int? {
