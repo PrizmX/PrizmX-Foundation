@@ -23,13 +23,19 @@ public protocol ConfigParserProtocol: Sendable {
 
 /// Convenience entry that picks Clash YAML vs sing-box JSON from the first non-space character.
 public enum ConfigAdapter: Sendable {
-    public static func parse(rawString: String) throws -> (Router, NodeManager) {
+    public static func parse(
+        rawString: String,
+        overlay: ProfileOverlay = .empty
+    ) throws -> (Router, NodeManager) {
         let trimmed = rawString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw ConfigError.emptyInput }
+        let parsed: (Router, NodeManager)
         if trimmed.first == "{" || trimmed.first == "[" {
-            return try SingboxConfigParser().parse(rawString: rawString)
+            parsed = try SingboxConfigParser().parse(rawString: rawString)
+        } else {
+            parsed = try ClashConfigParser().parse(rawString: rawString)
         }
-        return try ClashConfigParser().parse(rawString: rawString)
+        return try overlay.apply(to: parsed)
     }
 }
 

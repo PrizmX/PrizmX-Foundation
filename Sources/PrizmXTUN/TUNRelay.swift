@@ -51,7 +51,22 @@ private actor UDPRelayState {
         }
         guard let session = sessions[key] else { return }
         await session.send(datagram.payload, destination: datagram.destination)
-        engine.traffic.addBytes(up: UInt64(datagram.payload.count), down: 0, via: session.via)
+        engine.traffic.addBytes(
+            up: UInt64(datagram.payload.count),
+            down: 0,
+            via: session.via,
+            app: session.attribution
+        )
+    }
+
+    private func attribution(for key: UDPFlowKey, datagram: TUNUDPDatagram) -> FlowAttribution? {
+        engine.flowAttributor?.attribute(
+            transport: .udp,
+            localAddress: key.client.description,
+            localPort: key.clientPort,
+            remoteAddress: datagram.destination.host.description,
+            remotePort: datagram.destination.port
+        )
     }
 
     func stop() async {
@@ -99,7 +114,8 @@ private actor UDPRelayState {
             clientPort: key.clientPort,
             destinationPort: key.destinationPort,
             stack: stack,
-            traffic: engine.traffic
+            traffic: engine.traffic,
+            attribution: attribution(for: key, datagram: datagram)
         )
         sessions[key] = session
         tasks[key] = Task { await session.pump() }
@@ -149,7 +165,8 @@ private actor UDPRelayState {
                     clientPort: key.clientPort,
                     destinationPort: key.destinationPort,
                     stack: stack,
-                    traffic: engine.traffic
+                    traffic: engine.traffic,
+                    attribution: attribution(for: key, datagram: datagram)
                 )
                 sessions[key] = session
                 tasks[key] = Task { await session.pump() }
@@ -190,7 +207,8 @@ private actor UDPRelayState {
                 clientPort: key.clientPort,
                 destinationPort: key.destinationPort,
                 stack: stack,
-                traffic: engine.traffic
+                traffic: engine.traffic,
+                attribution: attribution(for: key, datagram: datagram)
             )
             sessions[key] = session
             tasks[key] = Task { await session.pump() }
@@ -207,12 +225,14 @@ private struct UDPFlowKey: Hashable, Sendable {
 private protocol UDPSession: AnyObject, Sendable {
     /// Routing label for traffic accounting (`direct` / policy name).
     var via: String { get }
+    var attribution: FlowAttribution? { get }
     func send(_ payload: Data, destination: Endpoint) async
     func close() async
 }
 
 private final class DirectUDPSession: UDPSession, @unchecked Sendable {
     let via = "direct"
+    let attribution: FlowAttribution?
     private let connection: NWConnection
     private let client: IPv4Address
     private let clientPort: UInt16
@@ -226,7 +246,8 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
         clientPort: UInt16,
         destinationPort: UInt16,
         stack: TUNStack,
-        traffic: TrafficCounter
+        traffic: TrafficCounter,
+        attribution: FlowAttribution?
     ) {
         self.connection = connection
         self.client = client
@@ -234,6 +255,7 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
         self.destinationPort = destinationPort
         self.stack = stack
         self.traffic = traffic
+        self.attribution = attribution
     }
 
     func send(_ payload: Data, destination _: Endpoint) async {
@@ -243,7 +265,7 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
     func pump() async {
         while !Task.isCancelled {
             guard let data = await connection.receiveDatagram(), !data.isEmpty else { return }
-            traffic.addBytes(up: 0, down: UInt64(data.count), via: via)
+            traffic.addBytes(up: 0, down: UInt64(data.count), via: via, app: attribution)
             await stack.sendUDP(
                 destinationIP: client.rawValue,
                 destinationPort: clientPort,
@@ -260,6 +282,7 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
 
 private final class StreamUDPSession: UDPSession, @unchecked Sendable {
     let via: String
+    let attribution: FlowAttribution?
     private let outbound: any OutboundConnection
     private let client: IPv4Address
     private let clientPort: UInt16
@@ -274,10 +297,12 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
         clientPort: UInt16,
         destinationPort: UInt16,
         stack: TUNStack,
-        traffic: TrafficCounter
+        traffic: TrafficCounter,
+        attribution: FlowAttribution?
     ) {
         self.outbound = outbound
         self.via = via
+        self.attribution = attribution
         self.client = client
         self.clientPort = clientPort
         self.destinationPort = destinationPort
@@ -296,7 +321,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
                 let chunk = try await outbound.readData(upTo: 16 * 1024)
                 if chunk.isEmpty { break }
                 for payload in decoder.feed(chunk) {
-                    traffic.addBytes(up: 0, down: UInt64(payload.count), via: via)
+                    traffic.addBytes(up: 0, down: UInt64(payload.count), via: via, app: attribution)
                     await stack.sendUDP(
                         destinationIP: client.rawValue,
                         destinationPort: clientPort,
@@ -318,6 +343,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
 
 private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
     let via: String
+    let attribution: FlowAttribution?
     private let connection: NWConnection
     private let preSharedKey: [UInt8]
     private let cipher: ShadowsocksCipher
@@ -336,12 +362,14 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
         clientPort: UInt16,
         destinationPort: UInt16,
         stack: TUNStack,
-        traffic: TrafficCounter
+        traffic: TrafficCounter,
+        attribution: FlowAttribution?
     ) {
         self.connection = connection
         self.preSharedKey = preSharedKey
         self.cipher = cipher
         self.via = via
+        self.attribution = attribution
         self.client = client
         self.clientPort = clientPort
         self.destinationPort = destinationPort
@@ -367,7 +395,7 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
                 preSharedKey: preSharedKey,
                 packet: data
             ) else { continue }
-            traffic.addBytes(up: 0, down: UInt64(decoded.payload.count), via: via)
+            traffic.addBytes(up: 0, down: UInt64(decoded.payload.count), via: via, app: attribution)
             await stack.sendUDP(
                 destinationIP: client.rawValue,
                 destinationPort: clientPort,

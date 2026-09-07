@@ -10,6 +10,7 @@
 //   * PrizmXCore      — engine that dispatches an endpoint through Router + Nodes
 //   * PrizmXConfig    — Clash YAML / sing-box JSON → Engine
 //   * PrizmXTUN       — SwiftTCP userspace stack + FakeIP DNS + engine relay
+//   * PrizmXAttribution — macOS process attribution (libproc). iOS leaves this unused.
 
 import PackageDescription
 
@@ -27,6 +28,7 @@ let package = Package(
         .library(name: "PrizmXCore", targets: ["PrizmXCore"]),
         .library(name: "PrizmXConfig", targets: ["PrizmXConfig"]),
         .library(name: "PrizmXTUN", targets: ["PrizmXTUN"]),
+        .library(name: "PrizmXAttribution", targets: ["PrizmXAttribution"]),
     ],
     dependencies: [
         .package(path: "../SwiftTCP"),
@@ -59,6 +61,14 @@ let package = Package(
                 .product(name: "SwiftTCP", package: "SwiftTCP"),
             ]
         ),
+        .target(
+            name: "PrizmXAttributionC",
+            publicHeadersPath: "include"
+        ),
+        .target(
+            name: "PrizmXAttribution",
+            dependencies: ["PrizmXAttributionC", "PrizmXCore"]
+        ),
         .testTarget(name: "PrizmXProtocolsTests", dependencies: ["PrizmXProtocols"]),
         .testTarget(name: "PrizmXRulesTests", dependencies: ["PrizmXRules"]),
         .testTarget(name: "PrizmXTUNTests", dependencies: ["PrizmXTUN"]),
@@ -69,6 +79,10 @@ let package = Package(
         .testTarget(
             name: "PrizmXConfigTests",
             dependencies: ["PrizmXConfig", "PrizmXCore", "PrizmXNodes", "PrizmXRules", "PrizmXProtocols"]
+        ),
+        .testTarget(
+            name: "PrizmXAttributionTests",
+            dependencies: ["PrizmXAttribution", "PrizmXCore"]
         ),
     ],
     swiftLanguageModes: [.v6]

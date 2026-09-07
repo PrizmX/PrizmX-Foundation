@@ -22,6 +22,7 @@ public struct ExtensionBootstrap: Sendable {
     public var systemDNS: [String]
     /// Node hostnames already resolved in the app.
     public var pinnedNodeAddresses: [String: [IPv4Address]]
+    public var overlay: ProfileOverlay
 
     public init(providerConfiguration: [String: Any]?, options: [String: Any]?) {
         var provider = providerConfiguration ?? [:]
@@ -40,16 +41,19 @@ public struct ExtensionBootstrap: Sendable {
         let dnsFromApp = (provider[TunnelProviderKeys.dnsServers] as? [String]) ?? []
         systemDNS = dnsFromApp.filter { NameserverAddress.isUsableIPv4($0) }
         pinnedNodeAddresses = NodeAddressStore.load()
+        overlay = ProfileOverlayStore.load(from: provider)
     }
 
-    public func makeEngine() throws -> Engine {
+    public func makeEngine(flowAttributor: (any FlowAttributing)? = nil) throws -> Engine {
         try EngineFactory.make(
             configText: configText,
             geoIPURL: geoIPURL,
             geositeURL: geositeURL,
             geositeJSON: geositeJSON,
             systemDNS: systemDNS,
-            pinnedNodeAddresses: pinnedNodeAddresses
+            pinnedNodeAddresses: pinnedNodeAddresses,
+            overlay: overlay,
+            flowAttributor: flowAttributor
         )
     }
 }

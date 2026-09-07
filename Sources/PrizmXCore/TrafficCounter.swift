@@ -27,6 +27,10 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     /// 1s IPC poll stays small.
     public var policyBytes: [String: TrafficByteCount]
     public var domainBytes: [String: TrafficByteCount]
+    /// Cumulative bytes per app accounting key (bundle ID or process name).
+    public var appBytes: [String: TrafficByteCount]
+    /// Display name for each app key (process name).
+    public var appNames: [String: String]
     /// Open TCP splices (Inspector Active).
     public var activeFlows: [FlowRecord]
     /// Recently closed TCP splices (Inspector Recent).
@@ -42,6 +46,8 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         directDownlinkBytes: UInt64 = 0,
         policyBytes: [String: TrafficByteCount] = [:],
         domainBytes: [String: TrafficByteCount] = [:],
+        appBytes: [String: TrafficByteCount] = [:],
+        appNames: [String: String] = [:],
         activeFlows: [FlowRecord] = [],
         recentFlows: [FlowRecord] = []
     ) {
@@ -54,11 +60,38 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         self.directDownlinkBytes = directDownlinkBytes
         self.policyBytes = policyBytes
         self.domainBytes = domainBytes
+        self.appBytes = appBytes
+        self.appNames = appNames
         self.activeFlows = activeFlows
         self.recentFlows = recentFlows
     }
 
     public static let zero = TrafficSnapshot()
+
+    enum CodingKeys: String, CodingKey {
+        case uploadBytesPerSecond, downloadBytesPerSecond
+        case uplinkBytes, downlinkBytes, activeConnections
+        case directUplinkBytes, directDownlinkBytes
+        case policyBytes, domainBytes, appBytes, appNames
+        case activeFlows, recentFlows
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        uploadBytesPerSecond = try container.decode(Double.self, forKey: .uploadBytesPerSecond)
+        downloadBytesPerSecond = try container.decode(Double.self, forKey: .downloadBytesPerSecond)
+        uplinkBytes = try container.decode(UInt64.self, forKey: .uplinkBytes)
+        downlinkBytes = try container.decode(UInt64.self, forKey: .downlinkBytes)
+        activeConnections = try container.decode(Int.self, forKey: .activeConnections)
+        directUplinkBytes = try container.decode(UInt64.self, forKey: .directUplinkBytes)
+        directDownlinkBytes = try container.decode(UInt64.self, forKey: .directDownlinkBytes)
+        policyBytes = try container.decodeIfPresent([String: TrafficByteCount].self, forKey: .policyBytes) ?? [:]
+        domainBytes = try container.decodeIfPresent([String: TrafficByteCount].self, forKey: .domainBytes) ?? [:]
+        appBytes = try container.decodeIfPresent([String: TrafficByteCount].self, forKey: .appBytes) ?? [:]
+        appNames = try container.decodeIfPresent([String: String].self, forKey: .appNames) ?? [:]
+        activeFlows = try container.decodeIfPresent([FlowRecord].self, forKey: .activeFlows) ?? []
+        recentFlows = try container.decodeIfPresent([FlowRecord].self, forKey: .recentFlows) ?? []
+    }
 }
 
 /// One TCP splice for Inspector (open or closed).
@@ -74,6 +107,7 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
     public var remoteEnd: String
     public var closed: Bool
     public var rule: String
+    public var attribution: FlowAttribution?
 
     public init(
         id: UUID = UUID(),
@@ -86,7 +120,8 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
         clientEnd: String = "",
         remoteEnd: String = "",
         closed: Bool = true,
-        rule: String = ""
+        rule: String = "",
+        attribution: FlowAttribution? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -99,6 +134,7 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
         self.remoteEnd = remoteEnd
         self.closed = closed
         self.rule = rule
+        self.attribution = attribution
     }
 }
 
@@ -118,6 +154,8 @@ public final class TrafficCounter: Sendable {
         var directDown: UInt64 = 0
         var policy: [String: TrafficByteCount] = [:]
         var domains: [String: TrafficByteCount] = [:]
+        var apps: [String: TrafficByteCount] = [:]
+        var appNames: [String: String] = [:]
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: State())
@@ -153,7 +191,7 @@ public final class TrafficCounter: Sendable {
     /// Datagram / splice bytes with the routing label of the pipe they
     /// crossed. `direct` feeds the Direct bucket; every other label (policy
     /// group, bare proxy) is proxied traffic ranked per policy.
-    public func addBytes(up: UInt64, down: UInt64, via: String) {
+    public func addBytes(up: UInt64, down: UInt64, via: String, app: FlowAttribution? = nil) {
         lock.withLock { state in
             state.uplinkBytes &+= up
             state.downlinkBytes &+= down
@@ -165,6 +203,16 @@ public final class TrafficCounter: Sendable {
                 count.up &+= up
                 count.down &+= down
                 state.policy[via] = count
+            }
+            if let app {
+                let key = app.accountingKey
+                var count = state.apps[key] ?? TrafficByteCount()
+                count.up &+= up
+                count.down &+= down
+                state.apps[key] = count
+                if state.appNames[key] == nil {
+                    state.appNames[key] = app.processName
+                }
             }
         }
     }
@@ -199,6 +247,7 @@ public final class TrafficCounter: Sendable {
             state.sampleAt = now
             state.sampleUp = state.uplinkBytes
             state.sampleDown = state.downlinkBytes
+            let topApps = Self.top(state.apps, cap: snapshotMapCap)
             return TrafficSnapshot(
                 uploadBytesPerSecond: upRate,
                 downloadBytesPerSecond: downRate,
@@ -209,6 +258,8 @@ public final class TrafficCounter: Sendable {
                 directDownlinkBytes: state.directDown,
                 policyBytes: Self.top(state.policy, cap: snapshotMapCap),
                 domainBytes: Self.top(state.domains, cap: snapshotMapCap),
+                appBytes: topApps,
+                appNames: state.appNames.filter { topApps[$0.key] != nil },
                 activeFlows: Array(state.open.values.sorted { $0.startedAt > $1.startedAt }.prefix(snapshotMapCap)),
                 recentFlows: Array(state.recent.suffix(snapshotMapCap).reversed())
             )

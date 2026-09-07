@@ -161,12 +161,21 @@ public final class MixedPortServer: @unchecked Sendable {
 
 private final class NWInboundStream: InboundStream, @unchecked Sendable {
     let endpoint: Endpoint
+    let clientAddress: String
+    let clientPort: UInt16
     private let connection: NWConnection
     private let leftover = OSAllocatedUnfairLock<Data>(initialState: Data())
 
     init(endpoint: Endpoint, connection: NWConnection, leftover seed: Data) {
         self.endpoint = endpoint
         self.connection = connection
+        if case .hostPort(let host, let port) = connection.endpoint {
+            self.clientAddress = "\(host)"
+            self.clientPort = port.rawValue
+        } else {
+            self.clientAddress = ""
+            self.clientPort = 0
+        }
         leftover.withLock { $0 = seed }
     }
 

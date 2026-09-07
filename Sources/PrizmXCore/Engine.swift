@@ -19,6 +19,8 @@ public final class Engine: Sendable {
     public let nodeManager: NodeManager
     public let dns: DNSClient
     public let traffic: TrafficCounter
+    /// Optional; nil on iOS and in tests. macOS Packet Tunnel injects process lookup.
+    public let flowAttributor: (any FlowAttributing)?
 
     private struct Runtime: Sendable {
         var mode: OutboundMode
@@ -34,12 +36,14 @@ public final class Engine: Sendable {
         dns: DNSClient = DNSClient(settings: .bootstrap(physicalIPs: [])),
         traffic: TrafficCounter = TrafficCounter(),
         outboundMode: OutboundMode = .rule,
-        globalGroup: String? = nil
+        globalGroup: String? = nil,
+        flowAttributor: (any FlowAttributing)? = nil
     ) {
         self.router = router
         self.nodeManager = nodeManager
         self.dns = dns
         self.traffic = traffic
+        self.flowAttributor = flowAttributor
         self.runtime = OSAllocatedUnfairLock(
             initialState: Runtime(
                 mode: outboundMode,

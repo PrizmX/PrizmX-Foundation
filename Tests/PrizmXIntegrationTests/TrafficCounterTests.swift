@@ -51,6 +51,20 @@ import PrizmXProtocols
     #expect(snapshot.activeFlows.isEmpty)
 }
 
+@Test func trafficCounterRanksApps() {
+    let counter = TrafficCounter()
+    let safari = FlowAttribution(
+        pid: 1,
+        processName: "Safari",
+        bundleID: "com.apple.Safari"
+    )
+    counter.addBytes(up: 10, down: 90, via: "Proxies", app: safari)
+    counter.addBytes(up: 5, down: 5, via: "direct", app: safari)
+    let snapshot = counter.snapshot()
+    #expect(snapshot.appBytes["com.apple.Safari"] == TrafficByteCount(up: 15, down: 95))
+    #expect(snapshot.appNames["com.apple.Safari"] == "Safari")
+}
+
 @Test func trafficCounterTracksOpenAndClearsRecent() {
     let counter = TrafficCounter()
     let open = FlowRecord(

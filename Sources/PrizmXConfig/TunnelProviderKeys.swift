@@ -5,6 +5,8 @@ public enum TunnelProviderKeys: Sendable {
     /// The config text itself is never stored in the profile:
     /// NetworkExtension profiles cap at 512 KB.
     public static let configPath = "configPath"
+    /// Relative path of the active `ProfileOverlay` JSON (App Group).
+    public static let overlayPath = "overlayPath"
     /// GeoIP `.mmdb` / `.metadb` path: App Group-relative, or absolute.
     public static let geoIPPath = "geoIPPath"
     /// `geosite.dat` (or a small JSON fixture) path: App Group-relative, or absolute.

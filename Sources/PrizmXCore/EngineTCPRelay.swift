@@ -8,9 +8,17 @@ import PrizmXProtocols
 /// (`NWInboundStream`) both conform so splice logic stays in Core.
 public protocol InboundStream: Sendable {
     var endpoint: Endpoint { get }
+    /// Client (app) address/port of the original socket, when known.
+    var clientAddress: String { get }
+    var clientPort: UInt16 { get }
     func read() async throws -> Data?
     func write(_ data: Data) async throws
     func close() async
+}
+
+extension InboundStream {
+    public var clientAddress: String { "" }
+    public var clientPort: UInt16 { 0 }
 }
 
 /// Splices an inbound TCP stream through `Engine.dispatch`, recording traffic
@@ -21,6 +29,13 @@ public enum EngineTCPRelay: Sendable {
         let prepared = await Self.prepare(stream: stream)
         let inbound = prepared.stream
         let target = prepared.endpoint
+        let attribution = engine.flowAttributor?.attribute(
+            transport: .tcp,
+            localAddress: inbound.clientAddress,
+            localPort: inbound.clientPort,
+            remoteAddress: target.host.description,
+            remotePort: target.port
+        )
         let ipv4 = await engine.resolveIPv4(for: target)
         let outbound: any OutboundConnection
         let rule: String
@@ -46,10 +61,14 @@ public enum EngineTCPRelay: Sendable {
                 endpoint: target,
                 via: via,
                 closed: false,
-                rule: rule
+                rule: rule,
+                attribution: attribution
             )
         )
-        TunnelLog.write(.debug, "flow opened \(target) via \(via)")
+        TunnelLog.write(
+            .debug,
+            "flow opened \(target) via \(via)\(attribution.map { " app=\($0.accountingKey)" } ?? "")"
+        )
         let started = ContinuousClock.now
         let tally = FlowTally()
         await withTaskGroup(of: Void.self) { group in
@@ -59,7 +78,7 @@ public enum EngineTCPRelay: Sendable {
                         try await outbound.writeAll(chunk)
                         tally.addUp(chunk.count)
                         let bytes = UInt64(chunk.count)
-                        engine.traffic.addBytes(up: bytes, down: 0, via: via)
+                        engine.traffic.addBytes(up: bytes, down: 0, via: via, app: attribution)
                         engine.traffic.addFlowBytes(id: flowID, up: bytes, down: 0)
                     }
                     tally.clientEnded("eof")
@@ -79,7 +98,7 @@ public enum EngineTCPRelay: Sendable {
                         try await inbound.write(data)
                         tally.addDown(data.count)
                         let bytes = UInt64(data.count)
-                        engine.traffic.addBytes(up: 0, down: bytes, via: via)
+                        engine.traffic.addBytes(up: 0, down: bytes, via: via, app: attribution)
                         engine.traffic.addFlowBytes(id: flowID, up: 0, down: bytes)
                     }
                 } catch {
@@ -104,7 +123,8 @@ public enum EngineTCPRelay: Sendable {
                 clientEnd: snapshot.client,
                 remoteEnd: snapshot.remote,
                 closed: true,
-                rule: rule
+                rule: rule,
+                attribution: attribution
             )
         )
         TunnelLog.write(
@@ -180,6 +200,8 @@ private struct PreparedStream: Sendable {
 
 private final class PrefixedInboundStream: InboundStream, @unchecked Sendable {
     let endpoint: Endpoint
+    var clientAddress: String { inner.clientAddress }
+    var clientPort: UInt16 { inner.clientPort }
     private let inner: any InboundStream
     private let leftover = OSAllocatedUnfairLock<Data>(initialState: Data())
 

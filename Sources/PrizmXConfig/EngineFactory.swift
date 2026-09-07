@@ -16,18 +16,20 @@ public enum EngineFactory: Sendable {
         systemDNS: [String] = [],
         pinnedNodeAddresses: [String: [IPv4Address]] = [:],
         outboundMode: OutboundMode? = nil,
-        globalGroup: String? = nil
+        globalGroup: String? = nil,
+        overlay: ProfileOverlay = .empty,
+        flowAttributor: (any FlowAttributing)? = nil
     ) throws -> Engine {
         let parsed: (Router, NodeManager)
         if let configText {
             let trimmed = configText.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
-                parsed = Self.directOnly()
+                parsed = try overlay.apply(to: Self.directOnly())
             } else {
-                parsed = try ConfigAdapter.parse(rawString: trimmed)
+                parsed = try ConfigAdapter.parse(rawString: trimmed, overlay: overlay)
             }
         } else {
-            parsed = Self.directOnly()
+            parsed = try overlay.apply(to: Self.directOnly())
         }
 
         let dnsSection = configText.flatMap { ClashDNSSection.parse(from: $0) }
@@ -77,7 +79,8 @@ public enum EngineFactory: Sendable {
             nodeManager: nodeManager,
             dns: dns,
             outboundMode: mode,
-            globalGroup: group
+            globalGroup: group,
+            flowAttributor: flowAttributor
         )
     }
 
