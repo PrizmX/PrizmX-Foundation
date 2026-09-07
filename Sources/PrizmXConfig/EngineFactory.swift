@@ -18,7 +18,8 @@ public enum EngineFactory: Sendable {
         outboundMode: OutboundMode? = nil,
         globalGroup: String? = nil,
         overlay: ProfileOverlay = .empty,
-        flowAttributor: (any FlowAttributing)? = nil
+        flowAttributor: (any FlowAttributing)? = nil,
+        dnsPersistenceURL: URL? = DNSClient.defaultPersistenceURL
     ) throws -> Engine {
         let parsed: (Router, NodeManager)
         if let configText {
@@ -46,7 +47,7 @@ public enum EngineFactory: Sendable {
         )
         let dns = DNSClient(
             settings: dnsSettings,
-            persistenceURL: DNSClient.defaultPersistenceURL,
+            persistenceURL: dnsPersistenceURL,
             pinnedNodeAddresses: pinnedNodeAddresses
         )
 

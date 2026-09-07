@@ -18,9 +18,10 @@ public final class MixedPortServer: @unchecked Sendable {
         self.allowLAN = allowLAN
     }
 
-    public func start() throws {
+    public func start() async throws {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
+        parameters.preferNoProxies = true
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw OutboundError.invalidEndpoint(Endpoint(host: .ipv4(.loopback), port: port))
         }
@@ -39,7 +40,28 @@ public final class MixedPortServer: @unchecked Sendable {
             connection.start(queue: .global(qos: .userInitiated))
             Task { await self.handle(connection) }
         }
-        listener.start(queue: .global(qos: .utility))
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let settled = OSAllocatedUnfairLock(initialState: false)
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    settled.withLock { done in
+                        guard !done else { return }
+                        done = true
+                        cont.resume()
+                    }
+                case .failed(let error):
+                    settled.withLock { done in
+                        guard !done else { return }
+                        done = true
+                        cont.resume(throwing: error)
+                    }
+                default:
+                    break
+                }
+            }
+            listener.start(queue: .global(qos: .utility))
+        }
         listenerBox.withLock { $0 = listener }
         TunnelLog.write(.info, "mixed-port listen \(allowLAN ? "0.0.0.0" : "127.0.0.1"):\(port)")
     }
