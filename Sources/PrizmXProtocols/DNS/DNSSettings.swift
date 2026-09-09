@@ -96,9 +96,9 @@ public struct DNSSettings: Sendable, Hashable {
     /// Clash `fake-ip-filter` — these domains never receive fake IPs.
     public var fakeIPFilter: [String]
     /// Clash `dns.ipv6`. When false (default), FakeDNS answers AAAA with
-    /// NODATA so clients use IPv4 FakeIP. When true, DIRECT / filter names
-    /// get real AAAA (kernel NIC) and proxied names get FakeIPv6
-    /// (`fd11:4514:1919:6472::/64`).
+    /// NODATA so clients use IPv4 FakeIP. When true, PROXY and DIRECT names
+    /// get FakeIPv6 (`fd11:4514:1919:6472::/64`); filter / node hosts still
+    /// get a real AAAA.
     public var ipv6: Bool
     /// Fallback positive-cache lifetime when the answer carries no TTL.
     public var cacheTTL: TimeInterval

@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import PrizmXTUN
 import PrizmXProtocols
+import PrizmXRules
 
 @Suite(.serialized)
 struct SwiftTCPStackTests {
@@ -58,18 +59,51 @@ struct SwiftTCPStackTests {
         }
         await stack.start()
 
-        var query = Data()
-        query.append(contentsOf: [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-        query.append(3); query.append(contentsOf: Array("www".utf8))
-        query.append(7); query.append(contentsOf: Array("example".utf8))
-        query.append(3); query.append(contentsOf: Array("com".utf8))
-        query.append(0)
-        query.append(contentsOf: [0x00, 0x01, 0x00, 0x01])
-        let datagram = UDPDatagram(sourcePort: 53_000, destinationPort: 53, payload: query)
-            .encode(source: IPv4Address(198, 18, 0, 1), destination: FakeIPAllocator.dns)
-        await stack.input(packets: [datagram])
+        await stack.input(packets: [dnsQueryPacket(name: "www.example.com")])
         #expect(!box.packets.isEmpty)
         #expect(pool.count == 1)
+
+        await stack.stop()
+    }
+
+    @Test func fakeDNSAllocatesFakeIPWhenPolicyIsDirect() async throws {
+        final class OutputBox: @unchecked Sendable {
+            var packets: [Data] = []
+        }
+        let box = OutputBox()
+        let pool = FakeIPAllocator()
+        let stack = TUNStack(fakeIP: pool, dnsPolicy: { _ in .direct }) { packets in
+            box.packets.append(contentsOf: packets)
+        }
+        await stack.start()
+
+        await stack.input(packets: [dnsQueryPacket(name: "www.example.com")])
+        #expect(pool.count == 1)
+        let parsed = try box.packets[0].withUnsafeBytes { try RawIPPacket($0) }
+        let udp = try #require(parsed.payload.flatMap { UDPDatagram.parse(ipPayload: $0) })
+        #expect(udp.payload[6] == 0 && udp.payload[7] == 1) // ANCOUNT 1
+        #expect(udp.payload.suffix(4).starts(with: [198, 18]))
+
+        await stack.stop()
+    }
+
+    @Test func fakeDNSReturnsNODATAWhenPolicyIsReject() async throws {
+        final class OutputBox: @unchecked Sendable {
+            var packets: [Data] = []
+        }
+        let box = OutputBox()
+        let pool = FakeIPAllocator()
+        let stack = TUNStack(fakeIP: pool, dnsPolicy: { _ in .reject }) { packets in
+            box.packets.append(contentsOf: packets)
+        }
+        await stack.start()
+
+        await stack.input(packets: [dnsQueryPacket(name: "ads.example")])
+        #expect(pool.count == 0)
+        #expect(!box.packets.isEmpty)
+        let parsed = try box.packets[0].withUnsafeBytes { try RawIPPacket($0) }
+        let udp = try #require(parsed.payload.flatMap { UDPDatagram.parse(ipPayload: $0) })
+        #expect(udp.payload[6] == 0 && udp.payload[7] == 0) // ANCOUNT 0
 
         await stack.stop()
     }
@@ -95,4 +129,18 @@ struct SwiftTCPStackTests {
         #expect(received.payload == payload)
         await stack.stop()
     }
+}
+
+/// Builds a UDP-encapsulated A-record query from a fake client to FakeDNS.
+private func dnsQueryPacket(name: String) -> Data {
+    var query = Data()
+    query.append(contentsOf: [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    for label in name.split(separator: ".") {
+        query.append(UInt8(label.count))
+        query.append(contentsOf: Array(label.utf8))
+    }
+    query.append(0)
+    query.append(contentsOf: [0x00, 0x01, 0x00, 0x01]) // A IN
+    return UDPDatagram(sourcePort: 53_000, destinationPort: 53, payload: query)
+        .encode(source: IPv4Address(198, 18, 0, 1), destination: FakeIPAllocator.dns)
 }

@@ -145,8 +145,8 @@ public final class Engine: Sendable {
         }
     }
 
-    /// FakeDNS-time policy: nested `select` groups that resolve to DIRECT
-    /// (or REJECT) must not receive a FakeIP, so the packet never enters TUN.
+    /// FakeDNS-time policy. REJECT → NODATA. DIRECT (including nested
+    /// `select` → DIRECT) still receives FakeIP so the flow enters TUN.
     public func dnsPolicy(host: String) async -> Policy {
         let endpoint = Endpoint(domain: host, port: 443)
         let ipv4 = await resolveIPv4(for: endpoint)

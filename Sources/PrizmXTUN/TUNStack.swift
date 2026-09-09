@@ -116,7 +116,7 @@ public actor TUNStack {
     private let mailbox: TUNMailbox
     private let fakeIPFilter: [String]
     private let dns: DNSClient?
-    /// Clash-style FakeDNS split: Direct/REJECT → real/NODATA; proxy → FakeIP.
+    /// FakeDNS: filter → real; REJECT → NODATA; PROXY and DIRECT → FakeIP.
     private let dnsPolicy: (@Sendable (String) async -> Policy)?
     /// Clash `dns.ipv6`: FakeIPv6 pool + pass IPv6 into SwiftTCP.
     private let ipv6Enabled: Bool
@@ -416,9 +416,9 @@ public actor TUNStack {
         return true
     }
 
-    /// Clash-style FakeDNS split: DIRECT / filter → real record; proxy →
-    /// FakeIP; REJECT → NODATA. AAAA only gets a real / FakeIPv6 answer when
-    /// `dns.ipv6` is on; otherwise NODATA so Happy Eyeballs uses IPv4 FakeIP.
+    /// Surge-style FakeIP capture: filter / node hosts → real record (stay off
+    /// TUN); REJECT → NODATA; PROXY and DIRECT → FakeIP so the flow enters
+    /// TUN and is spliced in userspace. AAAA is NODATA unless `dns.ipv6` is on.
     private func answer(query: DNSQuery, fakeIP: FakeIPAllocator) async {
         let type = query.question.type
         let isA = type == 1
@@ -427,17 +427,16 @@ public actor TUNStack {
             writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
             return
         }
-        // Clash fake-ip-filter: node domains / NTP / .lan always get a real record.
-        let policy = await policyFor(query.question.name)
-        if policy == .direct, let dns {
+        let name = query.question.name
+        if FakeIPFilter.matches(name, patterns: fakeIPFilter), let dns {
             if isAAAA, !ipv6Enabled {
                 writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
                 return
             }
-            replyReal(domain: query.question.name, aaaa: isAAAA, query: query, dns: dns)
+            replyReal(domain: name, aaaa: isAAAA, query: query, dns: dns)
             return
         }
-        if policy == .reject {
+        if await policyFor(name) == .reject {
             writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
             return
         }
@@ -460,13 +459,15 @@ public actor TUNStack {
         writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
     }
 
+    /// Only REJECT is decided at DNS time; filter names never reach this
+    /// (`answer` handles them first), and DIRECT no longer needs DNS-time
+    /// resolution — the rule runs again when the flow arrives.
     private func policyFor(_ name: String) async -> Policy? {
-        if FakeIPFilter.matches(name, patterns: fakeIPFilter) { return .direct }
         guard let dnsPolicy else { return nil }
         return await dnsPolicy(name)
     }
 
-    /// Upstream-resolves DIRECT names off the packet path, then writes back.
+    /// Upstream-resolves fake-ip-filter / node hosts off the packet path.
     private func replyReal(domain: String, aaaa: Bool, query: DNSQuery, dns: DNSClient) {
         let mailbox = self.mailbox
         Task {
