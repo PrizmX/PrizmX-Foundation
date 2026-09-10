@@ -107,50 +107,29 @@ public struct OverlayRule: Sendable, Hashable, Codable, Equatable, Identifiable 
         let mapped = ConfigMapping.policy(named: policy)
         let value = payload.trimmingCharacters(in: .whitespacesAndNewlines)
         switch type {
-        case .domain:
-            guard !value.isEmpty else { throw ConfigError.malformedRule("DOMAIN") }
-            return RouteRule(type: .domain(value), policy: mapped, noResolve: noResolve)
-        case .domainSuffix:
-            guard !value.isEmpty else { throw ConfigError.malformedRule("DOMAIN-SUFFIX") }
-            return RouteRule(type: .domainSuffix(value), policy: mapped, noResolve: noResolve)
-        case .domainKeyword:
-            guard !value.isEmpty else { throw ConfigError.malformedRule("DOMAIN-KEYWORD") }
-            return RouteRule(type: .domainKeyword(value), policy: mapped, noResolve: noResolve)
-        case .geoIP:
-            guard !value.isEmpty else { throw ConfigError.malformedRule("GEOIP") }
-            return RouteRule(type: .geoIP(code: value), policy: mapped, noResolve: noResolve)
-        case .geosite:
-            guard !value.isEmpty else { throw ConfigError.malformedRule("GEOSITE") }
-            return RouteRule(type: .geosite(tag: value), policy: mapped, noResolve: noResolve)
-        case .matchAll:
-            return RouteRule(type: .matchAll, policy: mapped, noResolve: noResolve)
-        case .ipCIDR:
-            return try compileCIDR(value, policy: mapped)
+        case .domain, .domainSuffix, .domainKeyword, .geoIP, .geosite:
+            guard !value.isEmpty else { throw ConfigError.malformedRule(type.clashType) }
+            fallthrough
+        case .matchAll, .ipCIDR:
+            do {
+                return try RouteRule(type: ruleType(value), policy: mapped, noResolve: noResolve)
+            } catch is RuleCompileError {
+                throw ConfigError.malformedRule("\(type.clashType) \(value)")
+            }
         }
     }
 
-    private func compileCIDR(_ text: String, policy: Policy) throws -> RouteRule {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = trimmed.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
-        let host = String(parts[0])
-        let prefixText = parts.count == 2 ? String(parts[1]) : nil
-        if let v4 = IPv4Address(parsing: host) {
-            let prefix = prefixText.flatMap(UInt8.init) ?? 32
-            guard prefix <= 32 else { throw ConfigError.malformedRule("IP-CIDR \(text)") }
-            let matcher: RouteRule.HostMatcher = prefix == 32
-                ? .ipv4(v4)
-                : .ipv4CIDR(v4, prefixLength: prefix)
-            return RouteRule(matcher, policy: policy, noResolve: noResolve)
+    /// Rebuilds the `RuleType` for the shared throwing compiler.
+    private func ruleType(_ value: String) -> RuleType {
+        switch type {
+        case .domain: .domain(value)
+        case .domainSuffix: .domainSuffix(value)
+        case .domainKeyword: .domainKeyword(value)
+        case .geoIP: .geoIP(code: value)
+        case .geosite: .geosite(tag: value)
+        case .matchAll: .matchAll
+        case .ipCIDR: .ipCIDR(value)
         }
-        if let v6 = IPv6Address(parsing: host) {
-            let prefix = prefixText.flatMap(UInt8.init) ?? 128
-            guard prefix <= 128 else { throw ConfigError.malformedRule("IP-CIDR6 \(text)") }
-            let matcher: RouteRule.HostMatcher = prefix == 128
-                ? .ipv6(v6)
-                : .ipv6CIDR(v6, prefixLength: prefix)
-            return RouteRule(matcher, policy: policy, noResolve: noResolve)
-        }
-        throw ConfigError.malformedRule("IP-CIDR \(text)")
     }
 }
 

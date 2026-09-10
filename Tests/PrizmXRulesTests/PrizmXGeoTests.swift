@@ -52,8 +52,8 @@ private func sampleGeoIPData() -> Data {
     let matcher = try GeoIPMatcher(data: sampleGeoIPData())
     let router = Router(
         rules: [
-            RouteRule(type: .geoIP(code: "CN"), policy: .direct),
-            RouteRule(type: .matchAll, policy: .proxy(targetGroup: "PROXY")),
+            RouteRule(.geoIP(code: "CN"), policy: .direct),
+            RouteRule(.matchAll, policy: .proxy(targetGroup: "PROXY")),
         ],
         default: .direct,
         geoIP: matcher
@@ -70,8 +70,8 @@ private func sampleGeoIPData() -> Data {
     let matcher = try GeoIPMatcher(data: sampleGeoIPData())
     let router = Router(
         rules: [
-            RouteRule(type: .geoIP(code: "CN"), policy: .direct),
-            RouteRule(type: .matchAll, policy: .proxy(targetGroup: "PROXY")),
+            RouteRule(.geoIP(code: "CN"), policy: .direct),
+            RouteRule(.matchAll, policy: .proxy(targetGroup: "PROXY")),
         ],
         default: .direct,
         geoIP: matcher
@@ -84,8 +84,8 @@ private func sampleGeoIPData() -> Data {
     )
     let skipped = Router(
         rules: [
-            RouteRule(type: .geoIP(code: "CN"), policy: .direct, noResolve: true),
-            RouteRule(type: .matchAll, policy: .proxy(targetGroup: "PROXY")),
+            RouteRule(.geoIP(code: "CN"), policy: .direct, noResolve: true),
+            RouteRule(.matchAll, policy: .proxy(targetGroup: "PROXY")),
         ],
         default: .direct,
         geoIP: matcher
@@ -158,8 +158,8 @@ private func sampleGeoIPData() -> Data {
     ])
     let router = Router(
         rules: [
-            RouteRule(type: .geosite(tag: "cn"), policy: .direct),
-            RouteRule(type: .matchAll, policy: .proxy(targetGroup: "PROXY")),
+            RouteRule(.geosite(tag: "cn"), policy: .direct),
+            RouteRule(.matchAll, policy: .proxy(targetGroup: "PROXY")),
         ],
         default: .direct,
         geosite: geosite

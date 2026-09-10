@@ -370,27 +370,31 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
 
         if kind == "MATCH" || kind == "FINAL" {
             guard parts.count >= 2 else { throw ConfigError.malformedRule(raw) }
-            return RouteRule(type: .matchAll, policy: ConfigMapping.policy(named: parts[1]))
+            return try RouteRule(type: .matchAll, policy: ConfigMapping.policy(named: parts[1]))
         }
         guard parts.count >= 3 else { throw ConfigError.malformedRule(raw) }
         let payload = parts[1]
         let policy = ConfigMapping.policy(named: parts[2])
         let noResolve = parts.dropFirst(3).contains { $0.lowercased() == "no-resolve" }
 
-        switch kind {
-        case "DOMAIN":
-            return RouteRule(type: .domain(payload), policy: policy, noResolve: noResolve)
-        case "DOMAIN-SUFFIX", "DOMAINSUFFIX":
-            return RouteRule(type: .domainSuffix(payload), policy: policy, noResolve: noResolve)
-        case "DOMAIN-KEYWORD", "DOMAINKEYWORD":
-            return RouteRule(type: .domainKeyword(payload), policy: policy, noResolve: noResolve)
-        case "IP-CIDR", "IP-CIDR6", "IPCIDR":
-            return RouteRule(type: .ipCIDR(payload), policy: policy, noResolve: noResolve)
-        case "GEOIP":
-            return RouteRule(type: .geoIP(code: payload), policy: policy, noResolve: noResolve)
-        case "GEOSITE":
-            return RouteRule(type: .geosite(tag: payload), policy: policy)
-        default:
+        do {
+            switch kind {
+            case "DOMAIN":
+                return try RouteRule(type: .domain(payload), policy: policy, noResolve: noResolve)
+            case "DOMAIN-SUFFIX", "DOMAINSUFFIX":
+                return try RouteRule(type: .domainSuffix(payload), policy: policy, noResolve: noResolve)
+            case "DOMAIN-KEYWORD", "DOMAINKEYWORD":
+                return try RouteRule(type: .domainKeyword(payload), policy: policy, noResolve: noResolve)
+            case "IP-CIDR", "IP-CIDR6", "IPCIDR":
+                return try RouteRule(type: .ipCIDR(payload), policy: policy, noResolve: noResolve)
+            case "GEOIP":
+                return try RouteRule(type: .geoIP(code: payload), policy: policy, noResolve: noResolve)
+            case "GEOSITE":
+                return try RouteRule(type: .geosite(tag: payload), policy: policy)
+            default:
+                throw ConfigError.malformedRule(raw)
+            }
+        } catch is RuleCompileError {
             throw ConfigError.malformedRule(raw)
         }
     }

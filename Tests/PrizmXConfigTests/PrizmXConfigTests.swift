@@ -212,6 +212,35 @@ private let expectedNodeCount = 2
     #expect(engine.router.match(host: "example.com", port: 443) == .direct)
 }
 
+@Test func configAdapterRoutesSurgeINIToClashParser() throws {
+    // Regression: `[`-leading Surge INI was misclassified as sing-box JSON.
+    let surge = """
+    [Proxy]
+    ss-us = ss, us.ss.example, 8388, encrypt-method=aes-256-gcm, password=test-password
+
+    [Rule]
+    DOMAIN-SUFFIX,google.com,ss-us
+    FINAL,DIRECT
+    """
+    let (router, nodes) = try ConfigAdapter.parse(rawString: surge)
+    #expect(nodes.nodesByID.count == 1)
+    #expect(router.rules.count == 2)
+    #expect(router.match(endpoint: Endpoint(domain: "www.google.com", port: 443)) == .proxy(targetGroup: "ss-us"))
+}
+
+@Test func clashRulesSkipInvalidCIDRWithoutCrashing() throws {
+    // A bad CIDR line must not trap the tunnel process; the line is skipped.
+    let yaml = """
+    proxies: []
+    rules:
+      - IP-CIDR,not-an-ip,DIRECT
+      - IP-CIDR,10.0.0.0/33,DIRECT
+      - DOMAIN-SUFFIX,google.com,DIRECT
+    """
+    let (router, _) = try ConfigAdapter.parse(rawString: yaml)
+    #expect(router.rules.count == 1)
+}
+
 @Test func engineFactoryHonorsOutboundMode() throws {
     let yaml = """
     proxies:

@@ -1,10 +1,12 @@
 import Foundation
 import Network
 import Dispatch
+import os
 import PrizmXCore
 import PrizmXNodes
 import PrizmXProtocols
 import PrizmXRules
+import SwiftTCP
 
 private typealias IPv4Address = PrizmXProtocols.IPv4Address
 
@@ -32,13 +34,25 @@ private actor UDPRelayState {
 
     func ingest(_ datagram: TUNUDPDatagram) async {
         guard case .ipv4(let clientIP) = datagram.source.host else { return }
+        // Keyed by the full 4-tuple (destination host included): FakeIP gives
+        // each domain its own address, so this uniquely identifies the target
+        // and prevents same-port multi-destination (QUIC/443) misdelivery.
         let key = UDPFlowKey(
             client: clientIP,
             clientPort: datagram.source.port,
+            destinationHost: datagram.destination.host.description,
             destinationPort: datagram.destination.port
         )
         if sessions[key] == nil {
-            guard sessions.count < MemoryWatchdog.maxUDPSessions else { return }
+            if sessions.count >= MemoryWatchdog.maxUDPSessions {
+                // Evict the least-recently-active session instead of dropping
+                // all new UDP traffic until tunnel restart.
+                guard let victim = sessions.min(by: { $0.value.lastActivity < $1.value.lastActivity })?.key,
+                      let evicted = sessions.removeValue(forKey: victim)
+                else { return }
+                tasks.removeValue(forKey: victim)?.cancel()
+                await evicted.close()
+            }
             let ipv4 = await engine.resolveIPv4(for: datagram.destination)
             switch engine.policy(for: datagram.destination, resolvedIPv4: ipv4) {
             case .reject:
@@ -57,6 +71,24 @@ private actor UDPRelayState {
             via: session.via,
             app: session.attribution
         )
+    }
+
+    /// Called when a session's pump loop exits (peer closed / cancelled):
+    /// drop the entry so a later datagram opens a fresh session and the
+    /// session table cannot fill up with dead entries.
+    private func finishSession(_ key: UDPFlowKey) {
+        sessions.removeValue(forKey: key)
+        tasks.removeValue(forKey: key)
+    }
+
+    /// Registers `session` and starts its pump; the pump's exit removes the
+    /// session from the table.
+    private func track(_ key: UDPFlowKey, session: any UDPSession) {
+        sessions[key] = session
+        tasks[key] = Task { [weak self] in
+            await session.pump()
+            await self?.finishSession(key)
+        }
     }
 
     private func attribution(for key: UDPFlowKey, datagram: TUNUDPDatagram) -> FlowAttribution? {
@@ -110,15 +142,12 @@ private actor UDPRelayState {
         connection.start(queue: DispatchQueue.global(qos: .userInitiated))
         let session = DirectUDPSession(
             connection: connection,
-            client: key.client,
-            clientPort: key.clientPort,
-            destinationPort: key.destinationPort,
+            flow: datagram.flow,
             stack: stack,
             traffic: engine.traffic,
             attribution: attribution(for: key, datagram: datagram)
         )
-        sessions[key] = session
-        tasks[key] = Task { await session.pump() }
+        track(key, session: session)
     }
 
     private func openProxy(
@@ -161,15 +190,12 @@ private actor UDPRelayState {
                 let session = StreamUDPSession(
                     outbound: outbound,
                     via: group,
-                    client: key.client,
-                    clientPort: key.clientPort,
-                    destinationPort: key.destinationPort,
+                    flow: datagram.flow,
                     stack: stack,
                     traffic: engine.traffic,
                     attribution: attribution(for: key, datagram: datagram)
                 )
-                sessions[key] = session
-                tasks[key] = Task { await session.pump() }
+                track(key, session: session)
             } catch {
                 return
             }
@@ -203,15 +229,12 @@ private actor UDPRelayState {
                 preSharedKey: cipher.masterKey(fromPassword: password),
                 cipher: cipher,
                 via: group,
-                client: key.client,
-                clientPort: key.clientPort,
-                destinationPort: key.destinationPort,
+                flow: datagram.flow,
                 stack: stack,
                 traffic: engine.traffic,
                 attribution: attribution(for: key, datagram: datagram)
             )
-            sessions[key] = session
-            tasks[key] = Task { await session.pump() }
+            track(key, session: session)
         }
     }
 }
@@ -219,6 +242,8 @@ private actor UDPRelayState {
 private struct UDPFlowKey: Hashable, Sendable {
     var client: IPv4Address
     var clientPort: UInt16
+    /// Destination host (domain restored from FakeIP, or IP literal).
+    var destinationHost: String
     var destinationPort: UInt16
 }
 
@@ -226,52 +251,58 @@ private protocol UDPSession: AnyObject, Sendable {
     /// Routing label for traffic accounting (`direct` / policy name).
     var via: String { get }
     var attribution: FlowAttribution? { get }
+    /// Last send/receive activity; used to evict the idlest session at capacity.
+    var lastActivity: ContinuousClock.Instant { get }
     func send(_ payload: Data, destination: Endpoint) async
+    func pump() async
     func close() async
+}
+
+/// Shared last-activity timestamp for `UDPSession`s.
+private final class ActivityStamp: Sendable {
+    private let lock = OSAllocatedUnfairLock(initialState: ContinuousClock.now)
+    var value: ContinuousClock.Instant { lock.withLock { $0 } }
+    func touch() { lock.withLock { $0 = ContinuousClock.now } }
 }
 
 private final class DirectUDPSession: UDPSession, @unchecked Sendable {
     let via = "direct"
     let attribution: FlowAttribution?
     private let connection: NWConnection
-    private let client: IPv4Address
-    private let clientPort: UInt16
-    private let destinationPort: UInt16
+    private let flow: FlowKey
     private let stack: TUNStack
     private let traffic: TrafficCounter
+    private let activity = ActivityStamp()
+
+    var lastActivity: ContinuousClock.Instant { activity.value }
 
     init(
         connection: NWConnection,
-        client: IPv4Address,
-        clientPort: UInt16,
-        destinationPort: UInt16,
+        flow: FlowKey,
         stack: TUNStack,
         traffic: TrafficCounter,
         attribution: FlowAttribution?
     ) {
         self.connection = connection
-        self.client = client
-        self.clientPort = clientPort
-        self.destinationPort = destinationPort
+        self.flow = flow
         self.stack = stack
         self.traffic = traffic
         self.attribution = attribution
     }
 
+    /// The NWConnection is bound to the first destination; the flow key
+    /// pins the destination, so `destination` always matches the bound peer.
     func send(_ payload: Data, destination _: Endpoint) async {
+        activity.touch()
         connection.send(content: payload, completion: .contentProcessed { _ in })
     }
 
     func pump() async {
         while !Task.isCancelled {
             guard let data = await connection.receiveDatagram(), !data.isEmpty else { return }
+            activity.touch()
             traffic.addBytes(up: 0, down: UInt64(data.count), via: via, app: attribution)
-            await stack.sendUDP(
-                destinationIP: client.rawValue,
-                destinationPort: clientPort,
-                sourcePort: destinationPort,
-                payload: data
-            )
+            await stack.sendUDP(flow: flow, payload: data)
         }
     }
 
@@ -284,18 +315,17 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
     let via: String
     let attribution: FlowAttribution?
     private let outbound: any OutboundConnection
-    private let client: IPv4Address
-    private let clientPort: UInt16
-    private let destinationPort: UInt16
+    private let flow: FlowKey
     private let stack: TUNStack
     private let traffic: TrafficCounter
+    private let activity = ActivityStamp()
+
+    var lastActivity: ContinuousClock.Instant { activity.value }
 
     init(
         outbound: any OutboundConnection,
         via: String,
-        client: IPv4Address,
-        clientPort: UInt16,
-        destinationPort: UInt16,
+        flow: FlowKey,
         stack: TUNStack,
         traffic: TrafficCounter,
         attribution: FlowAttribution?
@@ -303,14 +333,15 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
         self.outbound = outbound
         self.via = via
         self.attribution = attribution
-        self.client = client
-        self.clientPort = clientPort
-        self.destinationPort = destinationPort
+        self.flow = flow
         self.stack = stack
         self.traffic = traffic
     }
 
+    /// The outbound was opened against the first destination; the flow key
+    /// pins the destination, so `destination` always matches.
     func send(_ payload: Data, destination _: Endpoint) async {
+        activity.touch()
         try? await outbound.writeAll(UDPOverStreamFrame.encode(payload))
     }
 
@@ -320,14 +351,10 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
             while !Task.isCancelled {
                 let chunk = try await outbound.readData(upTo: 16 * 1024)
                 if chunk.isEmpty { break }
+                activity.touch()
                 for payload in decoder.feed(chunk) {
                     traffic.addBytes(up: 0, down: UInt64(payload.count), via: via, app: attribution)
-                    await stack.sendUDP(
-                        destinationIP: client.rawValue,
-                        destinationPort: clientPort,
-                        sourcePort: destinationPort,
-                        payload: payload
-                    )
+                    await stack.sendUDP(flow: flow, payload: payload)
                 }
             }
         } catch {
@@ -347,20 +374,19 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
     private let connection: NWConnection
     private let preSharedKey: [UInt8]
     private let cipher: ShadowsocksCipher
-    private let client: IPv4Address
-    private let clientPort: UInt16
-    private let destinationPort: UInt16
+    private let flow: FlowKey
     private let stack: TUNStack
     private let traffic: TrafficCounter
+    private let activity = ActivityStamp()
+
+    var lastActivity: ContinuousClock.Instant { activity.value }
 
     init(
         connection: NWConnection,
         preSharedKey: [UInt8],
         cipher: ShadowsocksCipher,
         via: String,
-        client: IPv4Address,
-        clientPort: UInt16,
-        destinationPort: UInt16,
+        flow: FlowKey,
         stack: TUNStack,
         traffic: TrafficCounter,
         attribution: FlowAttribution?
@@ -370,14 +396,13 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
         self.cipher = cipher
         self.via = via
         self.attribution = attribution
-        self.client = client
-        self.clientPort = clientPort
-        self.destinationPort = destinationPort
+        self.flow = flow
         self.stack = stack
         self.traffic = traffic
     }
 
     func send(_ payload: Data, destination: Endpoint) async {
+        activity.touch()
         guard let packet = try? ShadowsocksUDP.encode(
             cipher: cipher,
             preSharedKey: preSharedKey,
@@ -395,13 +420,9 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
                 preSharedKey: preSharedKey,
                 packet: data
             ) else { continue }
+            activity.touch()
             traffic.addBytes(up: 0, down: UInt64(decoded.payload.count), via: via, app: attribution)
-            await stack.sendUDP(
-                destinationIP: client.rawValue,
-                destinationPort: clientPort,
-                sourcePort: destinationPort,
-                payload: decoded.payload
-            )
+            await stack.sendUDP(flow: flow, payload: decoded.payload)
         }
     }
 

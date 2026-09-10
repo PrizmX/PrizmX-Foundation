@@ -59,8 +59,10 @@ public enum OutboundModeStore: Sendable {
             directoryName: directoryName
         )
         state.mode = mode
-        if let globalGroup, !globalGroup.isEmpty {
-            state.globalGroup = globalGroup
+        if let globalGroup {
+            // An explicit empty string clears the global-group override; nil
+            // keeps the stored value.
+            state.globalGroup = globalGroup.isEmpty ? nil : globalGroup
         }
         save(
             state,

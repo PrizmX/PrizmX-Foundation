@@ -35,6 +35,12 @@ public enum RuleType: Hashable, Sendable {
     case matchAll
 }
 
+/// Failure to compile a user-facing `RuleType` into a matcher.
+public enum RuleCompileError: Error, Equatable, Sendable {
+    /// The `ipCIDR` payload is not a valid IP literal or CIDR block.
+    case invalidCIDR(String)
+}
+
 /// A single routing rule.
 public struct RouteRule: Hashable, Sendable {
 
@@ -86,8 +92,11 @@ public struct RouteRule: Hashable, Sendable {
     }
 
     /// Builds a rule from a `RuleType` (parses CIDR strings).
-    public init(type: RuleType, port: UInt16? = nil, policy: Policy, noResolve: Bool = false) {
-        self.init(Self.compile(type), port: port, policy: policy, noResolve: noResolve)
+    ///
+    /// Throws `RuleCompileError.invalidCIDR` for malformed `ipCIDR` payloads
+    /// instead of trapping: rule text is user/config-controlled input.
+    public init(type: RuleType, port: UInt16? = nil, policy: Policy, noResolve: Bool = false) throws {
+        self.init(try Self.compile(type), port: port, policy: policy, noResolve: noResolve)
     }
 
     public var inspectorLabel: String {
@@ -136,7 +145,7 @@ public struct RouteRule: Hashable, Sendable {
         }
     }
 
-    public static func compile(_ type: RuleType) -> HostMatcher {
+    public static func compile(_ type: RuleType) throws -> HostMatcher {
         switch type {
         case .domain(let domain):
             return .domain(domain.lowercased())
@@ -147,7 +156,7 @@ public struct RouteRule: Hashable, Sendable {
         case .matchAll:
             return .matchAll
         case .ipCIDR(let text):
-            return compileCIDR(text)
+            return try parseCIDR(text)
         case .geoIP(code: let code):
             return .geoIP(code: code.uppercased())
         case .geosite(tag: let tag):
@@ -155,7 +164,7 @@ public struct RouteRule: Hashable, Sendable {
         }
     }
 
-    private static func compileCIDR(_ text: String) -> HostMatcher {
+    private static func parseCIDR(_ text: String) throws -> HostMatcher {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
         let host = String(parts[0])
@@ -163,15 +172,15 @@ public struct RouteRule: Hashable, Sendable {
 
         if let v4 = IPv4Address(parsing: host) {
             let prefix = prefixText.flatMap { UInt8($0) } ?? 32
-            precondition(prefix <= 32, "IPv4 CIDR prefix must be 0...32, got \(prefix)")
+            guard prefix <= 32 else { throw RuleCompileError.invalidCIDR(text) }
             return prefix == 32 ? .ipv4(v4) : .ipv4CIDR(v4, prefixLength: prefix)
         }
         if let v6 = IPv6Address(parsing: host) {
             let prefix = prefixText.flatMap { UInt8($0) } ?? 128
-            precondition(prefix <= 128, "IPv6 CIDR prefix must be 0...128, got \(prefix)")
+            guard prefix <= 128 else { throw RuleCompileError.invalidCIDR(text) }
             return prefix == 128 ? .ipv6(v6) : .ipv6CIDR(v6, prefixLength: prefix)
         }
-        preconditionFailure("invalid ipCIDR literal: \(text)")
+        throw RuleCompileError.invalidCIDR(text)
     }
 
     fileprivate static func normalizeSuffix(_ suffix: String) -> String {

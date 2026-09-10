@@ -63,12 +63,12 @@ public final class AnyTLSOutboundConnection: OutboundConnection, @unchecked Send
 
     private let auth: AnyTLSAuth
     private let lifecycle = OSAllocatedUnfairLock(initialState: Lifecycle())
-    private var stream: AnyTLSSessionStream?
     private var leftover = Data()
 
     private struct Lifecycle {
         var state: OutboundConnectionState = .idle
         var openTask: Task<Void, Error>?
+        var stream: AnyTLSSessionStream?
     }
 
     /// - Parameters:
@@ -124,10 +124,11 @@ public final class AnyTLSOutboundConnection: OutboundConnection, @unchecked Send
                 life.state = .connecting
                 let task = Task {
                     TunnelLog.write(.debug, "anytls open \(self.identity.server) → \(self.endpoint)")
-                    self.stream = try await AnyTLSSessionPool.shared.openStream(
+                    let stream = try await AnyTLSSessionPool.shared.openStream(
                         identity: self.identity,
                         to: self.endpoint
                     )
+                    self.lifecycle.withLock { $0.stream = stream }
                 }
                 life.openTask = task
                 return task
@@ -135,9 +136,27 @@ public final class AnyTLSOutboundConnection: OutboundConnection, @unchecked Send
         }
         do {
             try await task.value
-            lifecycle.withLock { $0.state = .established }
+            // A close() racing the in-flight open wins: stay closed and shut
+            // the stream that just arrived instead of resurrecting the
+            // connection back to `.established`.
+            let orphaned: AnyTLSSessionStream? = lifecycle.withLock { life in
+                switch life.state {
+                case .connecting:
+                    life.state = .established
+                    return nil
+                case .closed:
+                    let stream = life.stream
+                    life.stream = nil
+                    return stream
+                case .idle, .established:
+                    return nil
+                }
+            }
+            await orphaned?.close()
         } catch {
-            lifecycle.withLock { $0.state = .idle }
+            lifecycle.withLock { life in
+                if life.state == .connecting { life.state = .idle }
+            }
             throw error
         }
     }
@@ -145,7 +164,9 @@ public final class AnyTLSOutboundConnection: OutboundConnection, @unchecked Send
     public func write(_ buffer: UnsafeRawBufferPointer) async throws -> Int {
         if buffer.isEmpty { return 0 }
         try await ensureOpen()
-        guard let stream else { throw OutboundError.alreadyClosed(endpoint) }
+        guard let stream = lifecycle.withLock({ $0.stream }) else {
+            throw OutboundError.alreadyClosed(endpoint)
+        }
         try await stream.write(buffer)
         return buffer.count
     }
@@ -153,7 +174,9 @@ public final class AnyTLSOutboundConnection: OutboundConnection, @unchecked Send
     public func read(into buffer: UnsafeMutableRawBufferPointer) async throws -> Int {
         if buffer.isEmpty { return 0 }
         try await ensureOpen()
-        guard let stream else { throw OutboundError.alreadyClosed(endpoint) }
+        guard let stream = lifecycle.withLock({ $0.stream }) else {
+            throw OutboundError.alreadyClosed(endpoint)
+        }
         if leftover.isEmpty {
             guard let data = try await stream.readData() else { return 0 }
             leftover = data
@@ -170,9 +193,10 @@ public final class AnyTLSOutboundConnection: OutboundConnection, @unchecked Send
         let current: AnyTLSSessionStream? = lifecycle.withLock { life in
             if life.state == .closed { return nil }
             life.state = .closed
-            return self.stream
+            let stream = life.stream
+            life.stream = nil
+            return stream
         }
-        stream = nil
         await current?.close()
     }
 

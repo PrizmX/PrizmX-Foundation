@@ -5,6 +5,9 @@ public enum TunnelProviderKeys: Sendable {
     /// The config text itself is never stored in the profile:
     /// NetworkExtension profiles cap at 512 KB.
     public static let configPath = "configPath"
+    /// Absolute kit root the Packet Tunnel can read. Not the App Group:
+    /// that vault is unreachable from the root system extension.
+    public static let containerPath = "containerPath"
     /// Relative path of the active `ProfileOverlay` JSON (App Group).
     public static let overlayPath = "overlayPath"
     /// GeoIP `.mmdb` / `.metadb` path: App Group-relative, or absolute.

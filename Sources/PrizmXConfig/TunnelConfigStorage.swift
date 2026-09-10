@@ -14,7 +14,13 @@ public enum TunnelConfigStorage: Sendable {
         appGroupIdentifier: String = defaultAppGroupIdentifier,
         directoryName: String = defaultDirectoryName
     ) -> URL? {
-        FileManager.default
+        // System extension runs as root; `containerURL` would be
+        // `/var/root/Library/Group Containers/…`. Bind the user's kit
+        // root from `providerConfiguration` before reading anything.
+        if let kitRoot = TunnelLog.kitRoot {
+            return kitRoot
+        }
+        return FileManager.default
             .containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
             .appendingPathComponent(directoryName, isDirectory: true)
     }
@@ -63,6 +69,13 @@ public enum TunnelConfigStorage: Sendable {
     public static func configText(from provider: [String: Any]) -> String? {
         guard let path = provider[TunnelProviderKeys.configPath] as? String else {
             return nil
+        }
+        if path.hasPrefix("/") {
+            return try? String(contentsOfFile: path, encoding: .utf8)
+        }
+        if let root = provider[TunnelProviderKeys.containerPath] as? String {
+            let url = URL(fileURLWithPath: root).appendingPathComponent(path)
+            return try? String(contentsOf: url, encoding: .utf8)
         }
         return read(relativePath: path)
     }

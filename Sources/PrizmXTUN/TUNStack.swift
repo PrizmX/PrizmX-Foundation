@@ -107,6 +107,10 @@ public struct TUNUDPDatagram: Sendable {
     public let destination: Endpoint
     public let source: Endpoint
     public let payload: Data
+    /// Original client→server flow; replies are sent back on it directly, so
+    /// no reply-key lookup (which cannot distinguish same-port destinations)
+    /// is involved.
+    let flow: FlowKey
 }
 
 /// Swift façade over SwiftTCP. FakeIP DNS is intercepted here; everything else
@@ -206,27 +210,10 @@ public actor TUNStack {
         )
     }
 
-    /// Send a UDP payload back toward the TUN client.
-    public func sendUDP(destinationIP: UInt32, destinationPort: UInt16, sourcePort: UInt16, payload: Data) async {
+    /// Send a UDP payload back toward the TUN client on the original flow.
+    public func sendUDP(flow: FlowKey, payload: Data) async {
         guard !payload.isEmpty else { return }
-        let key = TUNMailbox.UDPReplyKey(
-            client: destinationIP,
-            clientPort: destinationPort,
-            destPort: sourcePort
-        )
-        if let flow = mailbox.flow(for: key) {
-            await stack?.sendDatagram(flow: flow, payload: payload)
-            return
-        }
-        let reply = UDPDatagram(
-            sourcePort: sourcePort,
-            destinationPort: destinationPort,
-            payload: payload
-        ).encode(
-            source: IPv4Address(rawValue: 0),
-            destination: IPv4Address(rawValue: destinationIP)
-        )
-        mailbox.write(bytes: reply, protocolFamily: AddressFamily.inet)
+        await stack?.sendDatagram(flow: flow, payload: payload)
     }
 
     /// Feed `packetFlow.readPackets` datagrams into SwiftTCP.

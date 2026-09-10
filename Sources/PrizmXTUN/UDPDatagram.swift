@@ -6,18 +6,6 @@ struct UDPDatagram: Sendable {
     var destinationPort: UInt16
     var payload: Data
 
-    static func parse(ipPayload: UnsafeRawBufferPointer) -> UDPDatagram? {
-        guard ipPayload.count >= 8 else { return nil }
-        let length = Int(UInt16(ipPayload[4]) << 8 | UInt16(ipPayload[5]))
-        let payloadEnd = length > 0 ? min(length, ipPayload.count) : ipPayload.count
-        guard payloadEnd >= 8 else { return nil }
-        return UDPDatagram(
-            sourcePort: UInt16(ipPayload[0]) << 8 | UInt16(ipPayload[1]),
-            destinationPort: UInt16(ipPayload[2]) << 8 | UInt16(ipPayload[3]),
-            payload: Data(ipPayload[8..<payloadEnd])
-        )
-    }
-
     func encode(source: IPv4Address, destination: IPv4Address) -> Data {
         let length = 8 + payload.count
         var udp = Data(count: length)

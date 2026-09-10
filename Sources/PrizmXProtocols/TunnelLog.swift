@@ -22,11 +22,27 @@ public enum TunnelLog: Sendable {
     nonisolated(unsafe) private static var writtenOnceKeys = Set<String>()
     nonisolated(unsafe) private static var cachedFormatter: DateFormatter?
 
+    /// Kit root (`…/PrizmXKit`) used when `containerURL` is the wrong user
+    /// (Packet Tunnel system extension runs as root).
+    nonisolated(unsafe) private static var boundKitRoot: URL?
+
+    public static func bind(kitRoot: URL?) {
+        ioQueue.sync { boundKitRoot = kitRoot }
+    }
+
+    /// `…/PrizmXKit` after `bind`; nil when the process should use `containerURL`.
+    public static var kitRoot: URL? {
+        ioQueue.sync { boundKitRoot }
+    }
+
     public static func fileURL(
         appGroupIdentifier: String = defaultAppGroupIdentifier,
         directoryName: String = defaultDirectoryName
     ) -> URL? {
-        FileManager.default
+        if let boundKitRoot {
+            return boundKitRoot.appendingPathComponent(relativePath)
+        }
+        return FileManager.default
             .containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
             .appendingPathComponent(directoryName, isDirectory: true)
             .appendingPathComponent(relativePath)
@@ -67,21 +83,29 @@ public enum TunnelLog: Sendable {
     }
 
     private static func appendLocked(_ level: Level, _ message: String) {
-        guard let url = fileURL() else { return }
+        guard let url = fileURL() else {
+            NSLog("PrizmX TunnelLog skipped (no file URL): %@", message)
+            return
+        }
         let fileManager = FileManager.default
-        try? fileManager.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        rotateIfNeeded(url)
         let line = "\(timestamp()) [\(level.rawValue)] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: url)
+        do {
+            try fileManager.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            rotateIfNeeded(url)
+            if fileManager.fileExists(atPath: url.path) {
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                _ = try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } else {
+                try data.write(to: url, options: .atomic)
+            }
+        } catch {
+            NSLog("PrizmX TunnelLog write failed %@: %@", url.path, error.localizedDescription)
         }
     }
 

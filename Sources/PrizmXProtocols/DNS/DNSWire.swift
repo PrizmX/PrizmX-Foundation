@@ -25,8 +25,12 @@ public enum DNSWire {
         data.append(contentsOf: [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]) // QD=1
         for label in domain.split(separator: ".") {
             let bytes = Array(label.utf8)
-            data.append(UInt8(bytes.count))
-            data.append(contentsOf: bytes)
+            // RFC 1035 caps a label at 63 bytes; an over-long label would trap
+            // the UInt8 conversion. Clamp it — the resulting name simply
+            // fails to resolve, which is the correct fate for invalid input.
+            let clamped = bytes.prefix(63)
+            data.append(UInt8(clamped.count))
+            data.append(contentsOf: clamped)
         }
         data.append(0)
         data.append(UInt8(truncatingIfNeeded: type >> 8))

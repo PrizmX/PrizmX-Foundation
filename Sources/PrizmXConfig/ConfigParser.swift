@@ -30,7 +30,11 @@ public enum ConfigAdapter: Sendable {
         let trimmed = rawString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw ConfigError.emptyInput }
         let parsed: (Router, NodeManager)
-        if trimmed.first == "{" || trimmed.first == "[" {
+        // sing-box configs are JSON objects. A leading `[` is a Surge INI
+        // section header (`[General]`), not a JSON array, so only `{` routes
+        // to the sing-box parser; everything else goes to the Clash parser,
+        // which performs its own Surge INI detection.
+        if trimmed.first == "{" {
             parsed = try SingboxConfigParser().parse(rawString: rawString)
         } else {
             parsed = try ClashConfigParser().parse(rawString: rawString)

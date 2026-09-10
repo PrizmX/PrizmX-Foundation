@@ -26,6 +26,7 @@ public enum NodeAddressStore: Sendable {
         var result: [String: [PrizmXProtocols.IPv4Address]] = [:]
         for (host, raw) in dict {
             let addresses = raw.compactMap { PrizmXProtocols.IPv4Address(parsing: $0) }
+                .filter { NameserverAddress.isUsableIPv4($0.description) }
             if !addresses.isEmpty {
                 result[host.lowercased()] = addresses
             }
@@ -119,6 +120,9 @@ public enum NodeAddressStore: Sendable {
         var merged: [PrizmXProtocols.IPv4Address] = []
         for list in [good, previous, publicAnswers, captured, system] {
             for address in list where !merged.contains(address) {
+                guard NameserverAddress.isUsableIPv4(address.description) else {
+                    continue
+                }
                 merged.append(address)
             }
         }

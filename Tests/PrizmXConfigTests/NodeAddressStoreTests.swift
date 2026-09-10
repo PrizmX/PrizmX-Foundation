@@ -35,6 +35,19 @@ import PrizmXProtocols
     #expect(NodeAddressStore.nodeHostnames(in: yaml) == ["node.example.sbs", "other.example.sbs"])
 }
 
+@Test func orderedCandidatesDropFakeIP() {
+    let real = PrizmXProtocols.IPv4Address(218, 245, 102, 118)
+    let fake = PrizmXProtocols.IPv4Address(198, 18, 0, 4)
+    let ordered = NodeAddressStore.orderedCandidates(
+        good: [fake, real],
+        previous: [fake],
+        publicAnswers: [fake],
+        captured: [fake],
+        system: [fake, real]
+    )
+    #expect(ordered == [real])
+}
+
 @Test func orderedCandidatesPreferProvenGood() {
     let good = PrizmXProtocols.IPv4Address(218, 245, 102, 118)
     let oldPin = PrizmXProtocols.IPv4Address(203, 0, 113, 9)
@@ -53,7 +66,7 @@ import PrizmXProtocols
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("dns-good-test-\(UUID().uuidString).json")
     let payload = [
-        "proxy-server|node.example.sbs": ["218.245.102.118", "203.0.113.9"],
+        "proxy-server|node.example.sbs": ["218.245.102.118", "198.18.0.4", "203.0.113.9"],
         "direct|www.apple.com": ["17.1.1.1"],
     ]
     try JSONEncoder().encode(payload).write(to: url)

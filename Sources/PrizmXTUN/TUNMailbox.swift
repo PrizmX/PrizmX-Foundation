@@ -7,12 +7,6 @@ import SwiftTCP
 /// `PacketSink` / `TCPStreamHandler` / `UDPDatagramHandler` are invoked from
 /// event-loop actors; this type is the only shared mutable surface.
 final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unchecked Sendable {
-    struct UDPReplyKey: Hashable, Sendable {
-        var client: UInt32
-        var clientPort: UInt16
-        var destPort: UInt16
-    }
-
     private let lock = NSLock()
     /// Hop stream callbacks off the TCP event loop so splice resume/send
     /// cannot re-enter `ingestBatch`.
@@ -22,7 +16,6 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
 
     private var byteStream: (any TCPByteStream)?
     private var tcpStreams: [FlowKey: TUNTCPStream] = [:]
-    private var udpFlows: [UDPReplyKey: FlowKey] = [:]
     private var tcpContinuation: AsyncStream<TUNTCPStream>.Continuation?
     private var udpContinuation: AsyncStream<TUNUDPDatagram>.Continuation?
 
@@ -49,17 +42,10 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
         lock.unlock()
     }
 
-    func flow(for key: UDPReplyKey) -> FlowKey? {
-        lock.lock()
-        defer { lock.unlock() }
-        return udpFlows[key]
-    }
-
     func finishAll() {
         lock.lock()
         let streams = Array(tcpStreams.values)
         tcpStreams.removeAll()
-        udpFlows.removeAll()
         let tcp = tcpContinuation
         let udp = udpContinuation
         tcpContinuation = nil
@@ -130,12 +116,6 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
     }
 
     func onDatagram(flow: FlowKey, payload: Data) {
-        if case .v4(let client) = flow.src.kind {
-            let key = UDPReplyKey(client: client, clientPort: flow.srcPort, destPort: flow.dstPort)
-            lock.lock()
-            udpFlows[key] = flow
-            lock.unlock()
-        }
         lock.lock()
         let continuation = udpContinuation
         lock.unlock()
@@ -143,7 +123,8 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
             TUNUDPDatagram(
                 destination: Self.destination(flow: flow, fakeIP: fakeIP),
                 source: Self.source(flow: flow),
-                payload: payload
+                payload: payload,
+                flow: flow
             )
         )
     }

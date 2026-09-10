@@ -106,6 +106,7 @@ public final class DNSClient: Sendable {
         for (key, raw) in dict {
             guard key.hasPrefix("proxy-server|") else { continue }
             let addresses = raw.compactMap { IPv4Address(parsing: $0) }
+                .filter { NameserverAddress.isUsableIPv4($0.description) }
             if !addresses.isEmpty {
                 result[String(key.dropFirst("proxy-server|".count))] = addresses
             }
@@ -116,7 +117,10 @@ public final class DNSClient: Sendable {
     /// App Group persistence used by the tunnel providers (survives process
     /// restarts; a proven edge outlives any single tunnel session).
     public static var defaultPersistenceURL: URL? {
-        FileManager.default
+        if let kitRoot = TunnelLog.kitRoot {
+            return kitRoot.appendingPathComponent("dns-good.json")
+        }
+        return FileManager.default
             .containerURL(forSecurityApplicationGroupIdentifier: TunnelLog.defaultAppGroupIdentifier)?
             .appendingPathComponent(TunnelLog.defaultDirectoryName, isDirectory: true)
             .appendingPathComponent("dns-good.json")

@@ -82,27 +82,48 @@ final class NWStreamTransport: @unchecked Sendable {
     }
 
     /// Waits for `.ready`; a later failure / cancel marks the transport closed.
-    func waitUntilReady(_ nw: NWConnection) async throws {
+    ///
+    /// Hard ceiling on the wait: a silently dropped SYN leaves NWConnection
+    /// in `.waiting`/`.preparing` until the kernel TCP timeout (75s+), which
+    /// would hang `open()` for the whole flow. On timeout the connection is
+    /// cancelled, which also unwinds the suspended ready-wait child task.
+    func waitUntilReady(_ nw: NWConnection, timeout: Duration = .seconds(8)) async throws {
         let peer = endpoint
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let once = OnceResume(continuation)
-            nw.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .ready:
-                    nw.stateUpdateHandler = { [weak self] later in
-                        if case .failed = later { self?.markClosed() }
-                        if case .cancelled = later { self?.markClosed() }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    let once = OnceResume(continuation)
+                    nw.stateUpdateHandler = { [weak self] state in
+                        switch state {
+                        case .ready:
+                            nw.stateUpdateHandler = { [weak self] later in
+                                if case .failed = later { self?.markClosed() }
+                                if case .cancelled = later { self?.markClosed() }
+                            }
+                            once.resume(with: .success(()))
+                        case .failed(let error):
+                            once.resume(with: .failure(self?.mapTransportError(error) ?? error))
+                        case .cancelled:
+                            once.resume(with: .failure(OutboundError.alreadyClosed(peer)))
+                        default:
+                            break
+                        }
                     }
-                    once.resume(with: .success(()))
-                case .failed(let error):
-                    once.resume(with: .failure(self?.mapTransportError(error) ?? error))
-                case .cancelled:
-                    once.resume(with: .failure(OutboundError.alreadyClosed(peer)))
-                default:
-                    break
+                    nw.start(queue: self.queue)
                 }
             }
-            nw.start(queue: queue)
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw OutboundError.timedOut(peer)
+            }
+            do {
+                try await group.next()
+                group.cancelAll()
+            } catch {
+                nw.cancel()
+                group.cancelAll()
+                throw error
+            }
         }
     }
 

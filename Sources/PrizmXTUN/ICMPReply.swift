@@ -88,20 +88,7 @@ enum ICMPReply {
     }
 
     static func internetChecksum(_ data: Data) -> UInt16 {
-        var sum: UInt32 = 0
-        var index = 0
-        let bytes = [UInt8](data)
-        while index + 1 < bytes.count {
-            sum += UInt32(bytes[index]) << 8 | UInt32(bytes[index + 1])
-            index += 2
-        }
-        if index < bytes.count {
-            sum += UInt32(bytes[index]) << 8
-        }
-        while sum > 0xFFFF {
-            sum = (sum >> 16) + (sum & 0xFFFF)
-        }
-        return ~UInt16(truncatingIfNeeded: sum)
+        data.withUnsafeBytes { InternetChecksum.compute($0) }
     }
 
     private static func icmpv6Checksum(source: Data, destination: Data, icmp: Data) -> UInt16 {

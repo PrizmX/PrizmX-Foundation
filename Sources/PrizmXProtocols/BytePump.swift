@@ -171,3 +171,13 @@ final class OnceResume: @unchecked Sendable {
         pending?.resume(with: result)
     }
 }
+
+/// Big-endian UInt64 load from a raw buffer at `offset`.
+@inline(__always)
+func loadUInt64BE(_ buffer: UnsafeRawBufferPointer, offset: Int) -> UInt64 {
+    var value: UInt64 = 0
+    for index in 0..<8 {
+        value = (value << 8) | UInt64(buffer[offset + index])
+    }
+    return value
+}

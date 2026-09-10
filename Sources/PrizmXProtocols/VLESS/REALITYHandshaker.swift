@@ -210,17 +210,41 @@ public struct REALITYHandshaker: Sendable {
 
     /// Raw TCP handshake: custom ClientHello, then TLS 1.3, then HMAC cert check.
     /// Application data afterwards is TLS 1.3 records via the returned session.
+    ///
+    /// The whole exchange runs under a hard ceiling: `waitUntilReady` only
+    /// covers TCP setup, and a peer (or middlebox) that accepts the socket
+    /// but then goes silent would otherwise suspend `open()` forever. On
+    /// timeout the connection is cancelled, which also unwinds the receive
+    /// continuation suspended inside the handshake child task.
     public func handshake(
         on connection: NWConnection,
-        queue: DispatchQueue
+        queue: DispatchQueue,
+        timeout: Duration = .seconds(10)
     ) async throws -> REALITYSession {
         let prepared = try makeClientHello()
-        let layer = try await TLS13Handshake.run(
-            connection: connection,
-            queue: queue,
-            clientHello: prepared.hello
-        ) { certificate in
-            try Self.verifyPeerCertificate(authKey: prepared.authKey, certificate: certificate)
+        let layer = try await withThrowingTaskGroup(of: TLS13RecordLayer.self) { group in
+            group.addTask {
+                try await TLS13Handshake.run(
+                    connection: connection,
+                    queue: queue,
+                    clientHello: prepared.hello
+                ) { certificate in
+                    try Self.verifyPeerCertificate(authKey: prepared.authKey, certificate: certificate)
+                }
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw REALITYError.handshakeFailed("TLS handshake timed out")
+            }
+            do {
+                let layer = try await group.next()!
+                group.cancelAll()
+                return layer
+            } catch {
+                connection.cancel()
+                group.cancelAll()
+                throw error
+            }
         }
         return REALITYSession(layer: layer, authKey: prepared.authKey)
     }

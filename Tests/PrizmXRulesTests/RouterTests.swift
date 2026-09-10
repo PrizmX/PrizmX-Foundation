@@ -148,7 +148,7 @@ import PrizmXProtocols
 @Test func domainKeywordMatch() {
     let router = Router(
         rules: [
-            RouteRule(type: .domainKeyword("ads"), policy: .reject),
+            RouteRule(.domainKeyword("ads"), policy: .reject),
             RouteRule(.domainSuffix("example.com"), policy: .proxy(targetGroup: "PROXY")),
         ],
         default: .direct
@@ -159,11 +159,11 @@ import PrizmXProtocols
     #expect(router.match(host: "example.org", port: 443) == .direct)
 }
 
-@Test func matchAllAndRuleTypeCIDR() {
+@Test func matchAllAndRuleTypeCIDR() throws {
     let router = Router(
         rules: [
-            RouteRule(type: .ipCIDR("10.0.0.0/8"), policy: .direct),
-            RouteRule(type: .matchAll, policy: .proxy(targetGroup: "FINAL")),
+            try RouteRule(type: .ipCIDR("10.0.0.0/8"), policy: .direct),
+            RouteRule(.matchAll, policy: .proxy(targetGroup: "FINAL")),
         ],
         default: .reject
     )
@@ -171,11 +171,20 @@ import PrizmXProtocols
     #expect(router.match(host: "unlisted.example", port: 443) == .proxy(targetGroup: "FINAL"))
 }
 
+@Test func invalidCIDRThrowsInsteadOfTrapping() {
+    #expect(throws: RuleCompileError.self) {
+        try RouteRule(type: .ipCIDR("not-an-ip"), policy: .direct)
+    }
+    #expect(throws: RuleCompileError.self) {
+        try RouteRule(type: .ipCIDR("10.0.0.0/33"), policy: .direct)
+    }
+}
+
 @Test func matchAllFirstRuleCapturesEverything() {
     let router = Router(
         rules: [
-            RouteRule(type: .matchAll, policy: .proxy(targetGroup: "PROXY")),
-            RouteRule(type: .domain("google.com"), policy: .direct),
+            RouteRule(.matchAll, policy: .proxy(targetGroup: "PROXY")),
+            RouteRule(.domain("google.com"), policy: .direct),
         ],
         default: .reject
     )

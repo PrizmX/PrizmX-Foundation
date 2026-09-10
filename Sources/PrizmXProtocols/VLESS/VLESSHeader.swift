@@ -357,15 +357,6 @@ public struct VLESSHeader: Sendable, Equatable {
     }
 }
 
-@inline(__always)
-private func loadUInt64BE(_ buffer: UnsafeRawBufferPointer, offset: Int) -> UInt64 {
-    var value: UInt64 = 0
-    for index in 0..<8 {
-        value = (value << 8) | UInt64(buffer[offset + index])
-    }
-    return value
-}
-
 // MARK: - Response header
 
 /// Server response header: version + length-prefixed addons, then raw payload.

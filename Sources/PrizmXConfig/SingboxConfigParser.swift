@@ -50,7 +50,7 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
 
         var rules: [RouteRule] = []
         for rule in file.route?.rules ?? [] {
-            rules.append(contentsOf: expand(rule))
+            rules.append(contentsOf: try expand(rule))
         }
 
         let defaultPolicy = file.route?.final.map(ConfigMapping.policy(named:)) ?? .direct
@@ -157,26 +157,26 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
         )
     }
 
-    private func expand(_ rule: SingboxRouteRule) -> [RouteRule] {
+    private func expand(_ rule: SingboxRouteRule) throws -> [RouteRule] {
         let policy = ConfigMapping.policy(named: rule.outbound ?? "direct")
         var result: [RouteRule] = []
         for domain in rule.domain.values {
-            result.append(RouteRule(type: .domain(domain), policy: policy))
+            result.append(try RouteRule(type: .domain(domain), policy: policy))
         }
         for suffix in rule.domainSuffix.values {
-            result.append(RouteRule(type: .domainSuffix(suffix), policy: policy))
+            result.append(try RouteRule(type: .domainSuffix(suffix), policy: policy))
         }
         for keyword in rule.domainKeyword.values {
-            result.append(RouteRule(type: .domainKeyword(keyword), policy: policy))
+            result.append(try RouteRule(type: .domainKeyword(keyword), policy: policy))
         }
         for cidr in rule.ipCIDR.values {
-            result.append(RouteRule(type: .ipCIDR(cidr), policy: policy))
+            result.append(try RouteRule(type: .ipCIDR(cidr), policy: policy))
         }
         for site in rule.geosite.values {
-            result.append(RouteRule(type: .geosite(tag: site), policy: policy))
+            result.append(try RouteRule(type: .geosite(tag: site), policy: policy))
         }
         for country in rule.geoip.values {
-            result.append(RouteRule(type: .geoIP(code: country), policy: policy))
+            result.append(try RouteRule(type: .geoIP(code: country), policy: policy))
         }
         return result
     }

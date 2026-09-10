@@ -196,7 +196,7 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
         nodeIDs: [info.id, hk01.id, hk02.id]
     )
     let router = Router(
-        rules: [RouteRule(type: .matchAll, policy: .proxy(targetGroup: "Proxies"))],
+        rules: [RouteRule(.matchAll, policy: .proxy(targetGroup: "Proxies"))],
         default: .direct
     )
     let engine = Engine(
@@ -245,7 +245,7 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
     #expect(manager.selectedMemberID(inGroup: "Final") == "DIRECT")
     let engine = Engine(
         router: Router(
-            rules: [RouteRule(type: .matchAll, policy: .proxy(targetGroup: "Final"))],
+            rules: [RouteRule(.matchAll, policy: .proxy(targetGroup: "Final"))],
             default: .direct
         ),
         nodeManager: manager
@@ -277,7 +277,7 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
         router: Router(
             rules: [
                 RouteRule(.domainSuffix("google.com"), policy: .proxy(targetGroup: "Google")),
-                RouteRule(type: .matchAll, policy: .proxy(targetGroup: "Final")),
+                RouteRule(.matchAll, policy: .proxy(targetGroup: "Final")),
             ],
             default: .direct
         ),

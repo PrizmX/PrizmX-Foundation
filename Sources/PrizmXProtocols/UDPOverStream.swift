@@ -24,6 +24,10 @@ extension NWConnection {
 public enum UDPOverStreamFrame {
     /// Frames one datagram for the wire.
     public static func encode(_ payload: Data) -> Data {
+        precondition(
+            payload.count <= 0xFFFF,
+            "UDP datagram too large to frame (\(payload.count) bytes)"
+        )
         var frame = Data(count: 2 + payload.count)
         frame[0] = UInt8(truncatingIfNeeded: payload.count >> 8)
         frame[1] = UInt8(truncatingIfNeeded: payload.count)

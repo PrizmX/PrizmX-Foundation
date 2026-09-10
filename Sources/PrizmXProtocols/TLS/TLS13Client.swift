@@ -738,7 +738,8 @@ struct DERReader {
         offset += 1
         let (length, header) = try readLength()
         _ = header
-        guard offset + length <= bytes.count else {
+        // Subtraction form: `length` alone may be near Int.max.
+        guard length <= bytes.count - offset else {
             throw REALITYError.truncated(expected: length, actual: bytes.count - offset)
         }
         let contentBase = base + offset
@@ -757,13 +758,18 @@ struct DERReader {
             return (Int(first), 1)
         }
         let count = Int(first & 0x7F)
-        guard count > 0, offset + count <= bytes.count else {
+        // Cap the long-form width at 8 bytes: wider lengths can only come
+        // from a hostile or broken peer and would overflow Int below.
+        guard count > 0, count <= MemoryLayout<UInt64>.size, offset + count <= bytes.count else {
             throw REALITYError.truncated(expected: count, actual: bytes.count - offset)
         }
-        var length = 0
+        var wide: UInt64 = 0
         for _ in 0..<count {
-            length = (length << 8) | Int(bytes[offset])
+            wide = (wide << 8) | UInt64(bytes[offset])
             offset += 1
+        }
+        guard let length = Int(exactly: wide) else {
+            throw REALITYError.truncated(expected: Int.max, actual: bytes.count)
         }
         return (length, 1 + count)
     }

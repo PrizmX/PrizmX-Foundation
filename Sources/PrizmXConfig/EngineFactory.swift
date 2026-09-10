@@ -88,7 +88,7 @@ public enum EngineFactory: Sendable {
     private static func directOnly() -> (Router, NodeManager) {
         (
             Router(
-                rules: [RouteRule(type: .matchAll, policy: .direct)],
+                rules: [RouteRule(.matchAll, policy: .direct)],
                 default: .direct
             ),
             NodeManager(nodes: [], groups: [])
