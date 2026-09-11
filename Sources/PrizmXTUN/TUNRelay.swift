@@ -65,11 +65,19 @@ private actor UDPRelayState {
         }
         guard let session = sessions[key] else { return }
         await session.send(datagram.payload, destination: datagram.destination)
+        let domain: String?
+        if case .domain(let name) = datagram.destination.host {
+            domain = name
+        } else {
+            domain = nil
+        }
         engine.traffic.addBytes(
             up: UInt64(datagram.payload.count),
             down: 0,
             via: session.via,
-            app: session.attribution
+            app: session.attribution,
+            transport: .udp,
+            domain: domain
         )
     }
 
@@ -301,7 +309,7 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
         while !Task.isCancelled {
             guard let data = await connection.receiveDatagram(), !data.isEmpty else { return }
             activity.touch()
-            traffic.addBytes(up: 0, down: UInt64(data.count), via: via, app: attribution)
+            traffic.addBytes(up: 0, down: UInt64(data.count), via: via, app: attribution, transport: .udp)
             await stack.sendUDP(flow: flow, payload: data)
         }
     }
@@ -353,7 +361,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
                 if chunk.isEmpty { break }
                 activity.touch()
                 for payload in decoder.feed(chunk) {
-                    traffic.addBytes(up: 0, down: UInt64(payload.count), via: via, app: attribution)
+                    traffic.addBytes(up: 0, down: UInt64(payload.count), via: via, app: attribution, transport: .udp)
                     await stack.sendUDP(flow: flow, payload: payload)
                 }
             }
@@ -421,7 +429,7 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
                 packet: data
             ) else { continue }
             activity.touch()
-            traffic.addBytes(up: 0, down: UInt64(decoded.payload.count), via: via, app: attribution)
+            traffic.addBytes(up: 0, down: UInt64(decoded.payload.count), via: via, app: attribution, transport: .udp)
             await stack.sendUDP(flow: flow, payload: decoded.payload)
         }
     }

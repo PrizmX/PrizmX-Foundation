@@ -78,7 +78,7 @@ public enum EngineTCPRelay: Sendable {
                         try await outbound.writeAll(chunk)
                         tally.addUp(chunk.count)
                         let bytes = UInt64(chunk.count)
-                        engine.traffic.addBytes(up: bytes, down: 0, via: via, app: attribution)
+                        engine.traffic.addBytes(up: bytes, down: 0, via: via, app: attribution, transport: .tcp)
                         engine.traffic.addFlowBytes(id: flowID, up: bytes, down: 0)
                     }
                     tally.clientEnded("eof")
@@ -98,7 +98,7 @@ public enum EngineTCPRelay: Sendable {
                         try await inbound.write(data)
                         tally.addDown(data.count)
                         let bytes = UInt64(data.count)
-                        engine.traffic.addBytes(up: 0, down: bytes, via: via, app: attribution)
+                        engine.traffic.addBytes(up: 0, down: bytes, via: via, app: attribution, transport: .tcp)
                         engine.traffic.addFlowBytes(id: flowID, up: 0, down: bytes)
                     }
                 } catch {

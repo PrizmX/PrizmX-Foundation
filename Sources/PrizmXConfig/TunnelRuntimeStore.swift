@@ -18,10 +18,18 @@ public enum TunnelRuntimeStore: Sendable {
         "dns-good.json",
     ]
 
-    public static func runtimeKitRoot(
-        home: URL = FileManager.default.homeDirectoryForCurrentUser
-    ) -> URL {
-        home.appendingPathComponent(relativeKitPath, isDirectory: true)
+    public static func runtimeKitRoot(home: URL? = nil) -> URL {
+        let resolvedHome: URL
+        if let home {
+            resolvedHome = home
+        } else {
+            #if os(macOS)
+            resolvedHome = FileManager.default.homeDirectoryForCurrentUser
+            #else
+            resolvedHome = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            #endif
+        }
+        return resolvedHome.appendingPathComponent(relativeKitPath, isDirectory: true)
     }
 
     /// Copies extension inputs from the App Group kit into `destinationKit`.

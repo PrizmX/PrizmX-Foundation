@@ -29,6 +29,25 @@ import Network
     #expect(settings.defaultNameservers == [.udp(address: "223.5.5.5", port: 53)])
 }
 
+@Test func applyPhysicalDNSReplacesPrivateResolvers() {
+    var settings = DNSSettings.bootstrap(physicalIPs: ["192.168.1.1"])
+    settings.nameservers = [.udp(address: "8.8.8.8", port: 53)]
+    settings.applyPhysicalDNS(["192.168.0.1"])
+    #expect(settings.systemNameservers == [.udp(address: "192.168.0.1", port: 53)])
+    #expect(settings.defaultNameservers == [.udp(address: "192.168.0.1", port: 53)])
+    #expect(settings.nameservers == [.udp(address: "8.8.8.8", port: 53)])
+}
+
+@Test func applyPhysicalDNSDropsDeadGatewayWhenCaptureEmpty() {
+    var settings = DNSSettings.bootstrap(physicalIPs: ["192.168.1.1"])
+    settings.applyPhysicalDNS([])
+    #expect(settings.systemNameservers.isEmpty)
+    #expect(settings.defaultNameservers == [
+        .udp(address: "223.5.5.5", port: 53),
+        .udp(address: "119.29.29.29", port: 53),
+    ])
+}
+
 @Test func roleListsOverrideDefault() {
     let settings = DNSSettings(
         defaultNameservers: [.udp(address: "192.168.31.1", port: 53)],

@@ -138,6 +138,36 @@ public struct DNSSettings: Sendable, Hashable {
         )
     }
 
+    /// Swap LAN resolvers after a NIC / Wi-Fi / hotspot change. Public
+    /// nameservers stay; an empty capture drops private IPs so last-resort
+    /// public DNS can take over instead of querying a dead gateway.
+    public mutating func applyPhysicalDNS(_ ips: [String]) {
+        let fresh = ips.compactMap { NameserverEndpoint.udp(ip: $0) }
+        systemNameservers = fresh
+        defaultNameservers = Self.rebase(defaultNameservers, physical: fresh)
+        directNameservers = Self.rebase(directNameservers, physical: fresh)
+        nameservers = Self.rebase(nameservers, physical: fresh)
+        proxyServerNameservers = Self.rebase(proxyServerNameservers, physical: fresh)
+        if defaultNameservers.isEmpty {
+            defaultNameservers = ["223.5.5.5", "119.29.29.29"].compactMap {
+                NameserverEndpoint.udp(ip: $0)
+            }
+        }
+    }
+
+    private static func rebase(
+        _ endpoints: [NameserverEndpoint],
+        physical: [NameserverEndpoint]
+    ) -> [NameserverEndpoint] {
+        let publicOnes = endpoints.filter { endpoint in
+            guard case .udp(let address, _) = endpoint else { return true }
+            return !NameserverAddress.isPrivateIPv4(address)
+        }
+        let hadPrivate = publicOnes.count != endpoints.count
+        guard hadPrivate else { return endpoints }
+        return Self.deduplicate(physical + publicOnes)
+    }
+
     public func endpoints(for role: DNSRole) -> [NameserverEndpoint] {
         switch role {
         case .proxyServer:
@@ -194,9 +224,15 @@ public enum PhysicalDNSSnapshot: Sendable {
         guard let store = SCDynamicStoreCreate(nil, "PrizmX.DNS" as CFString, nil, nil) else {
             return []
         }
-        let primary = (SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any])?["PrimaryService"] as? String
+        let primary = (SCDynamicStoreCopyValue(
+            store,
+            "State:/Network/Global/IPv4" as CFString
+        ) as? [String: Any])?["PrimaryService"] as? String
         if let primary,
-           let dns = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(primary)/DNS" as CFString) as? [String: Any],
+           let dns = SCDynamicStoreCopyValue(
+               store,
+               "Setup:/Network/Service/\(primary)/DNS" as CFString
+           ) as? [String: Any],
            let addresses = dns["ServerAddresses"] as? [String] {
             let usable = addresses.filter { NameserverAddress.isUsableIPv4($0) }
             TunnelLog.write(.debug, "dns snapshot Setup service=\(addresses)")
@@ -209,7 +245,10 @@ public enum PhysicalDNSSnapshot: Sendable {
             if !usable.isEmpty { return usable }
         }
         if let primary,
-           let dns = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(primary)/DNS" as CFString) as? [String: Any],
+           let dns = SCDynamicStoreCopyValue(
+               store,
+               "State:/Network/Service/\(primary)/DNS" as CFString
+           ) as? [String: Any],
            let addresses = dns["ServerAddresses"] as? [String] {
             let usable = addresses.filter { NameserverAddress.isUsableIPv4($0) }
             TunnelLog.write(.debug, "dns snapshot State service=\(addresses)")
@@ -234,6 +273,19 @@ public enum NameserverAddress: Sendable {
         if (address.rawValue >> 24) == 127 { return false }
         if (address.rawValue & fakeIPMask) == fakeIPNetwork { return false }
         return true
+    }
+
+    /// Link-local / RFC1918 — dies when the LAN or hotspot changes.
+    public static func isPrivateIPv4(_ text: String) -> Bool {
+        guard let address = IPv4Address(parsing: text) else { return false }
+        let value = address.rawValue
+        let octet1 = value >> 24
+        let octet2 = (value >> 16) & 0xff
+        if octet1 == 10 { return true }
+        if octet1 == 192 && octet2 == 168 { return true }
+        if octet1 == 172 && (16...31).contains(octet2) { return true }
+        if octet1 == 169 && octet2 == 254 { return true }
+        return false
     }
 }
 

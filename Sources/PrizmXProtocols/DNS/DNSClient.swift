@@ -16,7 +16,8 @@ public final class DNSClient: Sendable {
     /// back to the system resolver (which is FakeDNS inside the tunnel).
     @TaskLocal public static var current: DNSClient?
 
-    public let settings: DNSSettings
+    public var settings: DNSSettings { settingsBox.withLock { $0 } }
+    private let settingsBox: OSAllocatedUnfairLock<DNSSettings>
 
     private struct CacheKey: Hashable, Sendable {
         var domain: String
@@ -82,7 +83,7 @@ public final class DNSClient: Sendable {
         badTTL: TimeInterval = 60,
         lastResortNameservers: [NameserverEndpoint]? = nil
     ) {
-        self.settings = settings
+        self.settingsBox = OSAllocatedUnfairLock(initialState: settings)
         self.persistenceURL = persistenceURL
         self.pinned = Dictionary(uniqueKeysWithValues: pinnedNodeAddresses.map {
             ($0.key.lowercased(), $0.value)
@@ -92,38 +93,12 @@ public final class DNSClient: Sendable {
         loadPersisted()
     }
 
-    /// Reads the persisted last-known-good node addresses (proxy-server
-    /// plane) written by the tunnel extension after successful dials.
-    /// The app's pin refresh leads with these: DNS answers are just
-    /// candidates — a proven address survives rotation / poisoning.
-    public static func persistedGoodNodeAddresses(
-        url: URL? = defaultPersistenceURL
-    ) -> [String: [IPv4Address]] {
-        guard let url,
-              let data = try? Data(contentsOf: url),
-              let dict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return [:] }
-        var result: [String: [IPv4Address]] = [:]
-        for (key, raw) in dict {
-            guard key.hasPrefix("proxy-server|") else { continue }
-            let addresses = raw.compactMap { IPv4Address(parsing: $0) }
-                .filter { NameserverAddress.isUsableIPv4($0.description) }
-            if !addresses.isEmpty {
-                result[String(key.dropFirst("proxy-server|".count))] = addresses
-            }
-        }
-        return result
-    }
-
-    /// App Group persistence used by the tunnel providers (survives process
-    /// restarts; a proven edge outlives any single tunnel session).
-    public static var defaultPersistenceURL: URL? {
-        if let kitRoot = TunnelLog.kitRoot {
-            return kitRoot.appendingPathComponent("dns-good.json")
-        }
-        return FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: TunnelLog.defaultAppGroupIdentifier)?
-            .appendingPathComponent(TunnelLog.defaultDirectoryName, isDirectory: true)
-            .appendingPathComponent("dns-good.json")
+    /// Replace LAN nameservers after the physical path changes, then drop
+    /// positive cache and dial-failure marks from the old network.
+    public func applyPhysicalDNS(_ ips: [String]) {
+        settingsBox.withLock { $0.applyPhysicalDNS(ips) }
+        cache.withLock { $0.removeAll() }
+        bad.withLock { $0.removeAll() }
     }
 
     /// All A records for `domain` on the given plane, merged across the
@@ -336,37 +311,6 @@ public final class DNSClient: Sendable {
         return addresses
     }
 
-    // MARK: - Persistence
-
-    private func persist() {
-        guard let persistenceURL else { return }
-        let snapshot: [String: [String]] = good.withLock { map in
-            Dictionary(uniqueKeysWithValues: map.map { ($0.key.persistKey, $0.value.addresses.map(\.description)) })
-        }
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        try? FileManager.default.createDirectory(
-            at: persistenceURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try? data.write(to: persistenceURL, options: .atomic)
-    }
-
-    private func loadPersisted() {
-        guard let persistenceURL,
-              let data = try? Data(contentsOf: persistenceURL),
-              let dict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return }
-        var loaded: [CacheKey: (addresses: [IPv4Address], touched: Date)] = [:]
-        for (persistKey, addresses) in dict {
-            guard let key = CacheKey.from(persistKey: persistKey) else { continue }
-            let parsed = addresses.compactMap { IPv4Address(parsing: $0) }
-            if !parsed.isEmpty {
-                loaded[key] = (addresses: parsed, touched: Date())
-            }
-        }
-        let final = loaded
-        good.withLock { $0 = final }
-    }
-
     // MARK: - Lookup
 
     /// Last-resort re-query for node hostnames whose pinned / configured
@@ -473,5 +417,72 @@ public final class DNSClient: Sendable {
             }
         }
         throw lastError
+    }
+}
+
+// MARK: - Persistence
+
+extension DNSClient {
+    /// Reads the persisted last-known-good node addresses (proxy-server
+    /// plane) written by the tunnel extension after successful dials.
+    /// The app's pin refresh leads with these: DNS answers are just
+    /// candidates — a proven address survives rotation / poisoning.
+    public static func persistedGoodNodeAddresses(
+        url: URL? = defaultPersistenceURL
+    ) -> [String: [IPv4Address]] {
+        guard let url,
+              let data = try? Data(contentsOf: url),
+              let dict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return [:] }
+        var result: [String: [IPv4Address]] = [:]
+        for (key, raw) in dict {
+            guard key.hasPrefix("proxy-server|") else { continue }
+            let addresses = raw.compactMap { IPv4Address(parsing: $0) }
+                .filter { NameserverAddress.isUsableIPv4($0.description) }
+            if !addresses.isEmpty {
+                result[String(key.dropFirst("proxy-server|".count))] = addresses
+            }
+        }
+        return result
+    }
+
+    /// App Group persistence used by the tunnel providers (survives process
+    /// restarts; a proven edge outlives any single tunnel session).
+    public static var defaultPersistenceURL: URL? {
+        if let kitRoot = TunnelLog.kitRoot {
+            return kitRoot.appendingPathComponent("dns-good.json")
+        }
+        return FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: TunnelLog.defaultAppGroupIdentifier)?
+            .appendingPathComponent(TunnelLog.defaultDirectoryName, isDirectory: true)
+            .appendingPathComponent("dns-good.json")
+    }
+
+    private func persist() {
+        guard let persistenceURL else { return }
+        let snapshot: [String: [String]] = good.withLock { map in
+            Dictionary(uniqueKeysWithValues: map.map { ($0.key.persistKey, $0.value.addresses.map(\.description)) })
+        }
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? FileManager.default.createDirectory(
+            at: persistenceURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: persistenceURL, options: .atomic)
+    }
+
+    private func loadPersisted() {
+        guard let persistenceURL,
+              let data = try? Data(contentsOf: persistenceURL),
+              let dict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return }
+        var loaded: [CacheKey: (addresses: [IPv4Address], touched: Date)] = [:]
+        for (persistKey, addresses) in dict {
+            guard let key = CacheKey.from(persistKey: persistKey) else { continue }
+            let parsed = addresses.compactMap { IPv4Address(parsing: $0) }
+            if !parsed.isEmpty {
+                loaded[key] = (addresses: parsed, touched: Date())
+            }
+        }
+        let final = loaded
+        good.withLock { $0 = final }
     }
 }

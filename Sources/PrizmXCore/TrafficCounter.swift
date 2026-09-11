@@ -11,6 +11,10 @@ public struct TrafficByteCount: Sendable, Hashable, Codable, Equatable {
         self.up = up
         self.down = down
     }
+
+    public static func + (lhs: TrafficByteCount, rhs: TrafficByteCount) -> TrafficByteCount {
+        TrafficByteCount(up: lhs.up &+ rhs.up, down: lhs.down &+ rhs.down)
+    }
 }
 
 /// Throughput snapshot exchanged over tunnel IPC.
@@ -35,6 +39,13 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     public var activeFlows: [FlowRecord]
     /// Recently closed TCP splices (Inspector Recent).
     public var recentFlows: [FlowRecord]
+    /// Per-key TCP / UDP totals for ranking bars.
+    public var appTCPBytes: [String: UInt64]
+    public var appUDPBytes: [String: UInt64]
+    public var domainTCPBytes: [String: UInt64]
+    public var domainUDPBytes: [String: UInt64]
+    public var policyTCPBytes: [String: UInt64]
+    public var policyUDPBytes: [String: UInt64]
 
     public init(
         uploadBytesPerSecond: Double = 0,
@@ -49,7 +60,13 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         appBytes: [String: TrafficByteCount] = [:],
         appNames: [String: String] = [:],
         activeFlows: [FlowRecord] = [],
-        recentFlows: [FlowRecord] = []
+        recentFlows: [FlowRecord] = [],
+        appTCPBytes: [String: UInt64] = [:],
+        appUDPBytes: [String: UInt64] = [:],
+        domainTCPBytes: [String: UInt64] = [:],
+        domainUDPBytes: [String: UInt64] = [:],
+        policyTCPBytes: [String: UInt64] = [:],
+        policyUDPBytes: [String: UInt64] = [:]
     ) {
         self.uploadBytesPerSecond = uploadBytesPerSecond
         self.downloadBytesPerSecond = downloadBytesPerSecond
@@ -64,9 +81,73 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         self.appNames = appNames
         self.activeFlows = activeFlows
         self.recentFlows = recentFlows
+        self.appTCPBytes = appTCPBytes
+        self.appUDPBytes = appUDPBytes
+        self.domainTCPBytes = domainTCPBytes
+        self.domainUDPBytes = domainUDPBytes
+        self.policyTCPBytes = policyTCPBytes
+        self.policyUDPBytes = policyUDPBytes
     }
 
     public static let zero = TrafficSnapshot()
+
+    /// Combine tunnel IPC counters with the in-app mixed-port engine.
+    /// The two paths are disjoint (FakeIP TUN vs HTTP/SOCKS listener).
+    public func merging(_ other: TrafficSnapshot) -> TrafficSnapshot {
+        func mergeMap(
+            _ lhs: [String: TrafficByteCount],
+            _ rhs: [String: TrafficByteCount]
+        ) -> [String: TrafficByteCount] {
+            var merged = lhs
+            for (key, value) in rhs {
+                merged[key] = (merged[key] ?? TrafficByteCount()) + value
+            }
+            return merged
+        }
+        func mergeCount(
+            _ lhs: [String: UInt64],
+            _ rhs: [String: UInt64]
+        ) -> [String: UInt64] {
+            var merged = lhs
+            for (key, value) in rhs {
+                merged[key, default: 0] &+= value
+            }
+            return merged
+        }
+        var names = appNames
+        for (key, name) in other.appNames where names[key] == nil {
+            names[key] = name
+        }
+        return TrafficSnapshot(
+            uploadBytesPerSecond: uploadBytesPerSecond + other.uploadBytesPerSecond,
+            downloadBytesPerSecond: downloadBytesPerSecond + other.downloadBytesPerSecond,
+            uplinkBytes: uplinkBytes &+ other.uplinkBytes,
+            downlinkBytes: downlinkBytes &+ other.downlinkBytes,
+            activeConnections: activeConnections + other.activeConnections,
+            directUplinkBytes: directUplinkBytes &+ other.directUplinkBytes,
+            directDownlinkBytes: directDownlinkBytes &+ other.directDownlinkBytes,
+            policyBytes: mergeMap(policyBytes, other.policyBytes),
+            domainBytes: mergeMap(domainBytes, other.domainBytes),
+            appBytes: mergeMap(appBytes, other.appBytes),
+            appNames: names,
+            activeFlows: Array(
+                (activeFlows + other.activeFlows)
+                    .sorted { $0.startedAt > $1.startedAt }
+                    .prefix(32)
+            ),
+            recentFlows: Array(
+                (recentFlows + other.recentFlows)
+                    .sorted { $0.startedAt > $1.startedAt }
+                    .prefix(32)
+            ),
+            appTCPBytes: mergeCount(appTCPBytes, other.appTCPBytes),
+            appUDPBytes: mergeCount(appUDPBytes, other.appUDPBytes),
+            domainTCPBytes: mergeCount(domainTCPBytes, other.domainTCPBytes),
+            domainUDPBytes: mergeCount(domainUDPBytes, other.domainUDPBytes),
+            policyTCPBytes: mergeCount(policyTCPBytes, other.policyTCPBytes),
+            policyUDPBytes: mergeCount(policyUDPBytes, other.policyUDPBytes)
+        )
+    }
 
     enum CodingKeys: String, CodingKey {
         case uploadBytesPerSecond, downloadBytesPerSecond
@@ -74,6 +155,8 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         case directUplinkBytes, directDownlinkBytes
         case policyBytes, domainBytes, appBytes, appNames
         case activeFlows, recentFlows
+        case appTCPBytes, appUDPBytes, domainTCPBytes, domainUDPBytes
+        case policyTCPBytes, policyUDPBytes
     }
 
     public init(from decoder: Decoder) throws {
@@ -91,6 +174,12 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         appNames = try container.decodeIfPresent([String: String].self, forKey: .appNames) ?? [:]
         activeFlows = try container.decodeIfPresent([FlowRecord].self, forKey: .activeFlows) ?? []
         recentFlows = try container.decodeIfPresent([FlowRecord].self, forKey: .recentFlows) ?? []
+        appTCPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .appTCPBytes) ?? [:]
+        appUDPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .appUDPBytes) ?? [:]
+        domainTCPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .domainTCPBytes) ?? [:]
+        domainUDPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .domainUDPBytes) ?? [:]
+        policyTCPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .policyTCPBytes) ?? [:]
+        policyUDPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .policyUDPBytes) ?? [:]
     }
 }
 
@@ -156,6 +245,12 @@ public final class TrafficCounter: Sendable {
         var domains: [String: TrafficByteCount] = [:]
         var apps: [String: TrafficByteCount] = [:]
         var appNames: [String: String] = [:]
+        var appTCP: [String: UInt64] = [:]
+        var appUDP: [String: UInt64] = [:]
+        var domainTCP: [String: UInt64] = [:]
+        var domainUDP: [String: UInt64] = [:]
+        var policyTCP: [String: UInt64] = [:]
+        var policyUDP: [String: UInt64] = [:]
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: State())
@@ -191,7 +286,15 @@ public final class TrafficCounter: Sendable {
     /// Datagram / splice bytes with the routing label of the pipe they
     /// crossed. `direct` feeds the Direct bucket; every other label (policy
     /// group, bare proxy) is proxied traffic ranked per policy.
-    public func addBytes(up: UInt64, down: UInt64, via: String, app: FlowAttribution? = nil) {
+    public func addBytes(
+        up: UInt64,
+        down: UInt64,
+        via: String,
+        app: FlowAttribution? = nil,
+        transport: FlowTransport? = nil,
+        domain: String? = nil
+    ) {
+        let added = up &+ down
         lock.withLock { state in
             state.uplinkBytes &+= up
             state.downlinkBytes &+= down
@@ -203,6 +306,7 @@ public final class TrafficCounter: Sendable {
                 count.up &+= up
                 count.down &+= down
                 state.policy[via] = count
+                Self.addProtocol(added, transport: transport, tcp: &state.policyTCP, udp: &state.policyUDP, key: via)
             }
             if let app {
                 let key = app.accountingKey
@@ -213,6 +317,10 @@ public final class TrafficCounter: Sendable {
                 if state.appNames[key] == nil {
                     state.appNames[key] = app.processName
                 }
+                Self.addProtocol(added, transport: transport, tcp: &state.appTCP, udp: &state.appUDP, key: key)
+            }
+            if let domain, !domain.isEmpty {
+                Self.addProtocol(added, transport: transport, tcp: &state.domainTCP, udp: &state.domainUDP, key: domain)
             }
         }
     }
@@ -233,6 +341,8 @@ public final class TrafficCounter: Sendable {
                 count.up &+= record.uplinkBytes
                 count.down &+= record.downlinkBytes
                 state.domains[domain] = count
+                let added = record.uplinkBytes &+ record.downlinkBytes
+                Self.addProtocol(added, transport: .tcp, tcp: &state.domainTCP, udp: &state.domainUDP, key: domain)
             }
         }
     }
@@ -248,6 +358,8 @@ public final class TrafficCounter: Sendable {
             state.sampleUp = state.uplinkBytes
             state.sampleDown = state.downlinkBytes
             let topApps = Self.top(state.apps, cap: snapshotMapCap)
+            let topDomains = Self.top(state.domains, cap: snapshotMapCap)
+            let topPolicies = Self.top(state.policy, cap: snapshotMapCap)
             return TrafficSnapshot(
                 uploadBytesPerSecond: upRate,
                 downloadBytesPerSecond: downRate,
@@ -256,14 +368,38 @@ public final class TrafficCounter: Sendable {
                 activeConnections: state.active,
                 directUplinkBytes: state.directUp,
                 directDownlinkBytes: state.directDown,
-                policyBytes: Self.top(state.policy, cap: snapshotMapCap),
-                domainBytes: Self.top(state.domains, cap: snapshotMapCap),
+                policyBytes: topPolicies,
+                domainBytes: topDomains,
                 appBytes: topApps,
                 appNames: state.appNames.filter { topApps[$0.key] != nil },
                 activeFlows: Array(state.open.values.sorted { $0.startedAt > $1.startedAt }.prefix(snapshotMapCap)),
-                recentFlows: Array(state.recent.suffix(snapshotMapCap).reversed())
+                recentFlows: Array(state.recent.suffix(snapshotMapCap).reversed()),
+                appTCPBytes: Self.slice(state.appTCP, keys: Set(topApps.keys)),
+                appUDPBytes: Self.slice(state.appUDP, keys: Set(topApps.keys)),
+                domainTCPBytes: Self.slice(state.domainTCP, keys: Set(topDomains.keys)),
+                domainUDPBytes: Self.slice(state.domainUDP, keys: Set(topDomains.keys)),
+                policyTCPBytes: Self.slice(state.policyTCP, keys: Set(topPolicies.keys)),
+                policyUDPBytes: Self.slice(state.policyUDP, keys: Set(topPolicies.keys))
             )
         }
+    }
+
+    private static func addProtocol(
+        _ bytes: UInt64,
+        transport: FlowTransport?,
+        tcp: inout [String: UInt64],
+        udp: inout [String: UInt64],
+        key: String
+    ) {
+        guard bytes > 0, let transport else { return }
+        switch transport {
+        case .tcp: tcp[key, default: 0] &+= bytes
+        case .udp: udp[key, default: 0] &+= bytes
+        }
+    }
+
+    private static func slice(_ map: [String: UInt64], keys: Set<String>) -> [String: UInt64] {
+        map.filter { keys.contains($0.key) }
     }
 
     private static func top(

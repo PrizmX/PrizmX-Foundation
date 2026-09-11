@@ -98,3 +98,39 @@ import PrizmXProtocols
     counter.clearRecent()
     #expect(counter.snapshot().recentFlows.isEmpty)
 }
+
+@Test func trafficSnapshotMergesTunnelAndMixedPort() {
+    let tunnel = TrafficSnapshot(
+        uploadBytesPerSecond: 10,
+        downloadBytesPerSecond: 20,
+        uplinkBytes: 100,
+        downlinkBytes: 200,
+        activeConnections: 1,
+        directUplinkBytes: 5,
+        policyBytes: ["Proxies": TrafficByteCount(up: 100, down: 200)],
+        activeFlows: [
+            FlowRecord(endpoint: Endpoint(domain: "a.example", port: 443), via: "Proxies")
+        ]
+    )
+    let mixed = TrafficSnapshot(
+        uploadBytesPerSecond: 3,
+        downloadBytesPerSecond: 7,
+        uplinkBytes: 30,
+        downlinkBytes: 70,
+        activeConnections: 2,
+        directUplinkBytes: 1,
+        policyBytes: ["Proxies": TrafficByteCount(up: 10, down: 20)],
+        activeFlows: [
+            FlowRecord(endpoint: Endpoint(domain: "b.example", port: 443), via: "Proxies")
+        ]
+    )
+    let merged = tunnel.merging(mixed)
+    #expect(merged.uploadBytesPerSecond == 13)
+    #expect(merged.downloadBytesPerSecond == 27)
+    #expect(merged.uplinkBytes == 130)
+    #expect(merged.downlinkBytes == 270)
+    #expect(merged.activeConnections == 3)
+    #expect(merged.directUplinkBytes == 6)
+    #expect(merged.policyBytes["Proxies"] == TrafficByteCount(up: 110, down: 220))
+    #expect(merged.activeFlows.count == 2)
+}
