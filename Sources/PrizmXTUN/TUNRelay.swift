@@ -51,6 +51,7 @@ private actor UDPRelayState {
                       let evicted = sessions.removeValue(forKey: victim)
                 else { return }
                 tasks.removeValue(forKey: victim)?.cancel()
+                engine.traffic.udpDidClose()
                 await evicted.close()
             }
             let ipv4 = await engine.resolveIPv4(for: datagram.destination)
@@ -85,14 +86,16 @@ private actor UDPRelayState {
     /// drop the entry so a later datagram opens a fresh session and the
     /// session table cannot fill up with dead entries.
     private func finishSession(_ key: UDPFlowKey) {
-        sessions.removeValue(forKey: key)
+        guard sessions.removeValue(forKey: key) != nil else { return }
         tasks.removeValue(forKey: key)
+        engine.traffic.udpDidClose()
     }
 
     /// Registers `session` and starts its pump; the pump's exit removes the
     /// session from the table.
     private func track(_ key: UDPFlowKey, session: any UDPSession) {
         sessions[key] = session
+        engine.traffic.udpDidOpen()
         tasks[key] = Task { [weak self] in
             await session.pump()
             await self?.finishSession(key)
@@ -112,10 +115,14 @@ private actor UDPRelayState {
     func stop() async {
         for task in tasks.values { task.cancel() }
         tasks.removeAll()
+        let leftover = sessions.count
         for session in sessions.values {
             await session.close()
         }
         sessions.removeAll()
+        for _ in 0..<leftover {
+            engine.traffic.udpDidClose()
+        }
     }
 
     private func dropUDP(_ datagram: TUNUDPDatagram, onceKey: String, reason: String) async {

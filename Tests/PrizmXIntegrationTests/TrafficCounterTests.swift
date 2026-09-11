@@ -78,6 +78,8 @@ import PrizmXProtocols
     #expect(snapshot.activeFlows.count == 1)
     #expect(snapshot.activeFlows[0].uplinkBytes == 10)
     #expect(snapshot.activeConnections == 1)
+    #expect(snapshot.tcpConnections == 1)
+    #expect(snapshot.udpConnections == 0)
 
     counter.flowDidClose(
         FlowRecord(
@@ -106,6 +108,7 @@ import PrizmXProtocols
         uplinkBytes: 100,
         downlinkBytes: 200,
         activeConnections: 1,
+        tcpConnections: 1,
         directUplinkBytes: 5,
         policyBytes: ["Proxies": TrafficByteCount(up: 100, down: 200)],
         activeFlows: [
@@ -118,6 +121,7 @@ import PrizmXProtocols
         uplinkBytes: 30,
         downlinkBytes: 70,
         activeConnections: 2,
+        tcpConnections: 2,
         directUplinkBytes: 1,
         policyBytes: ["Proxies": TrafficByteCount(up: 10, down: 20)],
         activeFlows: [
@@ -130,7 +134,32 @@ import PrizmXProtocols
     #expect(merged.uplinkBytes == 130)
     #expect(merged.downlinkBytes == 270)
     #expect(merged.activeConnections == 3)
+    #expect(merged.tcpConnections == 3)
+    #expect(merged.udpConnections == 0)
     #expect(merged.directUplinkBytes == 6)
     #expect(merged.policyBytes["Proxies"] == TrafficByteCount(up: 110, down: 220))
     #expect(merged.activeFlows.count == 2)
+}
+
+@Test func trafficSnapshotDecodesLegacyActiveConnectionsAsTCP() throws {
+    let json = Data("""
+        {"uploadBytesPerSecond":0,"downloadBytesPerSecond":0,"uplinkBytes":0,"downlinkBytes":0,"activeConnections":39,"directUplinkBytes":0,"directDownlinkBytes":0}
+        """.utf8)
+    let snapshot = try JSONDecoder().decode(TrafficSnapshot.self, from: json)
+    #expect(snapshot.tcpConnections == 39)
+    #expect(snapshot.udpConnections == 0)
+}
+
+@Test func trafficCounterTracksUDPSessions() {
+    let counter = TrafficCounter()
+    counter.udpDidOpen()
+    counter.udpDidOpen()
+    var snapshot = counter.snapshot()
+    #expect(snapshot.udpConnections == 2)
+    #expect(snapshot.tcpConnections == 0)
+    #expect(snapshot.activeConnections == 2)
+    counter.udpDidClose()
+    snapshot = counter.snapshot()
+    #expect(snapshot.udpConnections == 1)
+    #expect(snapshot.activeConnections == 1)
 }

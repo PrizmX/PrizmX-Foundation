@@ -24,6 +24,10 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     public var uplinkBytes: UInt64
     public var downlinkBytes: UInt64
     public var activeConnections: Int
+    /// Live TCP splices. `activeConnections` is TCP + UDP.
+    public var tcpConnections: Int
+    /// Live UDP sessions (TUN 4-tuple table).
+    public var udpConnections: Int
     /// Bytes that went DIRECT (proxy = uplink/downlink minus these).
     public var directUplinkBytes: UInt64
     public var directDownlinkBytes: UInt64
@@ -53,6 +57,8 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         uplinkBytes: UInt64 = 0,
         downlinkBytes: UInt64 = 0,
         activeConnections: Int = 0,
+        tcpConnections: Int = 0,
+        udpConnections: Int = 0,
         directUplinkBytes: UInt64 = 0,
         directDownlinkBytes: UInt64 = 0,
         policyBytes: [String: TrafficByteCount] = [:],
@@ -73,6 +79,8 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         self.uplinkBytes = uplinkBytes
         self.downlinkBytes = downlinkBytes
         self.activeConnections = activeConnections
+        self.tcpConnections = tcpConnections
+        self.udpConnections = udpConnections
         self.directUplinkBytes = directUplinkBytes
         self.directDownlinkBytes = directDownlinkBytes
         self.policyBytes = policyBytes
@@ -124,6 +132,8 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
             uplinkBytes: uplinkBytes &+ other.uplinkBytes,
             downlinkBytes: downlinkBytes &+ other.downlinkBytes,
             activeConnections: activeConnections + other.activeConnections,
+            tcpConnections: tcpConnections + other.tcpConnections,
+            udpConnections: udpConnections + other.udpConnections,
             directUplinkBytes: directUplinkBytes &+ other.directUplinkBytes,
             directDownlinkBytes: directDownlinkBytes &+ other.directDownlinkBytes,
             policyBytes: mergeMap(policyBytes, other.policyBytes),
@@ -152,6 +162,7 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case uploadBytesPerSecond, downloadBytesPerSecond
         case uplinkBytes, downlinkBytes, activeConnections
+        case tcpConnections, udpConnections
         case directUplinkBytes, directDownlinkBytes
         case policyBytes, domainBytes, appBytes, appNames
         case activeFlows, recentFlows
@@ -166,6 +177,14 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         uplinkBytes = try container.decode(UInt64.self, forKey: .uplinkBytes)
         downlinkBytes = try container.decode(UInt64.self, forKey: .downlinkBytes)
         activeConnections = try container.decode(Int.self, forKey: .activeConnections)
+        udpConnections = try container.decodeIfPresent(Int.self, forKey: .udpConnections) ?? 0
+        // Older Packet Tunnel dumps only had `activeConnections` (TCP). Treat
+        // a missing TCP key as that total so Home does not show 0/0.
+        if let tcp = try container.decodeIfPresent(Int.self, forKey: .tcpConnections) {
+            tcpConnections = tcp
+        } else {
+            tcpConnections = max(0, activeConnections - udpConnections)
+        }
         directUplinkBytes = try container.decode(UInt64.self, forKey: .directUplinkBytes)
         directDownlinkBytes = try container.decode(UInt64.self, forKey: .directDownlinkBytes)
         policyBytes = try container.decodeIfPresent([String: TrafficByteCount].self, forKey: .policyBytes) ?? [:]
@@ -234,6 +253,7 @@ public final class TrafficCounter: Sendable {
         var uplinkBytes: UInt64 = 0
         var downlinkBytes: UInt64 = 0
         var active: Int = 0
+        var udpActive: Int = 0
         var sampleAt: ContinuousClock.Instant = .now
         var sampleUp: UInt64 = 0
         var sampleDown: UInt64 = 0
@@ -325,6 +345,16 @@ public final class TrafficCounter: Sendable {
         }
     }
 
+    public func udpDidOpen() {
+        lock.withLock { $0.udpActive += 1 }
+    }
+
+    public func udpDidClose() {
+        lock.withLock { state in
+            state.udpActive = max(0, state.udpActive - 1)
+        }
+    }
+
     public func flowDidClose(_ record: FlowRecord) {
         lock.withLock { state in
             state.active = max(0, state.active - 1)
@@ -365,7 +395,9 @@ public final class TrafficCounter: Sendable {
                 downloadBytesPerSecond: downRate,
                 uplinkBytes: state.uplinkBytes,
                 downlinkBytes: state.downlinkBytes,
-                activeConnections: state.active,
+                activeConnections: state.active + state.udpActive,
+                tcpConnections: state.active,
+                udpConnections: state.udpActive,
                 directUplinkBytes: state.directUp,
                 directDownlinkBytes: state.directDown,
                 policyBytes: topPolicies,
