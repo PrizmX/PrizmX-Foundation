@@ -21,7 +21,8 @@ public protocol ConfigParserProtocol: Sendable {
     func parse(rawString: String) throws -> (Router, NodeManager)
 }
 
-/// Convenience entry that picks Clash YAML vs sing-box JSON from the first non-space character.
+/// Convenience entry that picks Clash YAML vs sing-box JSON from content, not
+/// the file extension. Tries the likely parser first, then the other once.
 public enum ConfigAdapter: Sendable {
     public static func parse(
         rawString: String,
@@ -31,15 +32,39 @@ public enum ConfigAdapter: Sendable {
         guard !trimmed.isEmpty else { throw ConfigError.emptyInput }
         let parsed: (Router, NodeManager)
         // sing-box configs are JSON objects. A leading `[` is a Surge INI
-        // section header (`[General]`), not a JSON array, so only `{` routes
-        // to the sing-box parser; everything else goes to the Clash parser,
-        // which performs its own Surge INI detection.
+        // section header (`[General]`), not a JSON array. Our YAML subset
+        // does not accept JSON documents, so a failed primary parse can
+        // safely fall through once; if both fail, keep the primary error.
         if trimmed.first == "{" {
-            parsed = try SingboxConfigParser().parse(rawString: rawString)
+            parsed = try parsePreferringJSON(rawString)
         } else {
-            parsed = try ClashConfigParser().parse(rawString: rawString)
+            parsed = try parsePreferringYAML(rawString)
         }
         return try overlay.apply(to: parsed)
+    }
+
+    private static func parsePreferringYAML(_ rawString: String) throws -> (Router, NodeManager) {
+        do {
+            return try ClashConfigParser().parse(rawString: rawString)
+        } catch let yamlError {
+            do {
+                return try SingboxConfigParser().parse(rawString: rawString)
+            } catch {
+                throw yamlError
+            }
+        }
+    }
+
+    private static func parsePreferringJSON(_ rawString: String) throws -> (Router, NodeManager) {
+        do {
+            return try SingboxConfigParser().parse(rawString: rawString)
+        } catch let jsonError {
+            do {
+                return try ClashConfigParser().parse(rawString: rawString)
+            } catch {
+                throw jsonError
+            }
+        }
     }
 }
 

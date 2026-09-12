@@ -1,7 +1,8 @@
 import Foundation
 
 /// Minimal YAML 1.1 subset used by Clash configs: block mappings/sequences,
-/// quoted scalars, and one-line flow maps/lists. Not a full YAML 1.2 implementation.
+/// quoted scalars (including `\u` / `\U` / `\x` escapes), and one-line flow
+/// maps/lists. Not a full YAML 1.2 implementation.
 enum YAMLNode: Equatable, Sendable {
     case scalar(String)
     case mapping([String: YAMLNode])
@@ -273,11 +274,11 @@ enum YAMLParser {
         guard let first = peek(iterator) else { return "" }
         if first == "\"" || first == "'" {
             let quote = iterator.next()!
-            var body = ""
+            var body = String(quote)
             var escaped = false
             while let character = iterator.next() {
+                body.append(character)
                 if escaped {
-                    body.append(character)
                     escaped = false
                     continue
                 }
@@ -286,7 +287,6 @@ enum YAMLParser {
                     continue
                 }
                 if character == quote { break }
-                body.append(character)
             }
             return body
         }
@@ -341,13 +341,76 @@ enum YAMLParser {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if trimmed.count >= 2 {
             if trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"") {
-                return String(trimmed.dropFirst().dropLast())
+                return yamlUnescapeDoubleQuoted(String(trimmed.dropFirst().dropLast()))
             }
             if trimmed.hasPrefix("'") && trimmed.hasSuffix("'") {
-                return String(trimmed.dropFirst().dropLast())
+                return String(trimmed.dropFirst().dropLast()).replacingOccurrences(of: "''", with: "'")
             }
         }
         if trimmed == "~" || trimmed.lowercased() == "null" { return "" }
         return trimmed
     }
+}
+
+/// YAML 1.1 double-quoted escapes, including Python-style `\UXXXXXXXX`
+/// sequences that subscription converters emit for emoji node names.
+private func yamlUnescapeDoubleQuoted(_ body: String) -> String {
+    var result = ""
+    var index = body.startIndex
+    while index < body.endIndex {
+        let character = body[index]
+        guard character == "\\" else {
+            result.append(character)
+            index = body.index(after: index)
+            continue
+        }
+        let escapeIndex = body.index(after: index)
+        guard escapeIndex < body.endIndex else {
+            result.append(character)
+            break
+        }
+        let escape = body[escapeIndex]
+        let afterEscape = body.index(after: escapeIndex)
+        if let simple = yamlSimpleDoubleQuoteEscapes[escape] {
+            result.append(simple)
+            index = afterEscape
+            continue
+        }
+        if let width = yamlHexEscapeWidths[escape],
+           let (scalar, end) = yamlHexScalar(in: body, from: afterEscape, count: width) {
+            result.append(Character(scalar))
+            index = end
+            continue
+        }
+        result.append(escape)
+        index = afterEscape
+    }
+    return result
+}
+
+private let yamlSimpleDoubleQuoteEscapes: [Character: Character] = [
+    "0": "\0", "a": "\u{07}", "b": "\u{08}", "t": "\t", "n": "\n",
+    "v": "\u{0B}", "f": "\u{0C}", "r": "\r", "e": "\u{1B}", " ": " ",
+    "\"": "\"", "/": "/", "\\": "\\", "N": "\u{85}", "_": "\u{A0}",
+    "L": "\u{2028}", "P": "\u{2029}",
+]
+
+private let yamlHexEscapeWidths: [Character: Int] = ["x": 2, "u": 4, "U": 8]
+
+private func yamlHexScalar(
+    in text: String,
+    from start: String.Index,
+    count: Int
+) -> (Unicode.Scalar, String.Index)? {
+    var index = start
+    var value: UInt32 = 0
+    for _ in 0..<count {
+        guard index < text.endIndex, let digit = text[index].hexDigitValue else {
+            return nil
+        }
+        value = value * 16 + UInt32(digit)
+        index = text.index(after: index)
+    }
+    guard let scalar = Unicode.Scalar(value) else { return nil }
+    return (scalar, index)
 }

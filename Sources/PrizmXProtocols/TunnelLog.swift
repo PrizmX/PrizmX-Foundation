@@ -4,16 +4,30 @@ import Foundation
 /// App Group container. Per-flow request data belongs to the Inspector's
 /// request list, not here.
 public enum TunnelLog: Sendable {
-    public enum Level: String, Sendable {
+    public enum Level: String, Sendable, CaseIterable, Comparable {
         case debug
         case info
         case warn
         case error
+
+        public static func < (lhs: Level, rhs: Level) -> Bool {
+            lhs.rank < rhs.rank
+        }
+
+        private var rank: Int {
+            switch self {
+            case .debug: 0
+            case .info: 1
+            case .warn: 2
+            case .error: 3
+            }
+        }
     }
 
     public static let defaultAppGroupIdentifier = PrizmXAppGroup.identifier
     public static let defaultDirectoryName = "PrizmXKit"
     public static let relativePath = "logs/tunnel.log"
+    static let minimumLevelKey = "tunnel.logMinimumLevel"
 
     private static let maxBytes = 512 * 1024
     private static let keepBytes = 256 * 1024
@@ -48,15 +62,25 @@ public enum TunnelLog: Sendable {
             .appendingPathComponent(relativePath)
     }
 
+    /// Lowest level written to `tunnel.log` (Events). Shared via App Group.
+    public static var minimumLevel: Level {
+        get { ioQueue.sync { minimumLevelLocked() } }
+        set { ioQueue.sync { setMinimumLevelLocked(newValue) } }
+    }
+
     public static func write(_ level: Level, _ message: @autoclosure () -> String) {
         let text = message()
-        ioQueue.async { appendLocked(level, text) }
+        ioQueue.async {
+            guard level >= minimumLevelLocked() else { return }
+            appendLocked(level, text)
+        }
     }
 
     /// Logs once per `key` for the process lifetime (e.g. unsupported UDP kinds).
     public static func writeOnce(_ key: String, _ level: Level, _ message: @autoclosure () -> String) {
         let text = message()
         ioQueue.async {
+            guard level >= minimumLevelLocked() else { return }
             guard writtenOnceKeys.insert(key).inserted else { return }
             appendLocked(level, text)
         }
@@ -80,6 +104,20 @@ public enum TunnelLog: Sendable {
                 try? FileManager.default.removeItem(at: url)
             }
         }
+    }
+
+    private static var defaults: UserDefaults? {
+        UserDefaults(suiteName: defaultAppGroupIdentifier)
+    }
+
+    private static func minimumLevelLocked() -> Level {
+        let raw = defaults?.string(forKey: minimumLevelKey) ?? Level.info.rawValue
+        return Level(rawValue: raw) ?? .info
+    }
+
+    private static func setMinimumLevelLocked(_ level: Level) {
+        defaults?.set(level.rawValue, forKey: minimumLevelKey)
+        defaults?.synchronize()
     }
 
     private static func appendLocked(_ level: Level, _ message: String) {

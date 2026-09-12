@@ -135,6 +135,52 @@ private let expectedNodeCount = 2
     #expect(fromJSON.1.nodesByID.count == expectedNodeCount)
 }
 
+@Test func clashDecodesYAMLUnicodeEscapesInProxyNames() throws {
+    // Subscription dumps often emit Python/YAML 1.1 `\UXXXXXXXX` instead of
+    // raw emoji. Names must round-trip to the real scalars so the UI and
+    // policy matching see “🇺🇸”, not the escape text.
+    let yaml = #"""
+    proxies:
+      - name: "\U0001F1FA\U0001F1F8美国"
+        type: ss
+        server: us.ss.example
+        port: 8388
+        cipher: aes-256-gcm
+        password: test-password
+      - {name: "\u9999港", type: ss, server: hk.ss.example, port: 8388, cipher: aes-256-gcm, password: x}
+    proxy-groups:
+      - name: "\U0001F30E全球"
+        type: select
+        proxies:
+          - "\U0001F1FA\U0001F1F8美国"
+          - "\u9999港"
+    rules:
+      - "MATCH,\U0001F30E全球"
+    """#
+    let (router, nodes) = try ConfigAdapter.parse(rawString: yaml)
+    let us = "\u{1F1FA}\u{1F1F8}美国"
+    let hk = "\u{9999}港"
+    let global = "\u{1F30E}全球"
+    #expect(nodes.node(id: us) != nil)
+    #expect(nodes.node(id: hk) != nil)
+    #expect(nodes.group(named: global)?.nodeIDs == [us, hk])
+    #expect(router.match(endpoint: Endpoint(domain: "example.com", port: 443)) == .proxy(targetGroup: global))
+}
+
+@Test func configAdapterKeepsJSONErrorWhenBothParsersFail() {
+    do {
+        _ = try ConfigAdapter.parse(rawString: "{not-json")
+        Issue.record("expected jsonSyntax")
+    } catch let error as ConfigError {
+        guard case .jsonSyntax = error else {
+            Issue.record("expected jsonSyntax, got \(error)")
+            return
+        }
+    } catch {
+        Issue.record("expected ConfigError, got \(error)")
+    }
+}
+
 @Test func clashSkipsUnknownRuleTypes() throws {
     // Subscriptions carry rule kinds we do not support yet (PROCESS-NAME,
     // RULE-SET…); Clash YAML import skips them instead of failing wholesale.
