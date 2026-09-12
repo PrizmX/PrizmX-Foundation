@@ -36,13 +36,14 @@ rules:
     #expect(parsed.0.rules[1].displayPayload == "google.com")
 }
 
-@Test func overlaySkipsSameNameGroup() throws {
+@Test func overlayOverridesSameNameGroup() throws {
     let overlay = ProfileOverlay(groups: [
-        OverlayGroup(name: "PROXY", members: ["DIRECT"]),
+        OverlayGroup(name: "PROXY", mode: "url-test", members: ["DIRECT", "ss-us"]),
         OverlayGroup(name: "Home", members: ["DIRECT", "ss-us"]),
     ])
     let parsed = try ConfigAdapter.parse(rawString: body, overlay: overlay)
-    #expect(parsed.1.group(named: "PROXY")?.nodeIDs == ["ss-us"])
+    #expect(parsed.1.group(named: "PROXY")?.nodeIDs == ["DIRECT", "ss-us"])
+    #expect(parsed.1.group(named: "PROXY")?.mode == .urlTest)
     #expect(parsed.1.group(named: "Home")?.nodeIDs == ["DIRECT", "ss-us"])
 }
 

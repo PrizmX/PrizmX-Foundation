@@ -6,8 +6,8 @@ import PrizmXRules
 /// Local overlay merged onto a profile body at parse time.
 ///
 /// The subscription / local YAML is never rewritten. Overlay rules are
-/// prepended (first match wins); overlay groups are appended and skipped
-/// when a group of the same name already exists in the body.
+/// prepended (first match wins). Overlay groups replace a same-name body
+/// group (mode / members / test URL) or append when the name is new.
 public struct ProfileOverlay: Sendable, Hashable, Codable, Equatable {
     public static let currentVersion = 1
     public static let empty = ProfileOverlay()
@@ -28,32 +28,46 @@ public struct ProfileOverlay: Sendable, Hashable, Codable, Equatable {
         self.groups = groups
     }
 
-    /// Prepends overlay rules and appends overlay groups onto a parsed body.
+    /// Prepends overlay rules and merges overlay groups onto a parsed body.
     public func apply(to parsed: (Router, NodeManager)) throws -> (Router, NodeManager) {
         guard !isEmpty else { return parsed }
         let compiledRules = try rules.map { try $0.compile() }
         let nodes = Array(parsed.1.nodesByID.values)
         var groups = Array(parsed.1.groupsByName.values)
-        var names = Set(groups.map(\.name))
         for item in self.groups {
-            let name = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty else { continue }
-            switch name.uppercased() {
+            let compiled = item.compile()
+            guard !compiled.name.isEmpty, !compiled.nodeIDs.isEmpty else { continue }
+            switch compiled.name.uppercased() {
             case "DIRECT", "REJECT", "REJECT-DROP":
                 continue
             default:
-                break
+                merge(compiled, into: &groups)
             }
-            guard names.insert(name).inserted else { continue }
-            let group = item.compile()
-            guard !group.nodeIDs.isEmpty else { continue }
-            groups.append(group)
         }
         let router = Router(
             rules: compiledRules + parsed.0.rules,
             default: parsed.0.defaultPolicy
         )
         return (router, NodeManager(nodes: nodes, groups: groups))
+    }
+
+    private func merge(_ compiled: PolicyGroup, into groups: inout [PolicyGroup]) {
+        if let index = groups.firstIndex(where: { $0.name == compiled.name }) {
+            let previous = groups[index]
+            groups[index] = PolicyGroup(
+                name: compiled.name,
+                mode: compiled.mode,
+                nodeIDs: compiled.nodeIDs,
+                selectedNodeID: compiled.selectedNodeID ?? previous.selectedNodeID,
+                iconURL: previous.iconURL,
+                testURL: compiled.testURL,
+                interval: compiled.interval,
+                tolerance: compiled.tolerance,
+                loadBalanceStrategy: compiled.loadBalanceStrategy
+            )
+        } else {
+            groups.append(compiled)
+        }
     }
 }
 
@@ -133,7 +147,7 @@ public struct OverlayRule: Sendable, Hashable, Codable, Equatable, Identifiable 
     }
 }
 
-/// One user-owned policy group. Same-name groups in the profile body win.
+/// One user-owned policy group. Same-name overlay groups replace the body group.
 public struct OverlayGroup: Sendable, Hashable, Codable, Equatable, Identifiable {
     public var id: UUID
     public var name: String
@@ -162,6 +176,17 @@ public struct OverlayGroup: Sendable, Hashable, Codable, Equatable, Identifiable
         self.testURL = testURL
         self.intervalSeconds = intervalSeconds
         self.toleranceMilliseconds = toleranceMilliseconds
+    }
+
+    /// Snapshot a live group so the overlay can override mode or members.
+    public init(from group: PolicyGroup) {
+        self.init(
+            name: group.name,
+            mode: group.mode.clashType,
+            members: group.nodeIDs,
+            selectedMember: group.selectedNodeID,
+            testURL: group.testURL
+        )
     }
 
     public func compile() -> PolicyGroup {

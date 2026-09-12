@@ -47,6 +47,15 @@ public struct PolicyGroup: Sendable, Hashable {
         case fallback
         /// Spread flows across live members (`loadBalanceStrategy`).
         case loadBalance
+
+        public var clashType: String {
+            switch self {
+            case .select: "select"
+            case .urlTest: "url-test"
+            case .fallback: "fallback"
+            case .loadBalance: "load-balance"
+            }
+        }
     }
 
     public enum LoadBalanceStrategy: Sendable, Hashable {
