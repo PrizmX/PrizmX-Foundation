@@ -99,7 +99,7 @@ private let expectedNodeCount = 2
         cipher: .aes256GCM
     ))
     let vless = try #require(nodes.node(id: "vless-us"))
-    guard case .vless(let server, let uuid, let sni, let tls, let reality) = vless.protocolConfig else {
+    guard case .vless(let server, let uuid, let sni, let tls, let reality, let flow) = vless.protocolConfig else {
         Issue.record("expected vless node")
         return
     }
@@ -108,6 +108,59 @@ private let expectedNodeCount = 2
     #expect(sni == "us.vless.example")
     #expect(tls)
     #expect(reality == nil)
+    #expect(flow == nil)
+}
+
+@Test func clashYAMLParsesVLESSVisionFlowAndREALITY() throws {
+    let yaml = """
+    proxies:
+      - name: vis
+        type: vless
+        server: 10.0.0.1
+        port: 8443
+        uuid: b831381d-6324-4d53-ad4f-8cda3b4b0c7f
+        tls: true
+        flow: xtls-rprx-vision
+        servername: www.mozilla.org
+        reality-opts:
+          public-key: jN9SoV2ySHWSZqALxpPfbKjsccEQSoyWKNaUVn2_V3o
+          short-id: 0a79af70ac4f2127
+    """
+    let (_, nodes) = try ClashConfigParser().parse(rawString: yaml)
+    let node = try #require(nodes.node(id: "vis"))
+    guard case .vless(_, _, let sni, let tls, let reality, let flow) = node.protocolConfig else {
+        Issue.record("expected vless node")
+        return
+    }
+    #expect(sni == "www.mozilla.org")
+    #expect(tls)
+    #expect(flow == VLESSVision.flowName)
+    #expect(reality?.shortId == "0a79af70ac4f2127")
+}
+
+@Test func singboxJSONParsesVLESSFlow() throws {
+    let json = """
+    {
+      "outbounds": [
+        {
+          "type": "vless",
+          "tag": "vis",
+          "server": "10.0.0.1",
+          "server_port": 8443,
+          "uuid": "b831381d-6324-4d53-ad4f-8cda3b4b0c7f",
+          "flow": "xtls-rprx-vision",
+          "tls": { "enabled": true, "server_name": "www.mozilla.org" }
+        }
+      ]
+    }
+    """
+    let (_, nodes) = try SingboxConfigParser().parse(rawString: json)
+    let node = try #require(nodes.node(id: "vis"))
+    guard case .vless(_, _, _, _, _, let flow) = node.protocolConfig else {
+        Issue.record("expected vless node")
+        return
+    }
+    #expect(flow == VLESSVision.flowName)
 }
 
 @Test func singboxJSONRestoresRouterAndNodes() throws {

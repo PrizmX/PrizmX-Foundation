@@ -781,6 +781,9 @@ final class TLS13RecordLayer: @unchecked Sendable {
     private var application: TLS13TrafficPair
     private var incoming = DirectBuffer()
     private var pendingPlaintext = DirectBuffer()
+    /// XTLS Vision direct-copy: after a downlink `command=direct` frame the
+    /// peer writes inner TLS records unencrypted, so decryption must stop.
+    private(set) var isRawMode = false
 
     init(application: TLS13TrafficPair) {
         self.application = application
@@ -815,47 +818,78 @@ final class TLS13RecordLayer: @unchecked Sendable {
         return data
     }
 
+    // MARK: Per-record decrypt + raw mode (Vision direct copy)
+
+    /// Appends wire bytes without decrypting (pair with `decryptNextRecord`).
+    func appendWire(_ chunk: Data) {
+        incoming.append(chunk)
+    }
+
+    /// Decrypts exactly one buffered record. Returns application-data
+    /// plaintext, an empty `Data` for consumed non-application records (CCS /
+    /// post-handshake), and `nil` only when no complete record is buffered.
+    func decryptNextRecord() throws -> Data? {
+        guard incoming.readableByteCount >= TLS13.recordHeaderByteCount else { return nil }
+        let headerView = incoming.readableBytes
+        let length = (Int(headerView[3]) << 8) | Int(headerView[4])
+        let total = TLS13.recordHeaderByteCount + length
+        guard incoming.readableByteCount >= total else { return nil }
+        let raw = Array(headerView)
+        let header = Array(raw.prefix(TLS13.recordHeaderByteCount))
+        let fragment = Array(raw[TLS13.recordHeaderByteCount..<total])
+        incoming.consume(total)
+
+        let recordType = header[0]
+        if recordType == TLS13.contentChangeCipherSpec {
+            return Data()
+        }
+        if recordType == TLS13.contentAlert {
+            if fragment.count >= 2 {
+                throw REALITYError.alert(fragment[0], fragment[1])
+            }
+            throw REALITYError.alert(0, 0)
+        }
+
+        let (innerType, plaintext) = try TLS13AEAD.open(
+            recordHeader: header,
+            fragment: fragment,
+            keys: &application.server
+        )
+        switch innerType {
+        case TLS13.contentApplicationData:
+            return plaintext
+        case TLS13.contentHandshake:
+            return Data()
+        case TLS13.contentAlert:
+            let bytes = Array(plaintext)
+            if bytes.count >= 2 {
+                throw REALITYError.alert(bytes[0], bytes[1])
+            }
+            throw REALITYError.alert(0, 0)
+        default:
+            return Data()
+        }
+    }
+
+    /// Switches to raw passthrough (Vision direct copy). Buffered wire bytes
+    /// and all later bytes are no longer decrypted.
+    func enableRawMode() {
+        isRawMode = true
+    }
+
+    /// Drains still-buffered wire bytes as raw (call after `enableRawMode`).
+    func drainRawIncoming() -> Data {
+        let count = incoming.readableByteCount
+        guard count > 0 else { return Data() }
+        let data = Data(incoming.readableBytes)
+        incoming.consume(count)
+        return data
+    }
+
     private func drainRecords() throws {
-        while incoming.readableByteCount >= TLS13.recordHeaderByteCount {
-            let headerView = incoming.readableBytes
-            let length = (Int(headerView[3]) << 8) | Int(headerView[4])
-            let total = TLS13.recordHeaderByteCount + length
-            guard incoming.readableByteCount >= total else { return }
-            let raw = Array(headerView)
-            let header = Array(raw.prefix(TLS13.recordHeaderByteCount))
-            let fragment = Array(raw[TLS13.recordHeaderByteCount..<total])
-            incoming.consume(total)
-
-            let recordType = header[0]
-            if recordType == TLS13.contentChangeCipherSpec {
-                continue
-            }
-            if recordType == TLS13.contentAlert {
-                if fragment.count >= 2 {
-                    throw REALITYError.alert(fragment[0], fragment[1])
-                }
-                throw REALITYError.alert(0, 0)
-            }
-
-            let (innerType, plaintext) = try TLS13AEAD.open(
-                recordHeader: header,
-                fragment: fragment,
-                keys: &application.server
-            )
-            switch innerType {
-            case TLS13.contentApplicationData:
-                pendingPlaintext.append(Array(plaintext))
-            case TLS13.contentHandshake:
-                continue
-            case TLS13.contentAlert:
-                let bytes = Array(plaintext)
-                if bytes.count >= 2 {
-                    throw REALITYError.alert(bytes[0], bytes[1])
-                }
-                throw REALITYError.alert(0, 0)
-            default:
-                break
-            }
+        while let plaintext = try decryptNextRecord() {
+            guard !plaintext.isEmpty else { continue }
+            pendingPlaintext.append(Array(plaintext))
         }
     }
 }

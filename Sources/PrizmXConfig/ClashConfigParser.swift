@@ -81,24 +81,7 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                 protocolConfig: .shadowsocks(server: endpoint, password: password, cipher: cipher)
             )
         case "vless":
-            let server = try node.requiredString("server")
-            let port = try node.int(for: "port")
-            let uuid = try node.requiredString("uuid")
-            let endpoint = try ConfigMapping.endpoint(host: server, port: port, field: "port")
-            let sni = node.string(for: "servername") ?? node.string(for: "sni")
-            let tls = node.bool(for: "tls", default: sni != nil)
-            let reality = try parseREALITY(from: node, sni: sni)
-            return OutboundNode(
-                id: name,
-                name: name,
-                protocolConfig: .vless(
-                    server: endpoint,
-                    uuid: uuid,
-                    sni: sni,
-                    tls: tls || reality != nil,
-                    reality: reality
-                )
-            )
+            return try makeClashVLESS(node, name: name)
         case "trojan":
             let server = try node.requiredString("server")
             let port = try node.int(for: "port")
@@ -136,6 +119,29 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         default:
             return nil
         }
+    }
+
+    private func makeClashVLESS(_ node: YAMLNode, name: String) throws -> OutboundNode {
+        let server = try node.requiredString("server")
+        let port = try node.int(for: "port")
+        let uuid = try node.requiredString("uuid")
+        let endpoint = try ConfigMapping.endpoint(host: server, port: port, field: "port")
+        let sni = node.string(for: "servername") ?? node.string(for: "sni")
+        let tls = node.bool(for: "tls", default: sni != nil)
+        let reality = try parseREALITY(from: node, sni: sni)
+        let flow = VLESSVision.normalized(node.string(for: "flow"))
+        return OutboundNode(
+            id: name,
+            name: name,
+            protocolConfig: .vless(
+                server: endpoint,
+                uuid: uuid,
+                sni: sni,
+                tls: tls || reality != nil,
+                reality: reality,
+                flow: flow
+            )
+        )
     }
 
     private func parseREALITY(from node: YAMLNode, sni: String?) throws -> REALITYConfig? {
@@ -274,6 +280,7 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             let sni = named("sni") ?? named("servername")
             let tls = named("tls").map { $0.lowercased() == "true" } ?? (sni != nil)
             let reality = try parseSurgeREALITY(named: named, sni: sni)
+            let flow = VLESSVision.normalized(named("flow"))
             let endpoint = try ConfigMapping.endpoint(host: host, port: port, field: "port")
             return OutboundNode(
                 id: String(name),
@@ -283,7 +290,8 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                     uuid: uuid,
                     sni: sni,
                     tls: tls || reality != nil,
-                    reality: reality
+                    reality: reality,
+                    flow: flow
                 )
             )
         case "trojan":

@@ -8,7 +8,14 @@ import PrizmXProtocols
 @frozen
 public enum ProtocolConfig: Sendable, Hashable {
     case shadowsocks(server: Endpoint, password: String, cipher: ShadowsocksCipher)
-    case vless(server: Endpoint, uuid: String, sni: String?, tls: Bool, reality: REALITYConfig?)
+    case vless(
+        server: Endpoint,
+        uuid: String,
+        sni: String?,
+        tls: Bool,
+        reality: REALITYConfig?,
+        flow: String? = nil
+    )
     case trojan(server: Endpoint, password: String, sni: String?)
     case anytls(
         server: Endpoint,
@@ -138,7 +145,7 @@ public enum NodeFactory: Sendable {
                 cipher: cipher,
                 target: target
             )
-        case .vless(let server, let uuid, let sni, let tls, let reality):
+        case .vless(let server, let uuid, let sni, let tls, let reality, let flow):
             return try VLESSOutboundConnection(
                 server: server,
                 uuid: uuid,
@@ -146,6 +153,7 @@ public enum NodeFactory: Sendable {
                 sni: sni,
                 tls: tls,
                 reality: reality,
+                flow: flow,
                 command: command
             )
         case .trojan(let server, let password, let sni):
@@ -523,7 +531,7 @@ extension OutboundNode {
         switch protocolConfig {
         case .shadowsocks(let server, _, _):
             return server
-        case .vless(let server, _, _, _, _):
+        case .vless(let server, _, _, _, _, _):
             return server
         case .trojan(let server, _, _):
             return server

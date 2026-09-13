@@ -82,6 +82,7 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
         let uuid = outbound.uuid ?? ""
         let tls = outbound.tls?.enabled ?? false
         let sni = outbound.tls?.serverName
+        let flow = VLESSVision.normalized(outbound.flow)
         var reality: REALITYConfig?
         if let settings = outbound.tls?.reality, settings.enabled != false,
            let publicKey = settings.publicKey, !publicKey.isEmpty {
@@ -101,7 +102,8 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
                 uuid: uuid,
                 sni: sni,
                 tls: tls || sni != nil || reality != nil,
-                reality: reality
+                reality: reality,
+                flow: flow
             )
         )
     }
@@ -197,6 +199,7 @@ struct SingboxOutbound: Codable, Sendable {
     var method: String?
     var password: String?
     var uuid: String?
+    var flow: String?
     var tls: SingboxTLS?
     var outbounds: [String]?
     var url: String?
@@ -205,7 +208,7 @@ struct SingboxOutbound: Codable, Sendable {
     var strategy: String?
 
     enum CodingKeys: String, CodingKey {
-        case type, tag, server, method, password, uuid, tls, outbounds, url, interval, tolerance, strategy
+        case type, tag, server, method, password, uuid, flow, tls, outbounds, url, interval, tolerance, strategy
         case serverPort = "server_port"
     }
 

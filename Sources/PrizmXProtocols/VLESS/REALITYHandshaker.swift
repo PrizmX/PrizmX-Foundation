@@ -300,6 +300,26 @@ public final class REALITYSession: @unchecked Sendable {
     func drainPlaintext() -> Data {
         layer.drainPlaintext()
     }
+
+    // MARK: Vision direct copy
+
+    var isRawMode: Bool { layer.isRawMode }
+
+    func appendWire(_ chunk: Data) {
+        layer.appendWire(chunk)
+    }
+
+    func decryptNextRecord() throws -> Data? {
+        try layer.decryptNextRecord()
+    }
+
+    func enableRawMode() {
+        layer.enableRawMode()
+    }
+
+    func drainRawIncoming() -> Data {
+        layer.drainRawIncoming()
+    }
 }
 
 // MARK: - Crypto helpers (tests + call sites)
