@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Network
 import os
@@ -99,6 +100,22 @@ struct UDPNameserver: NameserverTransport {
         return DNSWire.aaaaRecords(in: answer, expectedID: queryID)
     }
 
+    func queryPTR(_ domain: String) async throws -> [String] {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return [] }
+        let parameters = NWParameters.udp
+        parameters.preferNoProxies = true
+        let connection = NWConnection(host: NWEndpoint.Host(address), port: nwPort, using: parameters)
+        defer { connection.cancel() }
+        try await NWReady.wait(connection, timeout: .seconds(2))
+        let queryID = UInt16.random(in: .min ... .max)
+        try await send(
+            connection,
+            DNSWire.makeQuery(id: queryID, domain: domain, type: DNSWire.typePTR)
+        )
+        let answer = try await receiveMessage(connection, timeout: .seconds(3))
+        return DNSWire.ptrNames(in: answer, expectedID: queryID)
+    }
+
     private func send(_ connection: NWConnection, _ data: Data) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed { error in
@@ -144,5 +161,70 @@ struct UDPNameserver: NameserverTransport {
                 throw error
             }
         }
+    }
+}
+
+/// Reverse DNS that bypasses FakeIP / system proxy.
+///
+/// `dig` / `nslookup` / mDNSResponder follow the tunnel resolver (`198.18.0.2`)
+/// while TUN is up. This sends a PTR UDP query to the physical nameserver
+/// with `preferNoProxies`, same path as the Home DNS latency probe.
+public enum PhysicalPTRLookup: Sendable {
+    public static func hostname(for address: String) async -> String? {
+        guard let qname = ptrName(for: address) else { return nil }
+        var servers = PhysicalDNSSnapshot.capture()
+        servers.append(contentsOf: gatewayCandidates(for: address))
+        var seen = Set<String>()
+        for server in servers {
+            guard seen.insert(server).inserted else { continue }
+            guard NameserverAddress.isUsableIPv4(server),
+                  let endpoint = NameserverEndpoint.udp(ip: server),
+                  let transport = try? NameserverFactory.make(endpoint)
+            else { continue }
+            guard let udp = transport as? UDPNameserver else { continue }
+            if let name = try? await udp.queryPTR(qname), let host = name.first, !host.isEmpty {
+                return host
+            }
+        }
+        return nil
+    }
+
+    public static func ptrName(for address: String) -> String? {
+        if address.contains(":") {
+            return ip6arpa(address)
+        }
+        return inAddrArpa(address)
+    }
+
+    private static func inAddrArpa(_ address: String) -> String? {
+        let parts = address.split(separator: ".")
+        guard parts.count == 4 else { return nil }
+        return parts.reversed().joined(separator: ".") + ".in-addr.arpa"
+    }
+
+    private static func ip6arpa(_ address: String) -> String? {
+        var raw = address
+        if raw.lowercased().hasPrefix("::ffff:") {
+            return inAddrArpa(String(raw.dropFirst(7)))
+        }
+        if let percent = raw.firstIndex(of: "%") {
+            raw = String(raw[..<percent])
+        }
+        var addr = in6_addr()
+        guard inet_pton(AF_INET6, raw, &addr) == 1 else { return nil }
+        var nibbles: [String] = []
+        withUnsafeBytes(of: addr) { buffer in
+            for byte in buffer {
+                nibbles.append(String(byte >> 4, radix: 16))
+                nibbles.append(String(byte & 0x0F, radix: 16))
+            }
+        }
+        return nibbles.reversed().joined(separator: ".") + ".ip6.arpa"
+    }
+
+    private static func gatewayCandidates(for address: String) -> [String] {
+        let parts = address.split(separator: ".")
+        guard parts.count == 4 else { return [] }
+        return ["\(parts[0]).\(parts[1]).\(parts[2]).1"]
     }
 }

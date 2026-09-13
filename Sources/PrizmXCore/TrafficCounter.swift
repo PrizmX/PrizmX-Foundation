@@ -218,6 +218,9 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
     public var attribution: FlowAttribution?
     /// Session number for Inspector (Surge-style ID). Optional so older snapshots decode.
     public var serial: UInt64?
+    /// Remote socket of the inbound connection (mixed-port client). Optional
+    /// so older tunnel snapshots still decode.
+    public var sourceHost: String?
 
     public init(
         id: UUID = UUID(),
@@ -232,7 +235,8 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
         closed: Bool = true,
         rule: String = "",
         attribution: FlowAttribution? = nil,
-        serial: UInt64? = nil
+        serial: UInt64? = nil,
+        sourceHost: String? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -247,6 +251,7 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
         self.rule = rule
         self.attribution = attribution
         self.serial = serial
+        self.sourceHost = sourceHost
     }
 }
 

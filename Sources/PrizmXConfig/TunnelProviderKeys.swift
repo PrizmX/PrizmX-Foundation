@@ -26,6 +26,8 @@ public enum TunnelProviderKeys: Sendable {
     /// Mixed-port TCP port (default 7890).
     public static let mixedPort = "mixedPort"
     public static let defaultMixedPort = 7890
+    /// Clash `socks-port` default when the profile omits it.
+    public static let defaultSOCKSPort = 7891
     /// `Bool`. Bind mixed-port on all interfaces (Surge Allow LAN).
     public static let allowLAN = "allowLAN"
 }

@@ -7,15 +7,36 @@ import PrizmXProtocols
 public final class MixedPortServer: @unchecked Sendable {
     public static let defaultPort: UInt16 = 7890
 
+    public enum Accept: Sendable, Equatable, Hashable {
+        case mixed
+        case http
+        case socks
+
+        var logName: String {
+            switch self {
+            case .mixed: "mixed-port"
+            case .http: "http"
+            case .socks: "socks"
+            }
+        }
+    }
+
     private let engine: Engine
     private let port: UInt16
     private let allowLAN: Bool
+    private let accept: Accept
     private let listenerBox = OSAllocatedUnfairLock<NWListener?>(initialState: nil)
 
-    public init(engine: Engine, port: UInt16 = defaultPort, allowLAN: Bool = false) {
+    public init(
+        engine: Engine,
+        port: UInt16 = defaultPort,
+        allowLAN: Bool = false,
+        accept: Accept = .mixed
+    ) {
         self.engine = engine
         self.port = port
         self.allowLAN = allowLAN
+        self.accept = accept
     }
 
     public func start() async throws {
@@ -38,7 +59,7 @@ public final class MixedPortServer: @unchecked Sendable {
                 return
             }
             connection.start(queue: .global(qos: .userInitiated))
-            Task { await self.handle(connection) }
+            Task { await self.handle(connection, listenPort: self.port) }
         }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let settled = OSAllocatedUnfairLock(initialState: false)
@@ -63,7 +84,8 @@ public final class MixedPortServer: @unchecked Sendable {
             listener.start(queue: .global(qos: .utility))
         }
         listenerBox.withLock { $0 = listener }
-        TunnelLog.write(.info, "mixed-port listen \(allowLAN ? "0.0.0.0" : "127.0.0.1"):\(port)")
+        let bind = allowLAN ? "0.0.0.0" : "127.0.0.1"
+        TunnelLog.write(.info, "\(accept.logName) listen \(bind):\(port)")
     }
 
     public func stop() {
@@ -75,7 +97,7 @@ public final class MixedPortServer: @unchecked Sendable {
         listener?.cancel()
     }
 
-    private func handle(_ connection: NWConnection) async {
+    private func handle(_ connection: NWConnection, listenPort: UInt16) async {
         var buffer = Data()
         do {
             while buffer.isEmpty {
@@ -87,16 +109,28 @@ public final class MixedPortServer: @unchecked Sendable {
             }
             switch MixedPortParser.kind(firstByte: buffer[0]) {
             case .socks5:
-                try await handleSOCKS(connection, buffer: &buffer)
+                guard accept != .http else {
+                    connection.cancel()
+                    return
+                }
+                try await handleSOCKS(connection, listenPort: listenPort, buffer: &buffer)
             case .http:
-                try await handleHTTP(connection, buffer: &buffer)
+                guard accept != .socks else {
+                    connection.cancel()
+                    return
+                }
+                try await handleHTTP(connection, listenPort: listenPort, buffer: &buffer)
             }
         } catch {
             connection.cancel()
         }
     }
 
-    private func handleHTTP(_ connection: NWConnection, buffer: inout Data) async throws {
+    private func handleHTTP(
+        _ connection: NWConnection,
+        listenPort: UInt16,
+        buffer: inout Data
+    ) async throws {
         var parsed: MixedPortParser.HTTPRequest
         var leftover: Data
         while true {
@@ -115,12 +149,17 @@ public final class MixedPortServer: @unchecked Sendable {
         let stream = NWInboundStream(
             endpoint: endpoint,
             connection: connection,
+            listenPort: listenPort,
             leftover: parsed.command == .connect ? leftover : parsed.preface
         )
         await EngineTCPRelay.pipe(stream: stream, engine: engine)
     }
 
-    private func handleSOCKS(_ connection: NWConnection, buffer: inout Data) async throws {
+    private func handleSOCKS(
+        _ connection: NWConnection,
+        listenPort: UInt16,
+        buffer: inout Data
+    ) async throws {
         while true {
             do {
                 let consumed = try MixedPortParser.parseSOCKSGreeting(buffer)
@@ -147,6 +186,7 @@ public final class MixedPortServer: @unchecked Sendable {
         let stream = NWInboundStream(
             endpoint: MixedPortParser.endpoint(host: request.host, port: request.port),
             connection: connection,
+            listenPort: listenPort,
             leftover: leftover
         )
         await EngineTCPRelay.pipe(stream: stream, engine: engine)
@@ -185,20 +225,32 @@ private final class NWInboundStream: InboundStream, @unchecked Sendable {
     let endpoint: Endpoint
     let clientAddress: String
     let clientPort: UInt16
+    let listenPort: UInt16?
     private let connection: NWConnection
     private let leftover = OSAllocatedUnfairLock<Data>(initialState: Data())
 
-    init(endpoint: Endpoint, connection: NWConnection, leftover seed: Data) {
+    init(endpoint: Endpoint, connection: NWConnection, listenPort: UInt16, leftover seed: Data) {
         self.endpoint = endpoint
         self.connection = connection
-        if case .hostPort(let host, let port) = connection.endpoint {
-            self.clientAddress = "\(host)"
+        self.listenPort = listenPort
+        let remote = connection.currentPath?.remoteEndpoint ?? connection.endpoint
+        if case .hostPort(let host, let port) = remote {
+            self.clientAddress = Self.hostString(host)
             self.clientPort = port.rawValue
         } else {
             self.clientAddress = ""
             self.clientPort = 0
         }
         leftover.withLock { $0 = seed }
+    }
+
+    private static func hostString(_ host: NWEndpoint.Host) -> String {
+        switch host {
+        case .ipv4(let address): return "\(address)"
+        case .ipv6(let address): return "\(address)"
+        case .name(let name, _): return name
+        @unknown default: return "\(host)"
+        }
     }
 
     func read() async throws -> Data? {

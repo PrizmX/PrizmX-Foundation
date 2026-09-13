@@ -15,6 +15,7 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
     public let endpoint: Endpoint
     public var clientAddress: String { flow.src.description }
     public var clientPort: UInt16 { flow.srcPort }
+    public var isTunnelInbound: Bool { true }
     let flow: FlowKey
     private let byteStream: any TCPByteStream
     private let lock = NSLock()

@@ -306,3 +306,24 @@ private final class LocalUDPDNS: @unchecked Sendable {
         try await client.resolveAll("node.test", role: .direct)
     }
 }
+
+@Test func physicalPTRNameForIPv4() {
+    #expect(PhysicalPTRLookup.ptrName(for: "192.168.1.50") == "50.1.168.192.in-addr.arpa")
+}
+
+@Test func dnsWireParsesPTRAnswer() {
+    let query = DNSWire.makeQuery(id: 0x1234, domain: "50.1.168.192.in-addr.arpa", type: DNSWire.typePTR)
+    var packet = query
+    packet[2] = 0x81
+    packet[3] = 0x80
+    packet[6] = 0x00
+    packet[7] = 0x01
+    packet.append(contentsOf: [0xC0, 0x0C])
+    packet.append(contentsOf: [0x00, 0x0C, 0x00, 0x01])
+    packet.append(contentsOf: [0x00, 0x00, 0x00, 0x3C])
+    let rdata = Data([6]) + Data("iPhone".utf8) + Data([5]) + Data("local".utf8) + Data([0])
+    packet.append(UInt8(rdata.count >> 8))
+    packet.append(UInt8(rdata.count & 0xFF))
+    packet.append(rdata)
+    #expect(DNSWire.ptrNames(in: packet, expectedID: 0x1234) == ["iPhone.local"])
+}

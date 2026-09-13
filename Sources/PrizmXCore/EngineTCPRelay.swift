@@ -11,6 +11,13 @@ public protocol InboundStream: Sendable {
     /// Client (app) address/port of the original socket, when known.
     var clientAddress: String { get }
     var clientPort: UInt16 { get }
+    /// True for Packet Tunnel flows (SwiftTCP). Their source address is the
+    /// tunnel interface, not a remote LAN client, so they keep process
+    /// attribution even though the address is not loopback.
+    var isTunnelInbound: Bool { get }
+    /// Mixed-port listen port. Process attribution looks up the socket to
+    /// this port, not the ultimate destination port.
+    var listenPort: UInt16? { get }
     func read() async throws -> Data?
     func write(_ data: Data) async throws
     func close() async
@@ -19,6 +26,8 @@ public protocol InboundStream: Sendable {
 extension InboundStream {
     public var clientAddress: String { "" }
     public var clientPort: UInt16 { 0 }
+    public var isTunnelInbound: Bool { false }
+    public var listenPort: UInt16? { nil }
 }
 
 /// Splices an inbound TCP stream through `Engine.dispatch`, recording traffic
@@ -29,13 +38,20 @@ public enum EngineTCPRelay: Sendable {
         let prepared = await Self.prepare(stream: stream)
         let inbound = prepared.stream
         let target = prepared.endpoint
-        let attribution = engine.flowAttributor?.attribute(
-            transport: .tcp,
-            localAddress: inbound.clientAddress,
-            localPort: inbound.clientPort,
-            remoteAddress: target.host.description,
-            remotePort: target.port
-        )
+        // Mixed-port LAN clients are remote sockets. libproc matching their
+        // ephemeral port against this Mac can pin the row on a random local app.
+        let attribution: FlowAttribution?
+        if inbound.isTunnelInbound || Self.isLoopbackClient(inbound.clientAddress) {
+            attribution = engine.flowAttributor?.attribute(
+                transport: .tcp,
+                localAddress: inbound.clientAddress,
+                localPort: inbound.clientPort,
+                remoteAddress: target.host.description,
+                remotePort: inbound.listenPort ?? target.port
+            )
+        } else {
+            attribution = nil
+        }
         let ipv4 = await engine.resolveIPv4(for: target)
         let outbound: any OutboundConnection
         let rule: String
@@ -54,6 +70,7 @@ public enum EngineTCPRelay: Sendable {
         let via = outbound.routingLabel
         let flowID = UUID()
         let startedAt = Date()
+        let sourceHost = inbound.clientAddress.isEmpty ? nil : inbound.clientAddress
         engine.traffic.flowDidBegin(
             FlowRecord(
                 id: flowID,
@@ -62,7 +79,8 @@ public enum EngineTCPRelay: Sendable {
                 via: via,
                 closed: false,
                 rule: rule,
-                attribution: attribution
+                attribution: attribution,
+                sourceHost: sourceHost
             )
         )
         TunnelLog.write(
@@ -124,13 +142,27 @@ public enum EngineTCPRelay: Sendable {
                 remoteEnd: snapshot.remote,
                 closed: true,
                 rule: rule,
-                attribution: attribution
+                attribution: attribution,
+                sourceHost: sourceHost
             )
         )
         TunnelLog.write(
             .debug,
             "flow closed \(target) via \(via) up=\(snapshot.up) down=\(snapshot.down) client=\(snapshot.client) remote=\(snapshot.remote) ms=\(ms)"
         )
+    }
+
+    static func isLoopbackClient(_ address: String) -> Bool {
+        if address.isEmpty { return true }
+        var host = address
+        if let percent = host.firstIndex(of: "%") {
+            host = String(host[..<percent])
+        }
+        let lowered = host.lowercased()
+        if lowered.hasPrefix("::ffff:") {
+            host = String(host.dropFirst(7))
+        }
+        return host == "127.0.0.1" || host.hasPrefix("127.") || lowered == "::1" || lowered == "localhost"
     }
 
     /// Peek at the first client bytes on IP destinations so DOMAIN / GEOSITE
@@ -202,6 +234,8 @@ private final class PrefixedInboundStream: InboundStream, @unchecked Sendable {
     let endpoint: Endpoint
     var clientAddress: String { inner.clientAddress }
     var clientPort: UInt16 { inner.clientPort }
+    var isTunnelInbound: Bool { inner.isTunnelInbound }
+    var listenPort: UInt16? { inner.listenPort }
     private let inner: any InboundStream
     private let leftover = OSAllocatedUnfairLock<Data>(initialState: Data())
 
