@@ -216,6 +216,8 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
     public var closed: Bool
     public var rule: String
     public var attribution: FlowAttribution?
+    /// Session number for Inspector (Surge-style ID). Optional so older snapshots decode.
+    public var serial: UInt64?
 
     public init(
         id: UUID = UUID(),
@@ -229,7 +231,8 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
         remoteEnd: String = "",
         closed: Bool = true,
         rule: String = "",
-        attribution: FlowAttribution? = nil
+        attribution: FlowAttribution? = nil,
+        serial: UInt64? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -243,6 +246,7 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
         self.closed = closed
         self.rule = rule
         self.attribution = attribution
+        self.serial = serial
     }
 }
 
@@ -271,6 +275,7 @@ public final class TrafficCounter: Sendable {
         var domainUDP: [String: UInt64] = [:]
         var policyTCP: [String: UInt64] = [:]
         var policyUDP: [String: UInt64] = [:]
+        var nextSerial: UInt64 = 0
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: State())
@@ -290,6 +295,11 @@ public final class TrafficCounter: Sendable {
     public func flowDidBegin(_ record: FlowRecord) {
         lock.withLock { state in
             state.active += 1
+            var record = record
+            if record.serial == nil {
+                state.nextSerial += 1
+                record.serial = state.nextSerial
+            }
             state.open[record.id] = record
         }
     }
@@ -358,9 +368,17 @@ public final class TrafficCounter: Sendable {
     public func flowDidClose(_ record: FlowRecord) {
         lock.withLock { state in
             state.active = max(0, state.active - 1)
+            let open = state.open[record.id]
             state.open[record.id] = nil
             var closed = record
             closed.closed = true
+            if closed.serial == nil {
+                closed.serial = open?.serial
+            }
+            if closed.serial == nil {
+                state.nextSerial += 1
+                closed.serial = state.nextSerial
+            }
             state.recent.append(closed)
             if state.recent.count > recentCap {
                 state.recent.removeFirst(state.recent.count - recentCap)

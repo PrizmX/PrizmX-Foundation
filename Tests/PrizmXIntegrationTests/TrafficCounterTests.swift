@@ -77,6 +77,7 @@ import PrizmXProtocols
     var snapshot = counter.snapshot()
     #expect(snapshot.activeFlows.count == 1)
     #expect(snapshot.activeFlows[0].uplinkBytes == 10)
+    #expect(snapshot.activeFlows[0].serial == 1)
     #expect(snapshot.activeConnections == 1)
     #expect(snapshot.tcpConnections == 1)
     #expect(snapshot.udpConnections == 0)
