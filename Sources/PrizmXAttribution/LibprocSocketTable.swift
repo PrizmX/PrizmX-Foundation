@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import PrizmXAttributionC
 import PrizmXCore
+import PrizmXProtocols
 
 struct SocketOwner: Sendable, Equatable {
     var pid: Int32
@@ -33,7 +34,15 @@ final class LibprocSocketTable: SocketTableReading, @unchecked Sendable {
         if !fromPCB.isEmpty {
             return fromPCB
         }
-        return decodeLocked(skipPID: skipPID, fill: prizmx_list_sockets)
+        let fromLibproc = decodeLocked(skipPID: skipPID, fill: prizmx_list_sockets)
+        if fromLibproc.isEmpty {
+            TunnelLog.writeOnce(
+                "attribution-socket-table-empty",
+                .warn,
+                "process attribution unavailable: pcblist_n and libproc both returned no sockets"
+            )
+        }
+        return fromLibproc
     }
 
     private func decodeLocked(

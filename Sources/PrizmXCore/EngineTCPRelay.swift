@@ -40,9 +40,12 @@ public enum EngineTCPRelay: Sendable {
         let target = prepared.endpoint
         // Mixed-port LAN clients are remote sockets. libproc matching their
         // ephemeral port against this Mac can pin the row on a random local app.
+        // Flow-open is the last chance to name the process: bypass cached
+        // negatives so a transient SYN-warm-up miss cannot stick for the
+        // whole lifetime of the flow.
         let attribution: FlowAttribution?
         if inbound.isTunnelInbound || Self.isLoopbackClient(inbound.clientAddress) {
-            attribution = engine.flowAttributor?.attribute(
+            attribution = engine.flowAttributor?.attributeFresh(
                 transport: .tcp,
                 localAddress: inbound.clientAddress,
                 localPort: inbound.clientPort,

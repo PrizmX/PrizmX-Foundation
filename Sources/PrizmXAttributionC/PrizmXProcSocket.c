@@ -56,12 +56,68 @@ static void copy_addr(uint8_t out[16], uint8_t *is_ipv6, const struct in_sockinf
 #define XSO_SOCKET  0x001u
 #define XSO_INPCB   0x010u
 
+/// Enumerate all pids: proc_listpids first, `kern.proc.all` when listpids is
+/// denied (App Sandbox blocks `process-info-listpids` but still allows the
+/// KERN_PROC sysctl). Caller frees the returned buffer.
+static int enum_all_pids(pid_t **out_pids, int *out_errno) {
+    int pid_bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (pid_bytes > 0) {
+        pid_t *pids = malloc((size_t)pid_bytes);
+        if (pids == NULL) {
+            *out_errno = ENOMEM;
+            return -1;
+        }
+        int got = proc_listpids(PROC_ALL_PIDS, 0, pids, pid_bytes);
+        if (got > 0) {
+            *out_pids = pids;
+            return got / (int)sizeof(pid_t);
+        }
+        free(pids);
+    }
+    if (out_errno != NULL) {
+        *out_errno = errno;
+    }
+
+    int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+    size_t len = 0;
+    if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0 || len == 0) {
+        return -1;
+    }
+    struct kinfo_proc *procs = malloc(len);
+    if (procs == NULL) {
+        *out_errno = ENOMEM;
+        return -1;
+    }
+    if (sysctl(mib, 3, procs, &len, NULL, 0) != 0) {
+        free(procs);
+        return -1;
+    }
+    int count = (int)(len / sizeof(struct kinfo_proc));
+    pid_t *pids = malloc((size_t)(count + 1) * sizeof(pid_t));
+    if (pids == NULL) {
+        free(procs);
+        *out_errno = ENOMEM;
+        return -1;
+    }
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        pid_t pid = procs[i].kp_proc.p_pid;
+        if (pid > 0) {
+            pids[n++] = pid;
+        }
+    }
+    free(procs);
+    *out_pids = pids;
+    return n;
+}
+
 static int fill_pcblist_n(
     const char *mib,
     uint8_t transport,
     prizmx_socket_row *out,
     int max_count,
-    pid_t skip_pid
+    pid_t skip_pid,
+    int *claimed_count
 ) {
     if (out == NULL || max_count <= 0) {
         return 0;
@@ -81,6 +137,12 @@ static int fill_pcblist_n(
     uint32_t hdr_len = *(uint32_t *)(void *)buf;
     if (hdr_len < 8 || hdr_len > len) {
         hdr_len = 24;
+    }
+    // xinpgen.xig_count: sockets the kernel claims to hold. On macOS 26/27 the
+    // records are filtered down to the caller's own sockets while the header
+    // still reports the system-wide count — callers compare the two.
+    if (claimed_count != NULL && hdr_len >= 8 && len >= 8) {
+        *claimed_count = (int)*(uint32_t *)(void *)(buf + 4);
     }
     char *p = buf + hdr_len;
     char *end = buf + len;
@@ -124,7 +186,16 @@ int prizmx_list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid)
         errno = EINVAL;
         return -EINVAL;
     }
-    int tcp = fill_pcblist_n("net.inet.tcp.pcblist_n", IPPROTO_TCP, out, max_count, skip_pid);
+    int claimed_tcp = 0;
+    int claimed_udp = 0;
+    int tcp = fill_pcblist_n(
+        "net.inet.tcp.pcblist_n",
+        IPPROTO_TCP,
+        out,
+        max_count,
+        skip_pid,
+        &claimed_tcp
+    );
     int udp = 0;
     if (tcp < max_count) {
         udp = fill_pcblist_n(
@@ -132,10 +203,18 @@ int prizmx_list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid)
             IPPROTO_UDP,
             out + tcp,
             max_count - tcp,
-            skip_pid
+            skip_pid,
+            &claimed_udp
         );
     }
-    return tcp + udp;
+    int written = tcp + udp;
+    int claimed = claimed_tcp + claimed_udp;
+    // Filtered table (only the caller's own sockets) looks non-empty but is
+    // useless for attribution — report failure so callers use libproc instead.
+    if (claimed >= 16 && written < claimed / 4) {
+        return 0;
+    }
+    return written;
 }
 
 pid_t prizmx_find_pid_pcblist_n(uint16_t local_port_host, int is_tcp) {
@@ -162,22 +241,14 @@ int prizmx_list_sockets(prizmx_socket_row *out, int max_count, pid_t skip_pid) {
         return -EINVAL;
     }
 
-    int pid_bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    if (pid_bytes <= 0) {
-        return pid_bytes == 0 ? 0 : -errno;
-    }
-
-    pid_t *pids = malloc((size_t)pid_bytes);
-    if (pids == NULL) {
-        return -ENOMEM;
-    }
-    int got = proc_listpids(PROC_ALL_PIDS, 0, pids, pid_bytes);
-    if (got <= 0) {
-        int err = got == 0 ? 0 : -errno;
+    int enum_errno = 0;
+    pid_t *pids = NULL;
+    int pid_count = enum_all_pids(&pids, &enum_errno);
+    if (pid_count <= 0 || pids == NULL) {
+        int err = pid_count == 0 ? 0 : -(enum_errno != 0 ? enum_errno : errno);
         free(pids);
         return err;
     }
-    int pid_count = got / (int)sizeof(pid_t);
     int written = 0;
 
     for (int i = 0; i < pid_count && written < max_count; i++) {
@@ -275,26 +346,14 @@ int prizmx_libproc_stats_fill(prizmx_libproc_stats *out, pid_t skip_pid) {
     }
     memset(out, 0, sizeof(*out));
 
-    int pid_bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    out->last_errno = errno;
-    out->listpids_bytes = pid_bytes;
-    if (pid_bytes <= 0) {
-        return pid_bytes <= 0 && errno != 0 ? -errno : 0;
-    }
-
-    pid_t *pids = malloc((size_t)pid_bytes);
-    if (pids == NULL) {
-        out->last_errno = ENOMEM;
-        return -ENOMEM;
-    }
-    int got = proc_listpids(PROC_ALL_PIDS, 0, pids, pid_bytes);
-    if (got <= 0) {
-        out->last_errno = errno;
-        out->listpids_bytes = got;
+    int enum_errno = 0;
+    pid_t *pids = NULL;
+    int pid_count = enum_all_pids(&pids, &enum_errno);
+    out->last_errno = enum_errno;
+    if (pid_count <= 0 || pids == NULL) {
         free(pids);
-        return got == 0 ? 0 : -errno;
+        return pid_count < 0 && enum_errno != 0 ? -enum_errno : 0;
     }
-    int pid_count = got / (int)sizeof(pid_t);
     out->pid_count = pid_count;
 
     for (int i = 0; i < pid_count; i++) {

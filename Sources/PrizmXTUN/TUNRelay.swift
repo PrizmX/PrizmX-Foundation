@@ -103,7 +103,7 @@ private actor UDPRelayState {
     }
 
     private func attribution(for key: UDPFlowKey, datagram: TUNUDPDatagram) -> FlowAttribution? {
-        engine.flowAttributor?.attribute(
+        engine.flowAttributor?.attributeFresh(
             transport: .udp,
             localAddress: key.client.description,
             localPort: key.clientPort,

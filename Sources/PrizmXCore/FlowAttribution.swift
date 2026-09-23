@@ -63,4 +63,24 @@ extension FlowAttributing {
         remoteAddress: String,
         remotePort: UInt16
     ) {}
+
+    /// Flow-open lookup. Default forwards to `attribute`; implementations
+    /// with a negative cache should retry cached misses with a fresh table
+    /// match so a transient warm-up miss cannot pin a flow to "unattributed"
+    /// for its whole lifetime.
+    public func attributeFresh(
+        transport: FlowTransport,
+        localAddress: String,
+        localPort: UInt16,
+        remoteAddress: String,
+        remotePort: UInt16
+    ) -> FlowAttribution? {
+        attribute(
+            transport: transport,
+            localAddress: localAddress,
+            localPort: localPort,
+            remoteAddress: remoteAddress,
+            remotePort: remotePort
+        )
+    }
 }

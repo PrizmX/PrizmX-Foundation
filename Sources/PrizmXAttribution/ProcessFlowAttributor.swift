@@ -98,6 +98,44 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
         remoteAddress: String,
         remotePort: UInt16
     ) -> FlowAttribution? {
+        lookup(
+            transport: transport,
+            localAddress: localAddress,
+            localPort: localPort,
+            remoteAddress: remoteAddress,
+            remotePort: remotePort,
+            allowCachedNegative: true
+        )
+    }
+
+    /// Flow-open lookup: cached negatives are ignored and retried against a
+    /// fresh socket table, so a transient warm-up miss cannot pin a flow to
+    /// "unattributed" for its whole lifetime.
+    public func attributeFresh(
+        transport: FlowTransport,
+        localAddress: String,
+        localPort: UInt16,
+        remoteAddress: String,
+        remotePort: UInt16
+    ) -> FlowAttribution? {
+        lookup(
+            transport: transport,
+            localAddress: localAddress,
+            localPort: localPort,
+            remoteAddress: remoteAddress,
+            remotePort: remotePort,
+            allowCachedNegative: false
+        )
+    }
+
+    private func lookup(
+        transport: FlowTransport,
+        localAddress: String,
+        localPort: UInt16,
+        remoteAddress: String,
+        remotePort: UInt16,
+        allowCachedNegative: Bool
+    ) -> FlowAttribution? {
         _ = localAddress
         guard localPort > 0 else { return nil }
         let key = Self.key(
@@ -120,7 +158,7 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
                 )
             }
             return hit
-        }) {
+        }), hit.attribution != nil || allowCachedNegative {
             return hit.attribution
         }
         // Slow path: find the owner under the lookup lock, then resolve the
@@ -269,7 +307,16 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
             }) {
                 return exact
             }
-            return candidates.first { $0.remotePort == remotePort }
+            if let byPort = candidates.first(where: { $0.remotePort == remotePort }) {
+                return byPort
+            }
+            // Unconnected UDP sockets (WebRTC / STUN / QUIC probes) record
+            // remotePort 0 in the socket table. When every candidate on this
+            // local port agrees on one PID the owner is still unambiguous.
+            if Set(candidates.map(\.pid)).count == 1 {
+                return candidates.first
+            }
+            return nil
         }
         return candidates.first { $0.remotePort == remotePort } ?? candidates.first
     }
