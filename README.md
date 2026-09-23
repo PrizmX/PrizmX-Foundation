@@ -18,6 +18,7 @@ SwiftTCP/
 | `PrizmXNodes` | Node catalog, policy groups, URL-test |
 | `PrizmXCore` | Engine, traffic counters, mixed-port |
 | `PrizmXConfig` | Clash YAML / sing-box → engine, tunnel IPC / kit files |
+| `PrizmXScripts` | JavaScriptCore runtime for Scripts |
 | `PrizmXTUN` | SwiftTCP userspace stack + FakeIP + relays |
 | `PrizmXAttribution` | macOS process attribution (`libproc`). Unused on iOS |
 

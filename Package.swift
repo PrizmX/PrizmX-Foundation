@@ -9,6 +9,7 @@
 //   * PrizmXNodes     — outbound node catalog, policy groups, connection factory
 //   * PrizmXCore      — engine that dispatches an endpoint through Router + Nodes
 //   * PrizmXConfig    — Clash YAML / sing-box JSON → Engine
+//   * PrizmXScripts   — JavaScriptCore runtime for Scripts ($done / console)
 //   * PrizmXTUN       — SwiftTCP userspace stack + FakeIP DNS + engine relay
 //   * PrizmXAttribution — macOS process attribution (libproc). iOS leaves this unused.
 
@@ -27,6 +28,7 @@ let package = Package(
         .library(name: "PrizmXNodes", targets: ["PrizmXNodes"]),
         .library(name: "PrizmXCore", targets: ["PrizmXCore"]),
         .library(name: "PrizmXConfig", targets: ["PrizmXConfig"]),
+        .library(name: "PrizmXScripts", targets: ["PrizmXScripts"]),
         .library(name: "PrizmXTUN", targets: ["PrizmXTUN"]),
         .library(name: "PrizmXAttribution", targets: ["PrizmXAttribution"]),
     ],
@@ -51,6 +53,7 @@ let package = Package(
             name: "PrizmXConfig",
             dependencies: ["PrizmXProtocols", "PrizmXRules", "PrizmXNodes", "PrizmXCore"]
         ),
+        .target(name: "PrizmXScripts"),
         .target(
             name: "PrizmXTUN",
             dependencies: [
@@ -67,7 +70,7 @@ let package = Package(
         ),
         .target(
             name: "PrizmXAttribution",
-            dependencies: ["PrizmXAttributionC", "PrizmXCore"]
+            dependencies: ["PrizmXAttributionC", "PrizmXCore", "PrizmXProtocols"]
         ),
         .testTarget(name: "PrizmXProtocolsTests", dependencies: ["PrizmXProtocols"]),
         .testTarget(name: "PrizmXRulesTests", dependencies: ["PrizmXRules"]),
@@ -84,6 +87,7 @@ let package = Package(
             name: "PrizmXAttributionTests",
             dependencies: ["PrizmXAttribution", "PrizmXCore"]
         ),
+        .testTarget(name: "PrizmXScriptsTests", dependencies: ["PrizmXScripts"]),
     ],
     swiftLanguageModes: [.v6]
 )
