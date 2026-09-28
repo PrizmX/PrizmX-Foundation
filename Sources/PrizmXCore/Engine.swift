@@ -109,6 +109,9 @@ public final class Engine: Sendable {
         case .ipv4(let address):
             return address
         case .domain(let domain):
+            if let address = SystemHosts.lookup(domain)?.ipv4.first {
+                return address
+            }
             guard router.needsIPResolution else { return nil }
             return try? await dns.resolve(domain, role: .direct)
         case .ipv6:
@@ -127,7 +130,33 @@ public final class Engine: Sendable {
         resolvedIPv4: IPv4Address? = nil,
         resolvedIPv6: IPv6Address? = nil
     ) throws -> (connection: any OutboundConnection, rule: String) {
-        let matched = matchTarget(target, resolvedIPv4: resolvedIPv4, resolvedIPv6: resolvedIPv6)
+        // Hosts-file hit: the mapping is a local binding. Dial it here even
+        // when the rule would proxy — a remote node cannot apply /etc/hosts,
+        // and `127.0.0.1` / LAN entries would otherwise never take effect
+        // once the system proxy is on. REJECT still wins (IP rules see the
+        // mapped address).
+        let hosts = hostsMapping(for: target)
+        let matched = matchTarget(
+            target,
+            resolvedIPv4: hosts?.ipv4.first ?? resolvedIPv4,
+            resolvedIPv6: hosts?.ipv6.first ?? resolvedIPv6
+        )
+        if let hosts {
+            if case .reject = matched.policy {
+                TunnelLog.write(.info, "reject \(target)")
+                throw EngineError.rejected(target)
+            }
+            let name = target.host.description
+            TunnelLog.writeOnce(
+                "hosts-\(name)",
+                .info,
+                "hosts \(name) → \(hosts.summary) direct"
+            )
+            return (
+                DirectOutboundConnection(endpoint: target, role: .direct),
+                "HOSTS,\(name),DIRECT"
+            )
+        }
         switch matched.policy {
         case .direct:
             return (DirectOutboundConnection(endpoint: target, role: .direct), matched.rule)
@@ -143,6 +172,13 @@ public final class Engine: Sendable {
                 throw error
             }
         }
+    }
+
+    /// Hosts-file hit for a domain destination. IP literals are already resolved.
+    private func hostsMapping(for endpoint: Endpoint) -> SystemHosts.Mapping? {
+        guard case .domain(let domain) = endpoint.host else { return nil }
+        guard let mapping = SystemHosts.lookup(domain), !mapping.isEmpty else { return nil }
+        return mapping
     }
 
     /// FakeDNS-time policy. REJECT → NODATA. DIRECT (including nested

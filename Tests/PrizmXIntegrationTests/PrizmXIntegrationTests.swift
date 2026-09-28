@@ -2,8 +2,8 @@ import Foundation
 import Testing
 import PrizmXCore
 import PrizmXNodes
-import PrizmXProtocols
 import PrizmXRules
+@testable import PrizmXProtocols
 
 private let testUUID = "b831381d-6324-4d53-ad4f-8cda3b4b0c7f"
 
@@ -71,6 +71,50 @@ private func makeEngine() throws -> Engine {
     let direct = try #require(connection as? DirectOutboundConnection)
     #expect(direct.endpoint == target)
     #expect(direct.state == .idle)
+}
+
+@Test func systemHostsBypassesProxyAndStillHonorsReject() async throws {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("prizmx-hosts-\(UUID().uuidString)")
+    try """
+    127.0.0.1 maps.google.com
+    10.9.8.7 tracker.ads.example
+    """.write(to: url, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let engine = try makeEngine()
+    try await SystemHosts.$pathOverride.withValue(url.path) {
+        let proxied = Endpoint(domain: "maps.google.com", port: 443)
+        let connection = try engine.dispatchDetailed(target: proxied)
+        let direct = try #require(connection.connection as? DirectOutboundConnection)
+        #expect(direct.endpoint == proxied)
+        #expect(connection.rule == "HOSTS,maps.google.com,DIRECT")
+
+        let blocked = Endpoint(domain: "tracker.ads.example", port: 443)
+        do {
+            _ = try engine.dispatch(target: blocked)
+            Issue.record("expected hosts-mapped reject")
+        } catch let error as EngineError {
+            #expect(error == .rejected(blocked))
+        }
+
+        let untouched = try engine.dispatch(target: Endpoint(domain: "google.com", port: 443))
+        #expect(untouched is FailoverGroupConnection)
+
+        let ipRouter = Router(
+            rules: [try RouteRule(type: .ipCIDR("10.9.8.7/32"), policy: .reject)],
+            default: .proxy(targetGroup: "US-Group")
+        )
+        let ipEngine = Engine(router: ipRouter, nodeManager: engine.nodeManager)
+        let mapped = Endpoint(domain: "tracker.ads.example", port: 80)
+        #expect(await ipEngine.resolveIPv4(for: mapped) == IPv4Address(10, 9, 8, 7))
+        do {
+            _ = try ipEngine.dispatch(target: mapped)
+            Issue.record("expected IP-CIDR reject via hosts address")
+        } catch let error as EngineError {
+            #expect(error == .rejected(mapped))
+        }
+    }
 }
 
 @Test func rejectPolicyThrows() async throws {

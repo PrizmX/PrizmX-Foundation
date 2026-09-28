@@ -416,6 +416,31 @@ public actor TUNStack {
             return
         }
         let name = query.question.name
+        // libc checks /etc/hosts before querying FakeDNS. A client that
+        // queries us directly still needs the real record — FakeIP would
+        // hide the hosts edit.
+        if let mapping = SystemHosts.lookup(name), !mapping.isEmpty {
+            if await policyFor(name) == .reject {
+                writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
+                return
+            }
+            if isA, let address = mapping.ipv4.first {
+                writeDNSReply(
+                    DNSMessage.response(id: query.id, question: query.question, ipv4: address),
+                    to: query
+                )
+                return
+            }
+            if isAAAA, let address = mapping.ipv6.first {
+                writeDNSReply(
+                    DNSMessage.response(id: query.id, question: query.question, ipv6: address),
+                    to: query
+                )
+                return
+            }
+            writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
+            return
+        }
         if FakeIPFilter.matches(name, patterns: fakeIPFilter), let dns {
             if isAAAA, !ipv6Enabled {
                 writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)

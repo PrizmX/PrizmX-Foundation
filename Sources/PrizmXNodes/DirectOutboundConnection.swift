@@ -118,9 +118,12 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
         parameters.preferNoProxies = true
 
         // All A records become dial candidates; a failed attempt poisons that
-        // IP and the next candidate is tried immediately.
+        // IP and the next candidate is tried immediately. A hosts-file hit is
+        // dialed as written and does not fall through to upstream DNS.
         var candidates: [(host: NWEndpoint.Host, address: PrizmXProtocols.IPv4Address?)]
-        if case .domain = endpoint.host {
+        if case .domain(let domain) = endpoint.host, let mapped = SystemHosts.lookup(domain) {
+            candidates = mapped.addresses.prefix(8).map { (NWEndpoint.Host($0.description), nil) }
+        } else if case .domain = endpoint.host {
             guard DNSClient.current != nil else { throw DNSError.notConfigured }
             let addresses = try await DNSClient.resolveAll(endpoint.host, role: role)
             candidates = addresses.prefix(3).map { (NWEndpoint.Host($0.description), $0) }

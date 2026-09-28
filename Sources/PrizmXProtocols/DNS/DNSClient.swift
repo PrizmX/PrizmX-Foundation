@@ -104,10 +104,18 @@ public final class DNSClient: Sendable {
     /// All A records for `domain` on the given plane, merged across the
     /// role's nameservers. Cached and single-flighted.
     ///
+    /// `/etc/hosts` wins over pins and upstream DNS: a system-proxy client
+    /// never asks libc, so this is the only place a hosts edit can land.
+    /// An IPv6-only hosts hit does not fall through to public A records.
+    ///
     /// Proven (`markGood`) addresses win over App-pinned ones, which win over
     /// a fresh lookup. If any preferred address exists, it is returned
     /// immediately — the union lookup must not block the first dial.
     public func resolveAll(_ domain: String, role: DNSRole) async throws -> [IPv4Address] {
+        if let mapped = SystemHosts.lookup(domain) {
+            if !mapped.ipv4.isEmpty { return mapped.ipv4 }
+            throw DNSError.noRecord(domain)
+        }
         let key = CacheKey(domain: domain.lowercased(), role: role)
         let preferred = preferredAddresses(key: key)
         if !preferred.isEmpty {
@@ -195,6 +203,10 @@ public final class DNSClient: Sendable {
     /// AAAA records for DIRECT FakeDNS when Clash `dns.ipv6` is on.
     /// Proxy names never call this — FakeIP is IPv4-only, AAAA is NODATA.
     public func resolveAAAA(_ domain: String, role: DNSRole) async throws -> [IPv6Address] {
+        if let mapped = SystemHosts.lookup(domain) {
+            if !mapped.ipv6.isEmpty { return mapped.ipv6 }
+            throw DNSError.noRecord(domain)
+        }
         let endpoints = settings.endpoints(for: role)
         guard !endpoints.isEmpty else { throw DNSError.noNameserver }
         var merged: [IPv6Address] = []
@@ -285,8 +297,8 @@ public final class DNSClient: Sendable {
     }
 
     /// Resolve a host for `NWConnection` (first candidate). IP literals pass
-    /// through; domains require `DNSClient.current` and never use the system
-    /// resolver.
+    /// through. Domains check `/etc/hosts` first, then `DNSClient.current`.
+    /// They never fall back to `getaddrinfo` (FakeDNS inside the tunnel).
     public static func resolve(_ host: Endpoint.Host, role: DNSRole) async throws -> NWEndpoint.Host {
         switch host {
         case .ipv4(let address):
@@ -294,6 +306,9 @@ public final class DNSClient: Sendable {
         case .ipv6(let address):
             return NWEndpoint.Host(address.description)
         case .domain(let domain):
+            if let mapped = SystemHosts.lookup(domain)?.addresses.first {
+                return NWEndpoint.Host(mapped.description)
+            }
             guard let client = DNSClient.current else { throw DNSError.notConfigured }
             let address = try await client.resolve(domain, role: role)
             TunnelLog.write(.debug, "dns \(role) \(domain) → \(address)")
@@ -302,9 +317,14 @@ public final class DNSClient: Sendable {
     }
 
     /// All candidates for a host. Empty for IP literals (the caller dials the
-    /// literal directly); domains produce ordered A records.
+    /// literal directly); domains produce ordered A records. Hosts-file
+    /// addresses are returned even when no `DNSClient` is bound.
     public static func resolveAll(_ host: Endpoint.Host, role: DNSRole) async throws -> [IPv4Address] {
         guard case .domain(let domain) = host else { return [] }
+        if let mapped = SystemHosts.lookup(domain) {
+            if !mapped.ipv4.isEmpty { return mapped.ipv4 }
+            throw DNSError.noRecord(domain)
+        }
         guard let client = DNSClient.current else { throw DNSError.notConfigured }
         let addresses = try await client.resolveAll(domain, role: role)
         TunnelLog.write(.debug, "dns \(role) \(domain) → \(addresses.map(\.description))")

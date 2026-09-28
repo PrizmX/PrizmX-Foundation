@@ -1,7 +1,7 @@
 import Foundation
 import Testing
+@testable import PrizmXProtocols
 @testable import PrizmXTUN
-import PrizmXProtocols
 import PrizmXRules
 
 @Suite(.serialized)
@@ -84,6 +84,32 @@ struct SwiftTCPStackTests {
         #expect(udp.payload[6] == 0 && udp.payload[7] == 1) // ANCOUNT 1
         #expect(udp.payload.suffix(4).starts(with: [198, 18]))
 
+        await stack.stop()
+    }
+
+    @Test func fakeDNSReturnsSystemHostsInsteadOfFakeIP() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("prizmx-hosts-\(UUID().uuidString)")
+        try "127.0.0.1 dev.example.test\n".write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        final class OutputBox: @unchecked Sendable {
+            var packets: [Data] = []
+        }
+        let box = OutputBox()
+        let pool = FakeIPAllocator()
+        let stack = TUNStack(fakeIP: pool, dnsPolicy: { _ in .proxy(targetGroup: "Proxy") }) { packets in
+            box.packets.append(contentsOf: packets)
+        }
+        await stack.start()
+        await SystemHosts.$pathOverride.withValue(url.path) {
+            await stack.input(packets: [dnsQueryPacket(name: "dev.example.test")])
+        }
+        #expect(pool.count == 0)
+        let parsed = try box.packets[0].withUnsafeBytes { try RawIPPacket($0) }
+        let udp = try #require(parsed.payload.flatMap { UDPDatagram.parse(ipPayload: $0) })
+        #expect(udp.payload[6] == 0 && udp.payload[7] == 1)
+        #expect(udp.payload.suffix(4) == Data([127, 0, 0, 1]))
         await stack.stop()
     }
 

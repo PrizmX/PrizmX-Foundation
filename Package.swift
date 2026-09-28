@@ -74,7 +74,7 @@ let package = Package(
         ),
         .testTarget(name: "PrizmXProtocolsTests", dependencies: ["PrizmXProtocols"]),
         .testTarget(name: "PrizmXRulesTests", dependencies: ["PrizmXRules"]),
-        .testTarget(name: "PrizmXTUNTests", dependencies: ["PrizmXTUN"]),
+        .testTarget(name: "PrizmXTUNTests", dependencies: ["PrizmXTUN", "PrizmXProtocols"]),
         .testTarget(
             name: "PrizmXIntegrationTests",
             dependencies: ["PrizmXCore", "PrizmXNodes", "PrizmXRules", "PrizmXProtocols"]
