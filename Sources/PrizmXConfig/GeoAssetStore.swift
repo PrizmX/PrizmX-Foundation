@@ -1,14 +1,24 @@
 import Foundation
 import PrizmXProtocols
+import PrizmXRules
 
 /// App Group copies of Clash/Mihomo `geoip.metadb` and `geosite.dat`.
 ///
 /// The Network Extension profile is capped at 512 KB, so the databases live
 /// as files (same pattern as the active config). `prepare` downloads them
-/// once when a profile actually uses `GEOIP` / `GEOSITE` rules.
+/// when a profile actually uses `GEOIP` / `GEOSITE` rules. Downloads are
+/// validated before they replace a file (a captive-portal page must never be
+/// persisted), and a valid file older than `refreshAge` is refreshed in the
+/// background without delaying the caller.
 public enum GeoAssetStore: Sendable {
     public static let geoIPRelativePath = "geo/geoip.metadb"
     public static let geositeRelativePath = "geo/geosite.dat"
+    public static let refreshAge: TimeInterval = 7 * 24 * 3_600
+
+    enum Kind: Sendable {
+        case geoIP
+        case geosite
+    }
 
     public struct Sources: Sendable {
         public var geoIP: [URL]
@@ -59,13 +69,13 @@ public enum GeoAssetStore: Sendable {
         var prepared = Prepared()
         if geoIP {
             let url = root.appendingPathComponent(geoIPRelativePath)
-            if await ensureFile(at: url, sources: sources.geoIP, fileManager: fileManager, session: session) {
+            if await ensureFile(at: url, kind: .geoIP, sources: sources.geoIP, session: session) {
                 prepared.geoIPPath = geoIPRelativePath
             }
         }
         if geosite {
             let url = root.appendingPathComponent(geositeRelativePath)
-            if await ensureFile(at: url, sources: sources.geosite, fileManager: fileManager, session: session) {
+            if await ensureFile(at: url, kind: .geosite, sources: sources.geosite, session: session) {
                 prepared.geositePath = geositeRelativePath
             }
         }
@@ -85,13 +95,31 @@ public enum GeoAssetStore: Sendable {
 
     private static func ensureFile(
         at url: URL,
+        kind: Kind,
         sources: [URL],
-        fileManager: FileManager,
         session: URLSession
     ) async -> Bool {
-        if isPresent(url, fileManager: fileManager) { return true }
+        if isValidFile(url, kind: kind) {
+            if !sources.isEmpty, isStale(url) {
+                Task.detached(priority: .utility) {
+                    _ = await download(to: url, kind: kind, sources: sources, session: session)
+                }
+            }
+            return true
+        }
+        return await download(to: url, kind: kind, sources: sources, session: session)
+    }
+
+    /// Tries each source; the first body that validates atomically replaces
+    /// `url`. On failure an existing file is left untouched.
+    static func download(
+        to url: URL,
+        kind: Kind,
+        sources: [URL],
+        session: URLSession
+    ) async -> Bool {
         guard !sources.isEmpty else { return false }
-        try? fileManager.createDirectory(
+        try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
@@ -101,13 +129,12 @@ public enum GeoAssetStore: Sendable {
                 if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                     continue
                 }
-                guard data.count > 1_024 else { continue }
-                let temporary = url.appendingPathExtension("tmp")
-                try data.write(to: temporary, options: .atomic)
-                if fileManager.fileExists(atPath: url.path) {
-                    try fileManager.removeItem(at: url)
+                guard isValid(data, kind: kind) else {
+                    TunnelLog.write(.error, "geo download \(source.absoluteString) rejected: invalid \(url.lastPathComponent)")
+                    continue
                 }
-                try fileManager.moveItem(at: temporary, to: url)
+                // `.atomic` writes a temporary file and renames it over `url`.
+                try data.write(to: url, options: .atomic)
                 TunnelLog.write(.info, "geo downloaded \(url.lastPathComponent) bytes=\(data.count)")
                 return true
             } catch {
@@ -117,14 +144,34 @@ public enum GeoAssetStore: Sendable {
                 )
             }
         }
-        return isPresent(url, fileManager: fileManager)
+        return false
     }
 
-    private static func isPresent(_ url: URL, fileManager: FileManager) -> Bool {
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
-              let size = values.fileSize else {
-            return false
+    static func isValidFile(_ url: URL, kind: Kind) -> Bool {
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return false }
+        return isValid(data, kind: kind)
+    }
+
+    static func isValid(_ data: Data, kind: Kind) -> Bool {
+        switch kind {
+        case .geoIP:
+            let marker = Data([0xAB, 0xCD, 0xEF] + Array("MaxMind.com".utf8))
+            guard data.range(of: marker, options: .backwards) != nil else { return false }
+            return (try? GeoIPMatcher(data: data)) != nil
+        case .geosite:
+            // `GeoSiteList` starts with field 1 (length-delimited); walking it
+            // with a tag filter that matches nothing checks the framing only.
+            guard data.first == 0x0A else { return false }
+            return (try? GeositeDatParser.parse(data: data, includeTags: ["\u{0}"])) != nil
         }
-        return size > 1_024
+    }
+
+    private static func isStale(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+              let modified = values.contentModificationDate
+        else {
+            return true
+        }
+        return Date().timeIntervalSince(modified) > refreshAge
     }
 }
