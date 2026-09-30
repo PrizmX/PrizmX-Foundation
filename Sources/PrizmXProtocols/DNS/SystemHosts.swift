@@ -5,9 +5,11 @@ import os
 ///
 /// With the system proxy on, apps send the hostname to the mixed port
 /// (HTTP CONNECT / SOCKS domain) and skip `getaddrinfo`, so a hosts-file
-/// edit is invisible. Mappings found here replace upstream DNS. They are
-/// dialed on this machine: a remote node cannot reach `127.0.0.1` or a LAN
-/// address the user wrote down. `REJECT` rules still win.
+/// edit is invisible. Mappings found here replace upstream DNS. Local
+/// bindings (loopback / LAN / link-local / unspecified) are dialed on this
+/// machine, since a remote node cannot reach them; public addresses follow
+/// the rule and are handed to the chosen outbound (as mihomo does).
+/// `REJECT` rules still win.
 public enum SystemHosts: Sendable {
     public static let defaultPath = "/etc/hosts"
     /// `/etc` is a symlink to `/private/etc`. App Sandbox allows the latter
@@ -27,6 +29,30 @@ public enum SystemHosts: Sendable {
 
         public var summary: String {
             addresses.map(\.description).joined(separator: ",")
+        }
+
+        /// True when any address only means something on this host or its
+        /// LAN (127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 0.0.0.0,
+        /// ::1, ::, fc00::/7, fe80::/10). A remote node would dial its own
+        /// network instead, so such mappings stay DIRECT.
+        public var isLocalBinding: Bool {
+            ipv4.contains(where: Self.isLocal) || ipv6.contains(where: Self.isLocal)
+        }
+
+        static func isLocal(_ address: IPv4Address) -> Bool {
+            let value = address.rawValue
+            return value >> 24 == 127
+                || value >> 24 == 10
+                || value >> 20 == 0xAC1
+                || value >> 16 == 0xC0A8
+                || value >> 16 == 0xA9FE
+                || value == 0
+        }
+
+        static func isLocal(_ address: IPv6Address) -> Bool {
+            if address.high == 0, address.low <= 1 { return true } // :: and ::1
+            let top = address.high >> 48
+            return top & 0xFE00 == 0xFC00 || top & 0xFFC0 == 0xFE80
         }
 
         public init(

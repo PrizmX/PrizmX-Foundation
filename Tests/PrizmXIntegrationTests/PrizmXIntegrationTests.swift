@@ -117,6 +117,64 @@ private func makeEngine() throws -> Engine {
     }
 }
 
+@Test func publicHostsMappingFollowsTheRuleAndProxiesTheMappedAddress() async throws {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("prizmx-hosts-\(UUID().uuidString)")
+    try """
+    140.82.112.4 www.google.com
+    93.184.215.14 example.org
+    192.168.1.20 nas.google.com
+    """.write(to: url, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let engine = try makeEngine()
+    try await SystemHosts.$pathOverride.withValue(url.path) {
+        // Public mapping + proxy rule: stays proxied, and the node is asked
+        // for the mapped address instead of the name (mihomo semantics).
+        let proxied = Endpoint(domain: "www.google.com", port: 443)
+        let viaProxy = try engine.dispatchDetailed(target: proxied)
+        let group = try #require(viaProxy.connection as? FailoverGroupConnection)
+        #expect(group.endpoint == Endpoint(host: .ipv4(IPv4Address(140, 82, 112, 4)), port: 443))
+        #expect(!viaProxy.rule.hasPrefix("HOSTS,"))
+        #expect(await engine.resolvePolicy(for: proxied) == .proxy(targetGroup: "US-Group"))
+
+        // Public mapping + DIRECT rule: direct, resolved through hosts.
+        let direct = Endpoint(domain: "example.org", port: 443)
+        let viaDirect = try engine.dispatchDetailed(target: direct)
+        #expect((viaDirect.connection as? DirectOutboundConnection)?.endpoint == direct)
+
+        // LAN mapping under a proxy rule: still dialed locally (TCP and UDP).
+        let lan = Endpoint(domain: "nas.google.com", port: 445)
+        let viaLAN = try engine.dispatchDetailed(target: lan)
+        #expect(viaLAN.connection is DirectOutboundConnection)
+        #expect(viaLAN.rule == "HOSTS,nas.google.com,DIRECT")
+        #expect(await engine.resolvePolicy(for: lan) == .direct)
+    }
+}
+
+@Test func hostsLocalBindingCoversLoopbackLANAndUnspecified() {
+    func v4(_ text: String) -> SystemHosts.Mapping {
+        let address = IPv4Address(parsing: text)!
+        return SystemHosts.Mapping(addresses: [.ipv4(address)], ipv4: [address])
+    }
+    func v6(_ text: String) -> SystemHosts.Mapping {
+        let address = IPv6Address(parsing: text)!
+        return SystemHosts.Mapping(addresses: [.ipv6(address)], ipv6: [address])
+    }
+    for local in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.254", "192.168.0.10", "169.254.1.1", "0.0.0.0"] {
+        #expect(v4(local).isLocalBinding, "\(local)")
+    }
+    for global in ["8.8.8.8", "172.32.0.1", "172.15.255.255", "192.169.0.1", "100.64.0.1", "140.82.112.4"] {
+        #expect(!v4(global).isLocalBinding, "\(global)")
+    }
+    for local in ["::1", "::", "fd00::1", "fc12::1", "fe80::1"] {
+        #expect(v6(local).isLocalBinding, "\(local)")
+    }
+    for global in ["2606:4700::1111", "2001:db8::1", "fec0::1"] {
+        #expect(!v6(global).isLocalBinding, "\(global)")
+    }
+}
+
 @Test func rejectPolicyThrows() async throws {
     let engine = try makeEngine()
     let target = Endpoint(domain: "tracker.ads.example", port: 443)

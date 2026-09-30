@@ -138,7 +138,9 @@ public final class Engine: Sendable {
     /// Effective policy with lazy resolution (see `resolveAndMatch`).
     public func resolvePolicy(for endpoint: Endpoint) async -> Policy {
         if let hosts = hostsMapping(for: endpoint) {
-            return policy(for: endpoint, resolvedIPv4: hosts.ipv4.first, resolvedIPv6: hosts.ipv6.first)
+            let policy = policy(for: endpoint, resolvedIPv4: hosts.ipv4.first, resolvedIPv6: hosts.ipv6.first)
+            if hosts.isLocalBinding, case .proxy = policy { return .direct }
+            return policy
         }
         return await resolveAndMatch(endpoint).policy
     }
@@ -182,26 +184,36 @@ public final class Engine: Sendable {
         matched: (policy: Policy, rule: String),
         hosts: SystemHosts.Mapping?
     ) throws -> (connection: any OutboundConnection, rule: String) {
-        // Hosts-file hit: the mapping is a local binding. Dial it here even
-        // when the rule would proxy — a remote node cannot apply /etc/hosts,
-        // and `127.0.0.1` / LAN entries would otherwise never take effect
-        // once the system proxy is on. REJECT still wins (IP rules see the
-        // mapped address).
+        // Hosts-file hit. IP rules already saw the mapped address, and
+        // REJECT still wins. A local binding (loopback / LAN / 0.0.0.0) is
+        // dialed here even when the rule would proxy: a remote node would
+        // reach its own network instead. A public mapping follows the rule;
+        // a proxy is asked for the mapped address rather than the name
+        // (mihomo does the same), and DIRECT dials it via the hosts lookup.
         if let hosts {
+            let name = target.host.description
             if case .reject = matched.policy {
                 TunnelLog.write(.info, "reject \(target)")
                 throw EngineError.rejected(target)
             }
-            let name = target.host.description
-            TunnelLog.writeOnce(
-                "hosts-\(name)",
-                .info,
-                "hosts \(name) → \(hosts.summary) direct"
-            )
-            return (
-                DirectOutboundConnection(endpoint: target, role: .direct),
-                "HOSTS,\(name),DIRECT"
-            )
+            if hosts.isLocalBinding {
+                TunnelLog.writeOnce("hosts-\(name)", .info, "hosts \(name) → \(hosts.summary) direct (local)")
+                return (
+                    DirectOutboundConnection(endpoint: target, role: .direct),
+                    "HOSTS,\(name),DIRECT"
+                )
+            }
+            if case .proxy(let group) = matched.policy, let address = hosts.addresses.first {
+                TunnelLog.writeOnce("hosts-\(name)", .info, "hosts \(name) → \(hosts.summary) via \(group)")
+                let mapped = Endpoint(host: address, port: target.port)
+                do {
+                    let connection = try nodeManager.connection(forGroup: group, target: mapped, command: command)
+                    return (connection, matched.rule)
+                } catch {
+                    TunnelLog.write(.error, "dispatch \(target) group=\(group) failed: \(error.localizedDescription)")
+                    throw error
+                }
+            }
         }
         switch matched.policy {
         case .direct:
