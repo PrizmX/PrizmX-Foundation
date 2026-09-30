@@ -22,6 +22,7 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
     private var buffer = Data()
     private var waiter: CheckedContinuation<Data?, Never>?
     private var closed = false
+    private var finSent = false
 
     init(endpoint: Endpoint, flow: FlowKey, byteStream: any TCPByteStream) {
         self.endpoint = endpoint
@@ -48,7 +49,25 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
         }
     }
 
+    /// Full close: ends local reads and sends FIN (once).
     public func close() async {
+        finish()
+        await sendFIN()
+    }
+
+    /// Half-close: FIN toward the app; its remaining upload is still read.
+    public var supportsHalfClose: Bool { true }
+
+    public func closeWrite() async {
+        await sendFIN()
+    }
+
+    private func sendFIN() async {
+        let first = lock.withLock {
+            defer { finSent = true }
+            return !finSent
+        }
+        guard first else { return }
         await byteStream.close(flow: flow)
     }
 
@@ -156,7 +175,8 @@ public actor TUNStack {
         let tcp = TCPStackConfig(
             loopCount: max(1, min(2, ProcessInfo.processInfo.activeProcessorCount)),
             receiveWindow: MemoryWatchdog.maxBufferPerSession,
-            maxConnections: MemoryWatchdog.maxTCPSessions
+            maxConnections: MemoryWatchdog.maxTCPSessions,
+            sendBufferLimit: MemoryWatchdog.sendBufferLimit
         )
         let config = SwiftStackConfig(
             tcp: tcp,
@@ -187,10 +207,24 @@ public actor TUNStack {
     }
 
     /// Async sequence of reassembled UDP datagrams (DNS :53 is intercepted earlier).
+    /// Bounded: when the relay falls behind, the oldest datagrams are dropped.
     public func udpDatagrams() -> AsyncStream<TUNUDPDatagram> {
-        let stream = AsyncStream.makeStream(of: TUNUDPDatagram.self)
+        let stream = AsyncStream.makeStream(
+            of: TUNUDPDatagram.self,
+            bufferingPolicy: .bufferingNewest(MemoryWatchdog.udpIngestBuffer)
+        )
         mailbox.setUDPContinuation(stream.continuation)
         return stream.stream
+    }
+
+    /// Flows whose SwiftTCP UDP session ended (expired / evicted / closed).
+    func setUDPSessionClosedHandler(_ handler: (@Sendable (FlowKey) -> Void)?) {
+        mailbox.setUDPClosedHandler(handler)
+    }
+
+    /// Drops SwiftTCP's UDP session for `flow` (relay evicted its side).
+    func closeUDPSession(flow: FlowKey) async {
+        await stack?.closeDatagramSession(flow: flow)
     }
 
     /// ICMP port-unreachable so QUIC / HTTP3 fails immediately (TCP fallback).

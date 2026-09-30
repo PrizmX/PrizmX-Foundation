@@ -11,12 +11,20 @@ import SwiftTCP
 private typealias IPv4Address = PrizmXProtocols.IPv4Address
 
 /// Consumes `TUNStack.udpDatagrams()` and forwards DIRECT / SS-UDP / VLESS-UDP.
+///
+/// The ingest loop never waits on the network: each flow gets its own worker
+/// with a small bounded inbox, and policy lookup / DNS / outbound `open()` /
+/// sends run there. A slow or dead destination only delays its own flow.
 public enum TUNUDPRelay: Sendable {
     public static func run(stack: TUNStack, engine: Engine) async {
         let state = UDPRelayState(stack: stack, engine: engine)
+        await stack.setUDPSessionClosedHandler { flow in
+            Task { await state.stackClosed(flow) }
+        }
         for await datagram in await stack.udpDatagrams() {
             await state.ingest(datagram)
         }
+        await stack.setUDPSessionClosedHandler(nil)
         await state.stop()
     }
 }
@@ -24,15 +32,36 @@ public enum TUNUDPRelay: Sendable {
 private actor UDPRelayState {
     private let stack: TUNStack
     private let engine: Engine
-    private var sessions: [UDPFlowKey: any UDPSession] = [:]
-    private var tasks: [UDPFlowKey: Task<Void, Never>] = [:]
+    private var slots: [UDPFlowKey: FlowSlot] = [:]
+    private var keysByFlow: [FlowKey: UDPFlowKey] = [:]
+
+    /// One relayed UDP flow: inbox feeding its worker, plus the session once
+    /// the worker has opened it.
+    private final class FlowSlot: @unchecked Sendable {
+        let id = UUID()
+        let flow: FlowKey
+        let inbox: AsyncStream<TUNUDPDatagram>.Continuation
+        let activity = ActivityStamp()
+        var worker: Task<Void, Never>?
+        var session: (any UDPSession)?
+
+        /// Latest uplink (ingest) or downlink (session) activity.
+        var lastSeen: ContinuousClock.Instant {
+            max(activity.value, session?.lastActivity ?? activity.value)
+        }
+
+        init(flow: FlowKey, inbox: AsyncStream<TUNUDPDatagram>.Continuation) {
+            self.flow = flow
+            self.inbox = inbox
+        }
+    }
 
     init(stack: TUNStack, engine: Engine) {
         self.stack = stack
         self.engine = engine
     }
 
-    func ingest(_ datagram: TUNUDPDatagram) async {
+    func ingest(_ datagram: TUNUDPDatagram) {
         guard case .ipv4(let clientIP) = datagram.source.host else { return }
         // Keyed by the full 4-tuple (destination host included): FakeIP gives
         // each domain its own address, so this uniquely identifies the target
@@ -43,66 +72,143 @@ private actor UDPRelayState {
             destinationHost: datagram.destination.host.description,
             destinationPort: datagram.destination.port
         )
-        if sessions[key] == nil {
-            if sessions.count >= MemoryWatchdog.maxUDPSessions {
-                // Evict the least-recently-active session instead of dropping
-                // all new UDP traffic until tunnel restart.
-                guard let victim = sessions.min(by: { $0.value.lastActivity < $1.value.lastActivity })?.key,
-                      let evicted = sessions.removeValue(forKey: victim)
-                else { return }
-                tasks.removeValue(forKey: victim)?.cancel()
-                engine.traffic.udpDidClose()
-                await evicted.close()
-            }
-            let ipv4 = await engine.resolveIPv4(for: datagram.destination)
-            switch engine.policy(for: datagram.destination, resolvedIPv4: ipv4) {
-            case .reject:
-                await dropUDP(datagram, onceKey: "udp-reject", reason: "UDP dropped: reject")
-            case .direct:
-                await openDirect(key: key, datagram: datagram)
-            case .proxy(let group):
-                await openProxy(key: key, datagram: datagram, group: group)
+        if let slot = slots[key] {
+            slot.activity.touch()
+            slot.inbox.yield(datagram)
+            return
+        }
+        if slots.count >= MemoryWatchdog.maxUDPSessions {
+            // Evict the least-recently-active flow instead of dropping all
+            // new UDP traffic; SwiftTCP drops its side too.
+            if let victim = slots.min(by: { $0.value.lastSeen < $1.value.lastSeen }) {
+                let flow = victim.value.flow
+                finish(victim.key, id: victim.value.id)
+                let stack = self.stack
+                Task { await stack.closeUDPSession(flow: flow) }
             }
         }
-        guard let session = sessions[key] else { return }
-        await session.send(datagram.payload, destination: datagram.destination)
-        let domain: String?
-        if case .domain(let name) = datagram.destination.host {
-            domain = name
-        } else {
-            domain = nil
-        }
-        engine.traffic.addBytes(
-            up: UInt64(datagram.payload.count),
-            down: 0,
-            via: session.via,
-            app: session.attribution,
-            transport: .udp,
-            domain: domain
+        let (stream, inbox) = AsyncStream.makeStream(
+            of: TUNUDPDatagram.self,
+            bufferingPolicy: .bufferingNewest(MemoryWatchdog.udpSessionBuffer)
         )
-    }
-
-    /// Called when a session's pump loop exits (peer closed / cancelled):
-    /// drop the entry so a later datagram opens a fresh session and the
-    /// session table cannot fill up with dead entries.
-    private func finishSession(_ key: UDPFlowKey) {
-        guard sessions.removeValue(forKey: key) != nil else { return }
-        tasks.removeValue(forKey: key)
-        engine.traffic.udpDidClose()
-    }
-
-    /// Registers `session` and starts its pump; the pump's exit removes the
-    /// session from the table.
-    private func track(_ key: UDPFlowKey, session: any UDPSession) {
-        sessions[key] = session
-        engine.traffic.udpDidOpen()
-        tasks[key] = Task { [weak self] in
-            await session.pump()
-            await self?.finishSession(key)
+        let slot = FlowSlot(flow: datagram.flow, inbox: inbox)
+        slots[key] = slot
+        keysByFlow[datagram.flow] = key
+        inbox.yield(datagram)
+        let stack = self.stack
+        let engine = self.engine
+        slot.worker = Task {
+            await Self.work(
+                state: self, key: key, id: slot.id, first: datagram,
+                inbox: stream, stack: stack, engine: engine
+            )
         }
     }
 
-    private func attribution(for key: UDPFlowKey, datagram: TUNUDPDatagram) -> FlowAttribution? {
+    /// Per-flow worker: open the session, then send queued datagrams in
+    /// order until the inbox is finished (evicted / closed / peer gone).
+    private static func work(
+        state: UDPRelayState,
+        key: UDPFlowKey,
+        id: UUID,
+        first: TUNUDPDatagram,
+        inbox: AsyncStream<TUNUDPDatagram>,
+        stack: TUNStack,
+        engine: Engine
+    ) async {
+        let opener = UDPSessionOpener(stack: stack, engine: engine, key: key, datagram: first)
+        guard let session = await opener.open() else {
+            await state.finish(key, id: id)
+            return
+        }
+        guard await state.attach(session, key: key, id: id) else {
+            await session.close()
+            return
+        }
+        let pump = Task {
+            await session.pump()
+            await state.finish(key, id: id)
+        }
+        for await datagram in inbox {
+            await session.send(datagram.payload, destination: datagram.destination)
+            let domain: String?
+            if case .domain(let name) = datagram.destination.host {
+                domain = name
+            } else {
+                domain = nil
+            }
+            engine.traffic.addBytes(
+                up: UInt64(datagram.payload.count),
+                down: 0,
+                via: session.via,
+                app: session.attribution,
+                transport: .udp,
+                domain: domain
+            )
+        }
+        pump.cancel()
+        await session.close()
+    }
+
+    private func attach(_ session: any UDPSession, key: UDPFlowKey, id: UUID) -> Bool {
+        guard let slot = slots[key], slot.id == id else { return false }
+        slot.session = session
+        engine.traffic.udpDidOpen()
+        return true
+    }
+
+    /// Removes the flow; its worker drains out and closes the session.
+    private func finish(_ key: UDPFlowKey, id: UUID) {
+        guard let slot = slots[key], slot.id == id else { return }
+        slots.removeValue(forKey: key)
+        if keysByFlow[slot.flow] == key { keysByFlow.removeValue(forKey: slot.flow) }
+        slot.inbox.finish()
+        if slot.session != nil {
+            engine.traffic.udpDidClose()
+        }
+    }
+
+    /// SwiftTCP dropped the session (idle expiry, its own LRU, shutdown).
+    func stackClosed(_ flow: FlowKey) {
+        guard let key = keysByFlow[flow], let slot = slots[key] else { return }
+        finish(key, id: slot.id)
+    }
+
+    func stop() async {
+        let all = slots
+        slots.removeAll()
+        keysByFlow.removeAll()
+        for slot in all.values {
+            slot.inbox.finish()
+            slot.worker?.cancel()
+            if let session = slot.session {
+                await session.close()
+                engine.traffic.udpDidClose()
+            }
+        }
+    }
+}
+
+/// Policy + outbound setup for one new UDP flow (runs on the flow's worker).
+private struct UDPSessionOpener: Sendable {
+    let stack: TUNStack
+    let engine: Engine
+    let key: UDPFlowKey
+    let datagram: TUNUDPDatagram
+
+    func open() async -> (any UDPSession)? {
+        switch await engine.resolvePolicy(for: datagram.destination) {
+        case .reject:
+            await dropUDP(onceKey: "udp-reject", reason: "UDP dropped: reject")
+            return nil
+        case .direct:
+            return await openDirect()
+        case .proxy(let group):
+            return await openProxy(group: group)
+        }
+    }
+
+    private func attribution() -> FlowAttribution? {
         engine.flowAttributor?.attributeFresh(
             transport: .udp,
             localAddress: key.client.description,
@@ -112,42 +218,32 @@ private actor UDPRelayState {
         )
     }
 
-    func stop() async {
-        for task in tasks.values { task.cancel() }
-        tasks.removeAll()
-        let leftover = sessions.count
-        for session in sessions.values {
-            await session.close()
-        }
-        sessions.removeAll()
-        for _ in 0..<leftover {
-            engine.traffic.udpDidClose()
-        }
-    }
-
-    private func dropUDP(_ datagram: TUNUDPDatagram, onceKey: String, reason: String) async {
+    private func dropUDP(onceKey: String, reason: String) async {
         TunnelLog.writeOnce(onceKey, .warn, reason)
-        guard case .ipv4(let client) = datagram.source.host,
-              case .ipv4(let destination) = datagram.destination.host else { return }
+        // Use the wire addresses: a FakeIP destination is already rewritten
+        // to its domain, and without the ICMP the app never falls back
+        // (e.g. QUIC → TCP).
+        guard case .v4(let client) = datagram.flow.src.kind,
+              case .v4(let destination) = datagram.flow.dst.kind else { return }
         await stack.sendICMPPortUnreachable(
-            client: client,
-            destination: destination,
-            sourcePort: datagram.source.port,
-            destinationPort: datagram.destination.port
+            client: IPv4Address(rawValue: client),
+            destination: IPv4Address(rawValue: destination),
+            sourcePort: datagram.flow.srcPort,
+            destinationPort: datagram.flow.dstPort
         )
     }
 
-    private func openDirect(key: UDPFlowKey, datagram: TUNUDPDatagram) async {
+    private func openDirect() async -> (any UDPSession)? {
         let parameters = NWParameters.udp
         parameters.preferNoProxies = true
-        guard let port = NWEndpoint.Port(rawValue: datagram.destination.port) else { return }
+        guard let port = NWEndpoint.Port(rawValue: datagram.destination.port) else { return nil }
         let host: NWEndpoint.Host
         do {
             host = try await DNSClient.$current.withValue(engine.dns) {
                 try await DNSClient.resolve(datagram.destination.host, role: .direct)
             }
         } catch {
-            return
+            return nil
         }
         let connection = NWConnection(
             host: host,
@@ -155,43 +251,36 @@ private actor UDPRelayState {
             using: parameters
         )
         connection.start(queue: DispatchQueue.global(qos: .userInitiated))
-        let session = DirectUDPSession(
+        return DirectUDPSession(
             connection: connection,
             flow: datagram.flow,
             stack: stack,
             traffic: engine.traffic,
-            attribution: attribution(for: key, datagram: datagram)
+            attribution: attribution()
         )
-        track(key, session: session)
     }
 
-    private func openProxy(
-        key: UDPFlowKey,
-        datagram: TUNUDPDatagram,
-        group: String
-    ) async {
+    private func openProxy(group: String) async -> (any UDPSession)? {
         let leaf = engine.nodeManager.selectedLeaf(inGroup: group)
         switch leaf {
         case .direct:
-            await openDirect(key: key, datagram: datagram)
-            return
+            return await openDirect()
         case .reject:
-            await dropUDP(datagram, onceKey: "udp-reject-\(group)", reason: "UDP dropped: reject")
-            return
+            await dropUDP(onceKey: "udp-reject-\(group)", reason: "UDP dropped: reject")
+            return nil
         case nil:
             await dropUDP(
-                datagram,
                 onceKey: "udp-no-node-\(group)",
                 reason: "UDP dropped: no selected node in group \(group)"
             )
-            return
+            return nil
         case .node:
             break
         }
-        guard case .node(let node) = leaf else { return }
+        guard case .node(let node) = leaf else { return nil }
         switch node.protocolConfig {
         case .direct:
-            await openDirect(key: key, datagram: datagram)
+            return await openDirect()
         case .vless:
             do {
                 // Use the leaf picked above; dispatching through the group
@@ -201,37 +290,37 @@ private actor UDPRelayState {
                     to: datagram.destination,
                     command: .udp
                 )
-                try await outbound.open()
-                let session = StreamUDPSession(
+                try await DNSClient.$current.withValue(engine.dns) {
+                    try await outbound.open()
+                }
+                return StreamUDPSession(
                     outbound: outbound,
                     via: group,
                     flow: datagram.flow,
                     stack: stack,
                     traffic: engine.traffic,
-                    attribution: attribution(for: key, datagram: datagram)
+                    attribution: attribution()
                 )
-                track(key, session: session)
             } catch {
-                return
+                return nil
             }
         case .trojan, .anytls:
             await dropUDP(
-                datagram,
                 onceKey: "udp-proxy-unsupported",
                 reason: "UDP dropped: proxy protocol does not support UDP relay (trojan/anytls)"
             )
-            return
+            return nil
         case .shadowsocks(let server, let password, let cipher):
             let parameters = NWParameters.udp
             parameters.preferNoProxies = true
-            guard let port = NWEndpoint.Port(rawValue: server.port) else { return }
+            guard let port = NWEndpoint.Port(rawValue: server.port) else { return nil }
             let host: NWEndpoint.Host
             do {
                 host = try await DNSClient.$current.withValue(engine.dns) {
                     try await DNSClient.resolve(server.host, role: .proxyServer)
                 }
             } catch {
-                return
+                return nil
             }
             let connection = NWConnection(
                 host: host,
@@ -239,7 +328,7 @@ private actor UDPRelayState {
                 using: parameters
             )
             connection.start(queue: DispatchQueue.global(qos: .userInitiated))
-            let session = ShadowsocksUDPSession(
+            return ShadowsocksUDPSession(
                 connection: connection,
                 preSharedKey: cipher.masterKey(fromPassword: password),
                 cipher: cipher,
@@ -247,9 +336,8 @@ private actor UDPRelayState {
                 flow: datagram.flow,
                 stack: stack,
                 traffic: engine.traffic,
-                attribution: attribution(for: key, datagram: datagram)
+                attribution: attribution()
             )
-            track(key, session: session)
         }
     }
 }

@@ -18,6 +18,7 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
     private var tcpStreams: [FlowKey: TUNTCPStream] = [:]
     private var tcpContinuation: AsyncStream<TUNTCPStream>.Continuation?
     private var udpContinuation: AsyncStream<TUNUDPDatagram>.Continuation?
+    private var udpClosedHandler: (@Sendable (FlowKey) -> Void)?
 
     init(fakeIP: FakeIPAllocator?, onOutput: @escaping @Sendable ([Data]) -> Void) {
         self.fakeIP = fakeIP
@@ -39,6 +40,14 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
     func setUDPContinuation(_ continuation: AsyncStream<TUNUDPDatagram>.Continuation?) {
         lock.lock()
         udpContinuation = continuation
+        lock.unlock()
+    }
+
+    /// Told when SwiftTCP drops a UDP session (expiry, LRU eviction, …) so
+    /// the relay releases its outbound for that flow.
+    func setUDPClosedHandler(_ handler: (@Sendable (FlowKey) -> Void)?) {
+        lock.lock()
+        udpClosedHandler = handler
         lock.unlock()
     }
 
@@ -90,6 +99,7 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
         tcpStreams[flow] = stream
         let continuation = tcpContinuation
         lock.unlock()
+        Self.pin(flow: flow, fakeIP: fakeIP, by: 1)
         deliverQueue.async {
             continuation?.yield(stream)
         }
@@ -105,13 +115,50 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
         }
     }
 
+    /// Client FIN: the stream's reads end after the buffered bytes; writes
+    /// (the downlink) continue until the relay closes the flow.
+    func onPeerFinished(flow: FlowKey) {
+        lock.lock()
+        let stream = tcpStreams[flow]
+        lock.unlock()
+        guard let stream else { return }
+        deliverQueue.async {
+            stream.finish()
+        }
+    }
+
+    /// TCP only: SwiftTCP routes UDP closes to `onUDPSessionClosed`.
     func onClosed(flow: FlowKey) {
         lock.lock()
         let stream = tcpStreams.removeValue(forKey: flow)
         lock.unlock()
         guard let stream else { return }
+        Self.pin(flow: flow, fakeIP: fakeIP, by: -1)
         deliverQueue.async {
             stream.finish()
+        }
+    }
+
+    /// A UDP session left SwiftTCP's table. Never touches a TCP flow that
+    /// shares the 4-tuple.
+    func onUDPSessionClosed(flow: FlowKey, reason: UDPSessionCloseReason) {
+        lock.lock()
+        let handler = udpClosedHandler
+        lock.unlock()
+        handler?(flow)
+    }
+
+    /// Live TCP flows pin their FakeIP so LRU recycling skips it.
+    private static func pin(flow: FlowKey, fakeIP: FakeIPAllocator?, by delta: Int) {
+        guard let fakeIP else { return }
+        switch flow.dst.kind {
+        case .v4(let raw):
+            let address = IPv4Address(rawValue: raw)
+            guard fakeIP.contains(address) else { return }
+            if delta > 0 { fakeIP.retain(address) } else { fakeIP.release(address) }
+        case .v6(let high, let low):
+            let address = IPv6Address(high: high, low: low)
+            if delta > 0 { fakeIP.retain(address) } else { fakeIP.release(address) }
         }
     }
 
