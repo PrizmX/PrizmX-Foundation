@@ -25,18 +25,35 @@ public final class MixedPortServer: @unchecked Sendable {
     private let port: UInt16
     private let allowLAN: Bool
     private let accept: Accept
+    private let access: MixedPortAccess
     private let listenerBox = OSAllocatedUnfairLock<NWListener?>(initialState: nil)
+    /// Whole handshake (greeting, auth, request head) must finish in time.
+    static let handshakeTimeout: Duration = .seconds(10)
 
+    /// - Parameters:
+    ///   - authentication: Clash `authentication` (`["user:pass", …]`). `nil`
+    ///     or empty disables auth.
+    ///   - skipAuthPrefixes: Clash `skip-auth-prefixes`; `nil` = loopback.
+    ///   - lanAllowedIPs: sources accepted when `allowLAN` is on (mihomo
+    ///     `lan-allowed-ips`); `nil` = loopback + private / link-local ranges.
     public init(
         engine: Engine,
         port: UInt16 = defaultPort,
         allowLAN: Bool = false,
-        accept: Accept = .mixed
+        accept: Accept = .mixed,
+        authentication: [String]? = nil,
+        skipAuthPrefixes: [String]? = nil,
+        lanAllowedIPs: [String]? = nil
     ) {
         self.engine = engine
         self.port = port
         self.allowLAN = allowLAN
         self.accept = accept
+        self.access = MixedPortAccess(
+            authentication: authentication,
+            skipAuthPrefixes: skipAuthPrefixes,
+            lanAllowedIPs: lanAllowedIPs
+        )
     }
 
     public func start() async throws {
@@ -58,8 +75,14 @@ public final class MixedPortServer: @unchecked Sendable {
                 connection.cancel()
                 return
             }
+            let client = Self.clientAddress(of: connection)
+            if self.allowLAN, !self.access.acceptsSource(client) {
+                TunnelLog.writeOnce("mixed-lan-refused-\(client)", .warn, "\(self.accept.logName) refused LAN client \(client)")
+                connection.cancel()
+                return
+            }
             connection.start(queue: .global(qos: .userInitiated))
-            Task { await self.handle(connection, listenPort: self.port) }
+            Task { await self.handle(connection, client: client, listenPort: self.port) }
         }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let settled = OSAllocatedUnfairLock(initialState: false)
@@ -97,99 +120,175 @@ public final class MixedPortServer: @unchecked Sendable {
         listener?.cancel()
     }
 
-    private func handle(_ connection: NWConnection, listenPort: UInt16) async {
-        var buffer = Data()
-        do {
-            while buffer.isEmpty {
-                guard let chunk = try await receive(connection) else {
-                    connection.cancel()
-                    return
-                }
-                buffer.append(chunk)
-            }
-            switch MixedPortParser.kind(firstByte: buffer[0]) {
-            case .socks5:
-                guard accept != .http else {
-                    connection.cancel()
-                    return
-                }
-                try await handleSOCKS(connection, listenPort: listenPort, buffer: &buffer)
-            case .http:
-                guard accept != .socks else {
-                    connection.cancel()
-                    return
-                }
-                try await handleHTTP(connection, listenPort: listenPort, buffer: &buffer)
-            }
-        } catch {
-            connection.cancel()
+    static func clientAddress(of connection: NWConnection) -> String {
+        if case .hostPort(let host, _) = connection.endpoint {
+            return NWInboundStream.hostString(host)
         }
+        return ""
     }
 
-    private func handleHTTP(
-        _ connection: NWConnection,
-        listenPort: UInt16,
-        buffer: inout Data
-    ) async throws {
-        var parsed: MixedPortParser.HTTPRequest
-        var leftover: Data
-        while true {
-            do {
-                (parsed, leftover) = try MixedPortParser.parseHTTP(buffer)
-                break
-            } catch MixedPortParser.ParseError.needMore {
-                guard let chunk = try await receive(connection) else { return }
-                buffer.append(chunk)
-            }
+    private func handle(_ connection: NWConnection, client: String, listenPort: UInt16) async {
+        // Handshake phase is bounded; cancelling the connection fails any
+        // pending receive, which unwinds the handshake.
+        let timer = Task {
+            try await Task.sleep(for: Self.handshakeTimeout)
+            connection.cancel()
         }
-        if parsed.command == .connect {
-            try await send(connection, MixedPortParser.connectEstablished)
+        let stream: (any InboundStream)?
+        do {
+            stream = try await handshake(connection, client: client, listenPort: listenPort)
+        } catch {
+            stream = nil
         }
-        let endpoint = MixedPortParser.endpoint(host: parsed.host, port: parsed.port)
-        let stream = NWInboundStream(
-            endpoint: endpoint,
-            connection: connection,
-            listenPort: listenPort,
-            leftover: parsed.command == .connect ? leftover : parsed.preface
-        )
+        timer.cancel()
+        guard let stream else {
+            connection.cancel()
+            return
+        }
         await EngineTCPRelay.pipe(stream: stream, engine: engine)
     }
 
-    private func handleSOCKS(
+    private func handshake(
         _ connection: NWConnection,
+        client: String,
+        listenPort: UInt16
+    ) async throws -> (any InboundStream)? {
+        var buffer = Data()
+        while buffer.isEmpty {
+            guard let chunk = try await receive(connection) else { return nil }
+            buffer.append(chunk)
+        }
+        switch MixedPortParser.kind(firstByte: buffer[buffer.startIndex]) {
+        case .socks5:
+            guard accept != .http else { return nil }
+            return try await handshakeSOCKS(connection, client: client, listenPort: listenPort, buffer: &buffer)
+        case .http:
+            guard accept != .socks else { return nil }
+            return try await handshakeHTTP(connection, client: client, listenPort: listenPort, buffer: &buffer)
+        }
+    }
+
+    /// Remote clients may not target this host's loopback services.
+    private func refusesTarget(_ host: String, client: String) -> Bool {
+        guard !MixedPortAccess.isLoopbackSource(client), MixedPortAccess.isLoopbackTarget(host: host) else {
+            return false
+        }
+        TunnelLog.writeOnce("mixed-loopback-\(client)", .warn, "\(accept.logName) refused \(client) → loopback \(host)")
+        return true
+    }
+
+    private func handshakeHTTP(
+        _ connection: NWConnection,
+        client: String,
         listenPort: UInt16,
         buffer: inout Data
-    ) async throws {
+    ) async throws -> (any InboundStream)? {
+        var scanned = 0
         while true {
-            do {
-                let consumed = try MixedPortParser.parseSOCKSGreeting(buffer)
-                buffer = Data(buffer.dropFirst(consumed))
+            if let end = MixedPortParser.headerEnd(in: buffer, from: scanned - 3) {
+                guard end.lowerBound - buffer.startIndex <= MixedPortParser.maxHeaderBytes else {
+                    try? await send(connection, MixedPortParser.headerTooLarge)
+                    return nil
+                }
                 break
-            } catch MixedPortParser.ParseError.needMore {
-                guard let chunk = try await receive(connection) else { return }
-                buffer.append(chunk)
             }
+            guard buffer.count <= MixedPortParser.maxHeaderBytes else {
+                try? await send(connection, MixedPortParser.headerTooLarge)
+                return nil
+            }
+            scanned = buffer.count
+            guard let chunk = try await receive(connection) else { return nil }
+            buffer.append(chunk)
         }
-        try await send(connection, MixedPortParser.socksNoAuth)
-        var request: MixedPortParser.SOCKSRequest
-        var leftover: Data
-        while true {
-            do {
-                (request, leftover) = try MixedPortParser.parseSOCKSRequest(buffer)
-                break
-            } catch MixedPortParser.ParseError.needMore {
-                guard let chunk = try await receive(connection) else { return }
-                buffer.append(chunk)
+        let (parsed, leftover) = try MixedPortParser.parseHTTP(buffer)
+        if access.needsAuthentication(from: client),
+           !access.accepts(credentials: MixedPortParser.basicCredentials(parsed.proxyAuthorization)) {
+            try? await send(connection, MixedPortParser.proxyAuthRequired)
+            return nil
+        }
+        if refusesTarget(parsed.host, client: client) {
+            try? await send(connection, MixedPortParser.forbidden)
+            return nil
+        }
+        let endpoint = MixedPortParser.endpoint(host: parsed.host, port: parsed.port)
+        let inner = NWInboundStream(
+            endpoint: endpoint,
+            connection: connection,
+            listenPort: listenPort,
+            leftover: leftover
+        )
+        if parsed.command == .connect {
+            try await send(connection, MixedPortParser.connectEstablished)
+            return inner
+        }
+        return HTTPForwardInbound(inner: inner, head: parsed.preface, body: parsed.body)
+    }
+
+    private func handshakeSOCKS(
+        _ connection: NWConnection,
+        client: String,
+        listenPort: UInt16,
+        buffer: inout Data
+    ) async throws -> (any InboundStream)? {
+        let consumed = try await receiveUntilParsed(connection, &buffer) {
+            try MixedPortParser.parseSOCKSGreeting($0)
+        }
+        guard let consumed else { return nil }
+        let methods = MixedPortParser.socksMethods(buffer)
+        buffer = Data(buffer.dropFirst(consumed))
+        if access.needsAuthentication(from: client) {
+            guard methods.contains(0x02) else {
+                try? await send(connection, MixedPortParser.socksNoAcceptableMethod)
+                return nil
             }
+            try await send(connection, MixedPortParser.socksUserPass)
+            let auth = try await receiveUntilParsed(connection, &buffer) {
+                try MixedPortParser.parseSOCKSUserPass($0)
+            }
+            guard let auth else { return nil }
+            buffer = Data(buffer.dropFirst(auth.consumed))
+            guard access.accepts(credentials: auth.credentials) else {
+                try? await send(connection, MixedPortParser.socksAuthFailed)
+                return nil
+            }
+            try await send(connection, MixedPortParser.socksAuthOK)
+        } else {
+            try await send(connection, MixedPortParser.socksNoAuth)
+        }
+        let parsed = try await receiveUntilParsed(connection, &buffer) {
+            try MixedPortParser.parseSOCKSRequest($0)
+        }
+        guard let (request, leftover) = parsed else { return nil }
+        if refusesTarget(request.host, client: client) {
+            // REP 0x02: connection not allowed by ruleset.
+            try? await send(connection, Data([0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+            return nil
         }
         try await send(connection, MixedPortParser.socksConnectOK)
-        let stream = NWInboundStream(
+        return NWInboundStream(
             endpoint: MixedPortParser.endpoint(host: request.host, port: request.port),
             connection: connection,
             listenPort: listenPort,
             leftover: leftover
         )
-        await EngineTCPRelay.pipe(stream: stream, engine: engine)
+    }
+
+    /// Re-parses as bytes arrive (SOCKS messages are tiny); `nil` on EOF or
+    /// when the handshake exceeds `maxSOCKSHandshakeBytes`.
+    private func receiveUntilParsed<T>(
+        _ connection: NWConnection,
+        _ buffer: inout Data,
+        parse: (Data) throws -> T
+    ) async throws -> T? {
+        while true {
+            do {
+                return try parse(buffer)
+            } catch MixedPortParser.ParseError.needMore {
+                guard buffer.count <= MixedPortParser.maxSOCKSHandshakeBytes,
+                      let chunk = try await receive(connection) else { return nil }
+                buffer.append(chunk)
+            }
+        }
     }
 
     private func receive(_ connection: NWConnection) async throws -> Data? {
@@ -221,7 +320,7 @@ public final class MixedPortServer: @unchecked Sendable {
     }
 }
 
-private final class NWInboundStream: InboundStream, @unchecked Sendable {
+final class NWInboundStream: InboundStream, @unchecked Sendable {
     let endpoint: Endpoint
     let clientAddress: String
     let clientPort: UInt16
@@ -244,7 +343,7 @@ private final class NWInboundStream: InboundStream, @unchecked Sendable {
         leftover.withLock { $0 = seed }
     }
 
-    private static func hostString(_ host: NWEndpoint.Host) -> String {
+    static func hostString(_ host: NWEndpoint.Host) -> String {
         switch host {
         case .ipv4(let address): return "\(address)"
         case .ipv6(let address): return "\(address)"
@@ -292,4 +391,62 @@ private final class NWInboundStream: InboundStream, @unchecked Sendable {
     func close() async {
         connection.cancel()
     }
+
+    var supportsHalfClose: Bool { true }
+
+    /// FIN toward the client; receives keep working.
+    func closeWrite() async {
+        connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
+    }
+}
+
+/// Plain-HTTP proxy request (non-CONNECT): forwards exactly one request —
+/// the rewritten head, then its body per `Content-Length` / chunked framing.
+/// Later client bytes (a pipelined or keep-alive request, possibly for a
+/// different origin) are read and dropped, never sent to this origin; the
+/// relay closes the client once the origin finishes (`Connection: close`).
+final class HTTPForwardInbound: InboundStream, @unchecked Sendable {
+    let endpoint: Endpoint
+    var clientAddress: String { inner.clientAddress }
+    var clientPort: UInt16 { inner.clientPort }
+    var listenPort: UInt16? { inner.listenPort }
+    /// Close (not half-close) the client after the origin's EOF.
+    var supportsHalfClose: Bool { false }
+    private let inner: any InboundStream
+    private struct State {
+        var head: Data?
+        var framer: HTTPBodyFramer
+    }
+    private let state: OSAllocatedUnfairLock<State>
+
+    init(inner: any InboundStream, head: Data, body: HTTPBodyFraming) {
+        self.endpoint = inner.endpoint
+        self.inner = inner
+        self.state = OSAllocatedUnfairLock(initialState: State(head: head, framer: HTTPBodyFramer(body)))
+    }
+
+    func read() async throws -> Data? {
+        if let head = state.withLock({ current -> Data? in
+            defer { current.head = nil }
+            return current.head
+        }) {
+            return head
+        }
+        while true {
+            if state.withLock({ $0.framer.isComplete }) {
+                // Request done: swallow anything else until the client leaves.
+                while let extra = try await inner.read() {
+                    _ = extra
+                }
+                return nil
+            }
+            guard let chunk = try await inner.read() else { return nil }
+            if chunk.isEmpty { return chunk }
+            let count = try state.withLock { try $0.framer.consume(chunk) }
+            if count > 0 { return chunk.prefix(count) }
+        }
+    }
+
+    func write(_ data: Data) async throws { try await inner.write(data) }
+    func close() async { await inner.close() }
 }
