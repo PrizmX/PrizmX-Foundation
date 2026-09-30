@@ -11,7 +11,8 @@ enum TLSClient {
         minimum: tls_protocol_version_t? = nil,
         maximum: tls_protocol_version_t? = nil,
         requirePeerAuthentication: Bool = true,
-        skipVerification: Bool = false
+        skipVerification: Bool = false,
+        alpn: [String]? = nil
     ) -> NWProtocolTLS.Options {
         let tls = NWProtocolTLS.Options()
         let sec = tls.securityProtocolOptions
@@ -34,6 +35,9 @@ enum TLSClient {
             serverName.withCString { pointer in
                 sec_protocol_options_set_tls_server_name(sec, pointer)
             }
+        }
+        for name in alpn ?? [] {
+            sec_protocol_options_add_tls_application_protocol(sec, name)
         }
         return tls
     }

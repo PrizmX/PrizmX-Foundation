@@ -22,13 +22,31 @@ final class NWStreamTransport: @unchecked Sendable {
     let inbox = DirectBuffer()
 
     private let lifecycle = OSAllocatedUnfairLock(initialState: Lifecycle())
-    private(set) var connection: NWConnection?
-    /// Set once the wire returns a clean EOF.
+    /// Read (receive task) and written (open / close) from different tasks.
+    private let connectionBox = OSAllocatedUnfairLock<NWConnection?>(initialState: nil)
+    /// First protocol payload (salt / request header) has been handed to the
+    /// wire. Readers check this without taking `writeMutex`, so a stalled
+    /// upload never blocks the download direction.
+    private let handshakeFlag = OSAllocatedUnfairLock(initialState: false)
+    /// Set once the wire returns a clean EOF (read path only).
     private(set) var receiveEOF = false
 
     private struct Lifecycle {
         var state: OutboundConnectionState = .idle
         var openTask: Task<Void, Error>?
+        var writeClosed = false
+    }
+
+    var connection: NWConnection? {
+        connectionBox.withLock { $0 }
+    }
+
+    var isHandshakeFlushed: Bool {
+        handshakeFlag.withLock { $0 }
+    }
+
+    func markHandshakeFlushed() {
+        handshakeFlag.withLock { $0 = true }
     }
 
     init(queueLabel: String, endpoint: Endpoint, errorPeer: Endpoint) {
@@ -76,9 +94,16 @@ final class NWStreamTransport: @unchecked Sendable {
         }
     }
 
+    func ensureWritable() throws {
+        try ensureNotClosed()
+        if isWriteClosed {
+            throw OutboundError.alreadyClosed(endpoint)
+        }
+    }
+
     /// Connect body: registers the dialing connection before waiting.
     func attach(_ nw: NWConnection) {
-        connection = nw
+        connectionBox.withLock { $0 = nw }
     }
 
     /// Waits for `.ready`; a later failure / cancel marks the transport closed.
@@ -131,7 +156,7 @@ final class NWStreamTransport: @unchecked Sendable {
     func failOpen(_ nw: NWConnection) {
         lifecycle.withLock { $0.state = .closed }
         nw.cancel()
-        connection = nil
+        connectionBox.withLock { $0 = nil }
     }
 
     func markEstablished() {
@@ -194,7 +219,7 @@ final class NWStreamTransport: @unchecked Sendable {
         try await ensureOpen(running: body)
         await writeMutex.acquire()
         defer { writeMutex.release() }
-        try ensureNotClosed()
+        try ensureWritable()
         return try await send(buffer)
     }
 
@@ -205,8 +230,46 @@ final class NWStreamTransport: @unchecked Sendable {
             return true
         }
         guard shouldCancel else { return }
-        connection?.cancel()
-        connection = nil
+        let nw = connectionBox.withLock { box -> NWConnection? in
+            defer { box = nil }
+            return box
+        }
+        nw?.cancel()
+    }
+
+    /// Half-close: sends TCP FIN once the queued bytes are flushed. Reads
+    /// keep working. Serialized behind in-flight writes; idempotent.
+    ///
+    /// Network.framework TLS emits close_notify + FIN for the final message.
+    /// A userspace TLS layer seals its own close_notify in `prelude`, which
+    /// runs under `writeMutex` after further writes are already refused.
+    func finishWriting(prelude: (() async throws -> Void)? = nil) async {
+        guard state == .established else { return }
+        await writeMutex.acquire()
+        defer { writeMutex.release() }
+        let proceed: Bool = lifecycle.withLock { life in
+            guard life.state == .established, !life.writeClosed else { return false }
+            life.writeClosed = true
+            return true
+        }
+        guard proceed else { return }
+        if let prelude {
+            try? await prelude()
+        }
+        guard let connection else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            connection.send(
+                content: nil,
+                contentContext: .finalMessage,
+                isComplete: true,
+                completion: .contentProcessed { _ in continuation.resume() }
+            )
+        }
+    }
+
+    /// `true` after `finishWriting`; later writes fail fast.
+    var isWriteClosed: Bool {
+        lifecycle.withLock { $0.writeClosed }
     }
 
     func mapTransportError(_ error: NWError) -> Error {

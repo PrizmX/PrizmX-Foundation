@@ -134,7 +134,10 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
     public func read(into buffer: UnsafeMutableRawBufferPointer) async throws -> Int {
         if buffer.isEmpty { return 0 }
         try await transport.ensureOpen { try await self.connectTCP() }
-        try await flushHandshakeBeforeRead()
+        // Lock-free check: only the very first read may need `writeMutex`.
+        if !transport.isHandshakeFlushed {
+            try await flushHandshakeBeforeRead()
+        }
 
         await transport.readMutex.acquire()
         defer { transport.readMutex.release() }
@@ -167,6 +170,19 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
     public func close() async {
         await transport.close()
     }
+
+    /// Half-close: flushes the salt/address header if nothing was written
+    /// yet, then sends FIN. AEAD chunks are self-delimiting, so EOF at a
+    /// chunk boundary is a clean end of the uplink for SS servers.
+    public func closeWrite() async {
+        guard state == .established else { return }
+        if !transport.isHandshakeFlushed {
+            try? await flushHandshakeBeforeRead()
+        }
+        await transport.finishWriting()
+    }
+
+    public var supportsHalfClose: Bool { true }
 
     /// `Data` convenience matching the requested outbound write surface.
     /// Copies into a scratch buffer before `await` so the `Data` storage is not
@@ -249,6 +265,7 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
         sendCiphertext.clear()
         sendCiphertext.append(clientSalt)
         saltSent = true
+        transport.markHandshakeFlushed()
         try appendSealedChunk(plaintext: sendPlaintext.readableBytes)
         try await sendCiphertextBuffer()
         return take
@@ -257,7 +274,7 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
     private func flushHandshakeBeforeRead() async throws {
         await transport.writeMutex.acquire()
         defer { transport.writeMutex.release() }
-        try transport.ensureNotClosed()
+        try transport.ensureWritable()
         try prepareEncryptorIfNeeded()
         if !saltSent {
             _ = try await sendHandshakeIfNeeded(prefixing: UnsafeRawBufferPointer(start: nil, count: 0))

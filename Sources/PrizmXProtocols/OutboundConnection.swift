@@ -82,6 +82,18 @@ public protocol OutboundConnection: Sendable {
 
     /// Closes the connection and releases underlying resources. Idempotent.
     func close() async
+
+    /// Half-close: no more `write`s will follow. Implementations that
+    /// support it flush pending protocol bytes and signal end-of-stream to
+    /// the peer (TCP FIN, AnyTLS stream FIN, TLS close_notify + FIN) while
+    /// `read` keeps delivering the downlink. Idempotent; never throws.
+    ///
+    /// The default is a no-op: check `supportsHalfClose` and fall back to
+    /// `close()` (after draining reads, if desired) when it is `false`.
+    func closeWrite() async
+
+    /// `true` when `closeWrite()` actually signals end-of-stream.
+    var supportsHalfClose: Bool { get }
 }
 
 // MARK: - Convenience API (copy once at the boundary; use the raw-buffer
@@ -89,6 +101,10 @@ public protocol OutboundConnection: Sendable {
 
 extension OutboundConnection {
     public var routingLabel: String { "proxy" }
+
+    public func closeWrite() async {}
+
+    public var supportsHalfClose: Bool { false }
 
     /// Writes a byte array and returns the number of bytes written.
     ///

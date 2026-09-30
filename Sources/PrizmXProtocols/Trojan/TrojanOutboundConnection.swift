@@ -11,11 +11,14 @@ public struct TrojanOutboundFactory: OutboundConnectionFactory, Sendable {
     public let server: Endpoint
     public let password: String
     public let sni: String?
+    /// Clash `skip-cert-verify`: accept any server certificate.
+    public let skipCertVerify: Bool
 
-    public init(server: Endpoint, password: String, sni: String? = nil) {
+    public init(server: Endpoint, password: String, sni: String? = nil, skipCertVerify: Bool = false) {
         self.server = server
         self.password = password
         self.sni = sni
+        self.skipCertVerify = skipCertVerify
     }
 
     public func connect(to endpoint: Endpoint) async throws -> any OutboundConnection {
@@ -23,7 +26,8 @@ public struct TrojanOutboundFactory: OutboundConnectionFactory, Sendable {
             server: server,
             password: password,
             target: endpoint,
-            sni: sni
+            sni: sni,
+            skipCertVerify: skipCertVerify
         )
     }
 }
@@ -39,6 +43,7 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
     public let sni: String?
     public let command: TrojanCommand
     public let passwordHashHex: [UInt8]
+    public let skipCertVerify: Bool
 
     public var state: OutboundConnectionState {
         transport.state
@@ -54,17 +59,20 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
     ///   - target: Destination encoded in the Trojan request.
     ///   - sni: TLS server name. Defaults to `server`'s domain.
     ///   - command: CONNECT (TCP) or UDP ASSOCIATE.
+    ///   - skipCertVerify: Accept any server certificate (explicit opt-in).
     public init(
         server: Endpoint,
         password: String,
         target: Endpoint,
         sni: String? = nil,
-        command: TrojanCommand = .connect
+        command: TrojanCommand = .connect,
+        skipCertVerify: Bool = false
     ) {
         self.server = server
         self.endpoint = target
         self.sni = sni
         self.command = command
+        self.skipCertVerify = skipCertVerify
         let header = TrojanHeader(password: password, destination: target, command: command)
         self.header = header
         self.passwordHashHex = header.passwordHashHex
@@ -82,11 +90,19 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
         password: String,
         target: Endpoint,
         sni: String? = nil,
-        command: TrojanCommand = .connect
+        command: TrojanCommand = .connect,
+        skipCertVerify: Bool = false
     ) {
         let server = Endpoint(hostname: host, port: port)
             ?? Endpoint(domain: host, port: port)
-        self.init(server: server, password: password, target: target, sni: sni, command: command)
+        self.init(
+            server: server,
+            password: password,
+            target: target,
+            sni: sni,
+            command: command,
+            skipCertVerify: skipCertVerify
+        )
     }
 
     // MARK: OutboundConnection
@@ -130,6 +146,13 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
         await transport.close()
     }
 
+    /// Half-close: Network.framework TLS sends close_notify, then TCP FIN.
+    public func closeWrite() async {
+        await transport.finishWriting()
+    }
+
+    public var supportsHalfClose: Bool { true }
+
     // MARK: Handshake
 
     private func connectAndHandshake() async throws {
@@ -137,7 +160,7 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
             throw OutboundError.invalidEndpoint(server)
         }
         let serverName = TLSClient.resolvedServerName(explicit: sni, server: server)
-        let parameters = TLSClient.parameters(serverName: serverName)
+        let parameters = TLSClient.parameters(serverName: serverName, skipVerification: skipCertVerify)
         let host = try await DNSClient.resolve(server.host, role: .proxyServer)
         let nw = NWConnection(host: host, port: nwPort, using: parameters)
         transport.attach(nw)
