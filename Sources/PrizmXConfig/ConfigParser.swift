@@ -204,8 +204,10 @@ enum ConfigMapping {
         }
     }
 
-    /// Clash `interval`. `0` means "no periodic test" in mihomo; the engine
-    /// has no off switch, so 0 / negative / unparsable use the default.
+    /// Clash `interval`. mihomo turns 0 into 300 s for groups that list their
+    /// `proxies` inline (only `use:` provider groups inherit the provider's
+    /// setting, where 0 disables checks), so 0 / negative / unparsable use
+    /// the default here too.
     static func interval(_ raw: String?, defaultSeconds: Int = 300) -> Duration {
         guard let raw else { return .seconds(defaultSeconds) }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
