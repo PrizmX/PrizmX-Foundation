@@ -19,7 +19,7 @@ public struct ClashDNSSection: Sendable, Equatable {
     /// Extracts `dns:` from a Clash YAML document. Returns nil for sing-box
     /// JSON / Surge INI / missing section.
     public static func parse(from rawString: String) -> ClashDNSSection? {
-        let trimmed = rawString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = ConfigText.normalized(rawString)
         guard let first = trimmed.first, first != "{", first != "[" else { return nil }
         guard let root = try? YAMLParser.parse(trimmed), let dns = root.mapping?["dns"] else { return nil }
         var section = ClashDNSSection()

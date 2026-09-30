@@ -64,10 +64,15 @@ enum YAMLParser {
     }
 
     static func parse(_ text: String) throws -> YAMLNode {
-        let lines = tokenize(text)
+        let lines = tokenize(ConfigText.strippingBOM(text))
         guard !lines.isEmpty else { return .mapping([:]) }
         var index = 0
-        return try parseNode(lines: lines, index: &index, minIndent: 0)
+        let root = try parseNode(lines: lines, index: &index, minIndent: 0)
+        // Never return a silently truncated document.
+        if index < lines.count {
+            throw ConfigError.yamlSyntax("unexpected content at line \(lines[index].number)")
+        }
+        return root
     }
 
     private static func tokenize(_ text: String) -> [Line] {
@@ -90,29 +95,74 @@ enum YAMLParser {
         return (count, String(line.dropFirst(count)))
     }
 
+    /// `#` starts a comment only at the start of the content or after
+    /// whitespace, and never inside a quoted scalar (`password: abc#123`).
     private static func stripComment(_ line: String) -> String {
-        var inSingle = false
-        var inDouble = false
-        var escaped = false
-        for (index, character) in line.enumerated() {
-            if escaped {
-                escaped = false
-                continue
+        var cut: String.Index?
+        var previousIsSpace = true
+        scanUnquoted(line) { index, character in
+            if character == "#" && previousIsSpace {
+                cut = index
+                return false
             }
-            if character == "\\" && inDouble {
-                escaped = true
-                continue
-            }
-            if character == "'" && !inDouble {
-                inSingle.toggle()
-            } else if character == "\"" && !inSingle {
-                inDouble.toggle()
-            } else if character == "#" && !inSingle && !inDouble {
-                let cut = line.index(line.startIndex, offsetBy: index)
-                return String(line[..<cut]).trimmingCharacters(in: .whitespaces)
-            }
+            previousIsSpace = character == " " || character == "\t"
+            return true
         }
-        return line.trimmingCharacters(in: .whitespaces)
+        guard let cut else { return line.trimmingCharacters(in: .whitespaces) }
+        return String(line[..<cut]).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Calls `body` for each character outside quoted scalars until it returns
+    /// false. A quote only opens a scalar where one can start (content start,
+    /// after `[` `{` `,`, or after `: ` / `- ` / `? `), so apostrophes inside
+    /// plain scalars (`Tom's node`) are literal.
+    private static func scanUnquoted(_ text: String, _ body: (String.Index, Character) -> Bool) {
+        var quote: Character?
+        var previous: Character?
+        var spaced = false
+        var index = text.startIndex
+        while index < text.endIndex {
+            let character = text[index]
+            let next = text.index(after: index)
+            if let open = quote {
+                if open == "\"" && character == "\\" {
+                    index = next < text.endIndex ? text.index(after: next) : next
+                    continue
+                }
+                if character == open {
+                    if open == "'", next < text.endIndex, text[next] == "'" {
+                        index = text.index(after: next)
+                        continue
+                    }
+                    quote = nil
+                    previous = character
+                    spaced = false
+                }
+                index = next
+                continue
+            }
+            if character == "'" || character == "\"" {
+                let opens: Bool
+                if let previous {
+                    opens = "[{,".contains(previous) || (spaced && ":-?".contains(previous))
+                } else {
+                    opens = true
+                }
+                if opens {
+                    quote = character
+                    index = next
+                    continue
+                }
+            }
+            if !body(index, character) { return }
+            if character == " " || character == "\t" {
+                spaced = true
+            } else {
+                previous = character
+                spaced = false
+            }
+            index = next
+        }
     }
 
     private static func parseNode(lines: [Line], index: inout Int, minIndent: Int) throws -> YAMLNode {
@@ -121,7 +171,7 @@ enum YAMLParser {
         if line.indent < minIndent {
             return .scalar("")
         }
-        if line.content.hasPrefix("- ") || line.content == "-" {
+        if isSequenceItem(line) {
             return try parseSequence(lines: lines, index: &index, indent: line.indent)
         }
         return try parseMapping(lines: lines, index: &index, indent: line.indent)
@@ -135,7 +185,7 @@ enum YAMLParser {
             if line.indent > indent {
                 throw ConfigError.yamlSyntax("unexpected indent at line \(line.number)")
             }
-            guard line.content.hasPrefix("- ") || line.content == "-" else { break }
+            guard isSequenceItem(line) else { break }
             let rest = line.content == "-"
                 ? ""
                 : String(line.content.dropFirst(2)).trimmingCharacters(in: .whitespaces)
@@ -156,7 +206,7 @@ enum YAMLParser {
                 while index < lines.count {
                     let next = lines[index]
                     if next.indent <= indent { break }
-                    if next.content.hasPrefix("- ") { break }
+                    if isSequenceItem(next) { break }
                     let extra = try parseMapping(lines: lines, index: &index, indent: next.indent)
                     if case .mapping(let map) = extra {
                         for (mapKey, mapValue) in map { nested[mapKey] = mapValue }
@@ -180,7 +230,7 @@ enum YAMLParser {
             if line.indent > indent {
                 throw ConfigError.yamlSyntax("unexpected indent at line \(line.number)")
             }
-            if line.content.hasPrefix("- ") || line.content == "-" { break }
+            if isSequenceItem(line) { break }
             guard let colon = unquotedColon(in: line.content) else {
                 throw ConfigError.yamlSyntax("expected key: value at line \(line.number)")
             }
@@ -191,6 +241,9 @@ enum YAMLParser {
             if valuePart.isEmpty {
                 if index < lines.count, lines[index].indent > indent {
                     map[key] = try parseNode(lines: lines, index: &index, minIndent: lines[index].indent)
+                } else if index < lines.count, lines[index].indent == indent, isSequenceItem(lines[index]) {
+                    // `key:\n- item` — a block sequence may sit at its key's indent.
+                    map[key] = try parseSequence(lines: lines, index: &index, indent: indent)
                 } else {
                     map[key] = .scalar("")
                 }
@@ -321,20 +374,22 @@ enum YAMLParser {
     }
 
     private static func unquotedColon(in text: String) -> String.Index? {
-        var inSingle = false
-        var inDouble = false
         var depth = 0
-        for index in text.indices {
-            let character = text[index]
-            if character == "'" && !inDouble { inSingle.toggle() }
-            else if character == "\"" && !inSingle { inDouble.toggle() }
-            else if !inSingle && !inDouble {
-                if character == "{" || character == "[" { depth += 1 }
-                if character == "}" || character == "]" { depth -= 1 }
-                if character == ":" && depth == 0 { return index }
+        var found: String.Index?
+        scanUnquoted(text) { index, character in
+            if character == "{" || character == "[" { depth += 1 }
+            if character == "}" || character == "]" { depth -= 1 }
+            if character == ":" && depth == 0 {
+                found = index
+                return false
             }
+            return true
         }
-        return nil
+        return found
+    }
+
+    private static func isSequenceItem(_ line: Line) -> Bool {
+        line.content.hasPrefix("- ") || line.content == "-"
     }
 
     private static func unquote(_ raw: String) -> String {

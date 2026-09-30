@@ -8,7 +8,14 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
     public init() {}
 
     public func parse(rawString: String) throws -> (Router, NodeManager) {
-        let trimmed = rawString.trimmingCharacters(in: .whitespacesAndNewlines)
+        try parseWithWarnings(rawString: rawString).tuple
+    }
+
+    /// Rules with fields we cannot evaluate (`invert`, `port`, `network`,
+    /// `rule_set`, logical rules, unknown keys or actions) are skipped whole
+    /// and reported, never imported in a broadened form.
+    public func parseWithWarnings(rawString: String) throws -> ConfigParseResult {
+        let trimmed = ConfigText.normalized(rawString)
         guard !trimmed.isEmpty else { throw ConfigError.emptyInput }
         let data = Data(trimmed.utf8)
         let file: SingboxFile
@@ -20,25 +27,46 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
 
         var nodes: [OutboundNode] = []
         var groups: [PolicyGroup] = []
+        var warnings: [ConfigWarning] = []
+        // Tags of built-in outbounds map to DIRECT / REJECT.
+        var builtins: [String: Policy] = [:]
 
         for outbound in file.outbounds ?? [] {
-            switch outbound.type.lowercased() {
-            case "shadowsocks":
-                nodes.append(try makeShadowsocks(outbound))
-            case "vless":
-                nodes.append(try makeVLESS(outbound))
-            case "trojan":
-                nodes.append(try makeTrojan(outbound))
-            case "anytls":
-                nodes.append(try makeAnyTLS(outbound))
-            case "selector":
-                groups.append(makeGroup(outbound, mode: .select))
-            case "urltest":
-                groups.append(makeGroup(outbound, mode: .urlTest))
-            case "loadbalance", "load-balance":
-                groups.append(makeGroup(outbound, mode: .loadBalance))
-            default:
-                continue
+            do {
+                switch outbound.type.lowercased() {
+                case "shadowsocks":
+                    nodes.append(try makeShadowsocks(outbound))
+                case "vless":
+                    nodes.append(try makeVLESS(outbound))
+                case "trojan":
+                    nodes.append(try makeTrojan(outbound))
+                case "anytls":
+                    nodes.append(try makeAnyTLS(outbound))
+                case "selector":
+                    groups.append(makeGroup(outbound, mode: .select))
+                case "urltest":
+                    groups.append(makeGroup(outbound, mode: .urlTest))
+                case "loadbalance", "load-balance":
+                    groups.append(makeGroup(outbound, mode: .loadBalance))
+                case "direct":
+                    if let tag = outbound.tag { builtins[tag] = .direct }
+                case "block":
+                    if let tag = outbound.tag { builtins[tag] = .reject }
+                case "dns":
+                    continue
+                default:
+                    warnings.append(ConfigWarning(
+                        kind: .proxy,
+                        text: outbound.tag ?? "?",
+                        reason: "unsupported outbound type \(outbound.type)"
+                    ))
+                }
+            } catch {
+                warnings.append(ConfigWarning(
+                    kind: .proxy,
+                    text: outbound.tag ?? "?",
+                    reason: "invalid outbound: \(error)"
+                ))
             }
         }
 
@@ -48,14 +76,27 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
             allGroups.append(group)
         }
 
-        var rules: [RouteRule] = []
-        for rule in file.route?.rules ?? [] {
-            rules.append(contentsOf: try expand(rule))
+        func policy(_ tag: String) -> Policy {
+            builtins[tag] ?? ConfigMapping.policy(named: tag)
         }
 
-        let defaultPolicy = file.route?.final.map(ConfigMapping.policy(named:)) ?? .direct
-        let router = Router(rules: rules, default: defaultPolicy)
-        return (router, NodeManager(nodes: nodes, groups: allGroups))
+        var rules: [RouteRule] = []
+        for rule in file.route?.rules ?? [] {
+            do {
+                rules.append(contentsOf: try expand(rule, policy: policy))
+            } catch let skip as RuleSkip {
+                warnings.append(ConfigWarning(kind: .rule, text: rule.summary, reason: skip.reason))
+            }
+        }
+
+        let defaultPolicy = file.route?.final.map(policy) ?? .direct
+        let manager = NodeManager(nodes: nodes, groups: allGroups)
+        warnings += ConfigMapping.missingTargetWarnings(rules: rules, manager: manager)
+        return ConfigParseResult(
+            router: Router(rules: rules, default: defaultPolicy),
+            nodeManager: manager,
+            warnings: warnings
+        )
     }
 
     private func makeShadowsocks(_ outbound: SingboxOutbound) throws -> OutboundNode {
@@ -162,34 +203,67 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
         )
     }
 
-    private func expand(_ rule: SingboxRouteRule) throws -> [RouteRule] {
-        let policy = ConfigMapping.policy(named: rule.outbound ?? "direct")
-        var result: [RouteRule] = []
-        for domain in rule.domain.values {
-            result.append(try RouteRule(type: .domain(domain), policy: policy))
+    private func expand(_ rule: SingboxRouteRule, policy tagPolicy: (String) -> Policy) throws -> [RouteRule] {
+        let unsupported = rule.keys.subtracting(SingboxRouteRule.supportedKeys).sorted()
+        guard unsupported.isEmpty else {
+            throw RuleSkip("unsupported fields \(unsupported.joined(separator: ", "))")
         }
-        for suffix in rule.domainSuffix.values {
-            result.append(try RouteRule(type: .domainSuffix(suffix), policy: policy))
+        if let type = rule.type, type != "default" {
+            throw RuleSkip("unsupported rule type \(type)")
         }
-        for keyword in rule.domainKeyword.values {
-            result.append(try RouteRule(type: .domainKeyword(keyword), policy: policy))
+        if rule.invert == true {
+            throw RuleSkip("invert is not supported")
         }
-        for cidr in rule.ipCIDR.values {
-            result.append(try RouteRule(type: .ipCIDR(cidr), policy: policy))
+        let policy: Policy
+        switch rule.action ?? "route" {
+        case "route":
+            guard let outbound = rule.outbound, !outbound.isEmpty else {
+                throw RuleSkip("route rule without outbound")
+            }
+            policy = tagPolicy(outbound)
+        case "reject":
+            policy = .reject
+        default:
+            throw RuleSkip("unsupported action \(rule.action ?? "")")
         }
-        for site in rule.geosite.values {
-            result.append(try RouteRule(type: .geosite(tag: site), policy: policy))
+        do {
+            var result: [RouteRule] = []
+            for domain in rule.domain.values {
+                result.append(try RouteRule(type: .domain(domain), policy: policy))
+            }
+            for suffix in rule.domainSuffix.values {
+                result.append(try RouteRule(type: .domainSuffix(suffix), policy: policy))
+            }
+            for keyword in rule.domainKeyword.values {
+                result.append(try RouteRule(type: .domainKeyword(keyword), policy: policy))
+            }
+            for cidr in rule.ipCIDR.values {
+                result.append(try RouteRule(type: .ipCIDR(cidr), policy: policy))
+            }
+            if rule.ipIsPrivate == true {
+                for cidr in ConfigMapping.privateCIDRs {
+                    result.append(try RouteRule(type: .ipCIDR(cidr), policy: policy))
+                }
+            }
+            for site in rule.geosite.values {
+                result.append(try RouteRule(type: .geosite(tag: site), policy: policy))
+            }
+            for country in rule.geoip.values {
+                result.append(try RouteRule(type: .geoIP(code: country), policy: policy))
+            }
+            // A rule with no matcher we understand must not become match-all
+            // or vanish silently.
+            guard !result.isEmpty else { throw RuleSkip("no supported matcher") }
+            return result
+        } catch is RuleCompileError {
+            throw RuleSkip("invalid ip_cidr")
         }
-        for country in rule.geoip.values {
-            result.append(try RouteRule(type: .geoIP(code: country), policy: policy))
-        }
-        return result
     }
 }
 
 // MARK: - Codable document
 
-struct SingboxFile: Codable, Sendable {
+struct SingboxFile: Decodable, Sendable {
     var outbounds: [SingboxOutbound]?
     var route: SingboxRoute?
 }
@@ -237,11 +311,13 @@ struct SingboxInterval: Codable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let seconds = try? container.decode(Int.self) {
-            duration = .seconds(max(1, seconds))
+            duration = ConfigMapping.interval(String(seconds))
             return
         }
         if let seconds = try? container.decode(Double.self) {
-            duration = .seconds(max(1, Int(seconds)))
+            // Guard the Int conversion: NaN / huge values would trap.
+            let whole = seconds.isFinite && seconds >= 1 && seconds < 1e9 ? Int(seconds) : 0
+            duration = ConfigMapping.interval(String(whole))
             return
         }
         duration = ConfigMapping.interval(try container.decode(String.self))
@@ -276,36 +352,71 @@ struct SingboxReality: Codable, Sendable {
     }
 }
 
-struct SingboxRoute: Codable, Sendable {
+struct SingboxRoute: Decodable, Sendable {
     var rules: [SingboxRouteRule]?
     var final: String?
 }
 
-struct SingboxRouteRule: Codable, Sendable {
+struct SingboxRouteRule: Decodable, Sendable {
     var domain: StringOrArray
     var domainSuffix: StringOrArray
     var domainKeyword: StringOrArray
     var ipCIDR: StringOrArray
     var geosite: StringOrArray
     var geoip: StringOrArray
+    var ipIsPrivate: Bool?
     var outbound: String?
+    var action: String?
+    var type: String?
+    var invert: Bool?
+    /// Every key present, to reject rules with fields we would ignore.
+    var keys: Set<String>
 
-    enum CodingKeys: String, CodingKey {
-        case domain, geosite, geoip, outbound
-        case domainSuffix = "domain_suffix"
-        case domainKeyword = "domain_keyword"
-        case ipCIDR = "ip_cidr"
+    /// `invert: false` is harmless; `method` / `no_drop` only tune `reject`.
+    static let supportedKeys: Set<String> = [
+        "domain", "domain_suffix", "domain_keyword", "ip_cidr", "geosite", "geoip",
+        "ip_is_private", "outbound", "action", "type", "invert", "method", "no_drop",
+    ]
+
+    private struct AnyKey: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
     }
 
     init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        domain = try container.decodeIfPresent(StringOrArray.self, forKey: .domain) ?? .empty
-        domainSuffix = try container.decodeIfPresent(StringOrArray.self, forKey: .domainSuffix) ?? .empty
-        domainKeyword = try container.decodeIfPresent(StringOrArray.self, forKey: .domainKeyword) ?? .empty
-        ipCIDR = try container.decodeIfPresent(StringOrArray.self, forKey: .ipCIDR) ?? .empty
-        geosite = try container.decodeIfPresent(StringOrArray.self, forKey: .geosite) ?? .empty
-        geoip = try container.decodeIfPresent(StringOrArray.self, forKey: .geoip) ?? .empty
-        outbound = try container.decodeIfPresent(String.self, forKey: .outbound)
+        let container = try decoder.container(keyedBy: AnyKey.self)
+        func list(_ key: String) throws -> StringOrArray {
+            try container.decodeIfPresent(StringOrArray.self, forKey: AnyKey(stringValue: key)) ?? .empty
+        }
+        keys = Set(container.allKeys.map(\.stringValue))
+        domain = try list("domain")
+        domainSuffix = try list("domain_suffix")
+        domainKeyword = try list("domain_keyword")
+        ipCIDR = try list("ip_cidr")
+        geosite = try list("geosite")
+        geoip = try list("geoip")
+        ipIsPrivate = try? container.decodeIfPresent(Bool.self, forKey: AnyKey(stringValue: "ip_is_private"))
+        outbound = try? container.decodeIfPresent(String.self, forKey: AnyKey(stringValue: "outbound"))
+        action = try? container.decodeIfPresent(String.self, forKey: AnyKey(stringValue: "action"))
+        type = try? container.decodeIfPresent(String.self, forKey: AnyKey(stringValue: "type"))
+        invert = try? container.decodeIfPresent(Bool.self, forKey: AnyKey(stringValue: "invert"))
+    }
+
+    /// Compact text for warnings.
+    var summary: String {
+        var parts: [String] = []
+        for (key, value) in [
+            ("domain", domain), ("domain_suffix", domainSuffix), ("domain_keyword", domainKeyword),
+            ("ip_cidr", ipCIDR), ("geosite", geosite), ("geoip", geoip),
+        ] where !value.values.isEmpty {
+            parts.append("\(key)=\(value.values.prefix(3).joined(separator: "|"))")
+        }
+        let others = keys.subtracting(Self.supportedKeys).sorted()
+        if !others.isEmpty { parts.append(others.joined(separator: ",")) }
+        parts.append("-> \(action == "reject" ? "reject" : (outbound ?? action ?? "?"))")
+        return parts.joined(separator: " ")
     }
 }
 

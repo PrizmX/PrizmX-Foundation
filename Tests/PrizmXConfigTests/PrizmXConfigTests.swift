@@ -448,8 +448,8 @@ private let expectedNodeCount = 2
     let geoDir = root.appendingPathComponent("geo", isDirectory: true)
     try FileManager.default.createDirectory(at: geoDir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
-    try Data(repeating: 1, count: 2_048).write(to: geoDir.appendingPathComponent("geoip.metadb"))
-    try Data(repeating: 2, count: 2_048).write(to: geoDir.appendingPathComponent("geosite.dat"))
+    try geoIPFixture().write(to: geoDir.appendingPathComponent("geoip.metadb"))
+    try geositeFixture().write(to: geoDir.appendingPathComponent("geosite.dat"))
 
     let prepared = await GeoAssetStore.prepare(
         root: root,

@@ -27,7 +27,14 @@ public enum EngineFactory: Sendable {
             if trimmed.isEmpty {
                 parsed = try overlay.apply(to: Self.directOnly())
             } else {
-                parsed = try ConfigAdapter.parse(rawString: trimmed, overlay: overlay)
+                let result = try ConfigAdapter.parseWithWarnings(rawString: trimmed, overlay: overlay)
+                parsed = result.tuple
+                if !result.warnings.isEmpty {
+                    TunnelLog.write(.warn, "config import skipped \(result.warnings.count) item(s)")
+                    for warning in result.warnings.prefix(50) {
+                        TunnelLog.write(.warn, "config skip: \(warning)")
+                    }
+                }
             }
         } else {
             parsed = try overlay.apply(to: Self.directOnly())
