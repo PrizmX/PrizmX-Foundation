@@ -19,14 +19,22 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
     public var routingLabel: String { "direct" }
 
     private let queue: DispatchQueue
+    /// All mutable state lives behind this lock; I/O copies the connection
+    /// reference out and never touches the NWConnection while holding it.
     private let lifecycle = OSAllocatedUnfairLock(initialState: Lifecycle())
-    private var connection: NWConnection?
-    private var leftover = Data()
-    private var receiveEOF = false
 
     private struct Lifecycle {
         var state: OutboundConnectionState = .idle
         var openTask: Task<Void, Error>?
+        var connection: NWConnection?
+        var leftover = Data()
+        var writeClosed = false
+    }
+
+    public var supportsHalfClose: Bool { true }
+
+    private var connection: NWConnection? {
+        lifecycle.withLock { $0.connection }
     }
 
     public init(endpoint: Endpoint, role: DNSRole = .direct) {
@@ -77,27 +85,45 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
     public func read(into buffer: UnsafeMutableRawBufferPointer) async throws -> Int {
         if buffer.isEmpty { return 0 }
         try await ensureOpen()
-        if leftover.isEmpty {
-            leftover = try await receiveOnce()
-            if leftover.isEmpty { return 0 }
+        var pending = lifecycle.withLock { life -> Data in
+            defer { life.leftover = Data() }
+            return life.leftover
         }
-        let take = min(buffer.count, leftover.count)
-        leftover.withUnsafeBytes { raw in
+        if pending.isEmpty {
+            pending = try await receiveOnce()
+            if pending.isEmpty { return 0 }
+        }
+        let take = min(buffer.count, pending.count)
+        pending.withUnsafeBytes { raw in
             buffer.copyMemory(from: UnsafeRawBufferPointer(rebasing: raw.prefix(take)))
         }
-        leftover.removeFirst(take)
+        if take < pending.count {
+            let rest = pending.subdata(in: (pending.startIndex + take)..<pending.endIndex)
+            lifecycle.withLock { $0.leftover = rest }
+        }
         return take
     }
 
     public func close() async {
-        let shouldCancel: Bool = lifecycle.withLock { life in
-            if life.state == .closed { return false }
+        let nw: NWConnection? = lifecycle.withLock { life in
+            if life.state == .closed { return nil }
             life.state = .closed
-            return true
+            let current = life.connection
+            life.connection = nil
+            life.leftover = Data()
+            return current
         }
-        guard shouldCancel else { return }
-        connection?.cancel()
-        connection = nil
+        nw?.cancel()
+    }
+
+    /// TCP FIN; the downlink keeps flowing until the peer closes.
+    public func closeWrite() async {
+        let nw: NWConnection? = lifecycle.withLock { life in
+            guard life.state == .established, !life.writeClosed else { return nil }
+            life.writeClosed = true
+            return life.connection
+        }
+        nw?.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
     }
 
     private func ensureOpen() async throws {
@@ -139,8 +165,17 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
                 if let address = candidate.address, case .domain(let domain) = endpoint.host {
                     DNSClient.current?.markGood(domain: domain, role: role, address: address)
                 }
-                self.connection = nw
-                lifecycle.withLock { $0.state = .established }
+                // `close()` may have raced the dial: never resurrect a closed flow.
+                let adopted = lifecycle.withLock { life -> Bool in
+                    guard life.state != .closed else { return false }
+                    life.connection = nw
+                    life.state = .established
+                    return true
+                }
+                guard adopted else {
+                    nw.cancel()
+                    throw OutboundError.alreadyClosed(endpoint)
+                }
                 return
             } catch {
                 nw.cancel()

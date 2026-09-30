@@ -92,6 +92,14 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
         return try await active.read(into: buffer)
     }
 
+    public var supportsHalfClose: Bool {
+        lifecycle.withLock { $0.active?.supportsHalfClose ?? false }
+    }
+
+    public func closeWrite() async {
+        await lifecycle.withLock({ $0.active })?.closeWrite()
+    }
+
     public func close() async {
         let active = lifecycle.withLock { life -> (any OutboundConnection)? in
             let current = life.active
