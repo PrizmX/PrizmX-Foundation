@@ -55,18 +55,19 @@ public struct ScriptResult: Sendable, Hashable {
 /// Apple JavaScriptCore runtime used by Scripts.
 ///
 /// Same engine family as Surge `engine=jsc`, Quantumult X, Loon, and Stash:
-/// one `JSVirtualMachine`, a serial queue (`JSContext` is not thread-safe),
-/// a fresh context per run, and `$done` to finish async work.
+/// a fresh `JSVirtualMachine` + serial queue + context per run (`JSContext`
+/// is not thread-safe), and `$done` to finish async work.
 ///
 /// `$httpClient` / MITM hooks are not installed yet. `timeout` covers waits
-/// for `$done` and timers; it cannot interrupt a synchronous infinite loop
-/// (JavaScriptCore has no public watchdog).
+/// for `$done` and timers. It cannot interrupt a synchronous infinite loop
+/// (JavaScriptCore has no public watchdog); such a run keeps its own queue
+/// busy, but the caller still gets `.timeout` and other runs are unaffected.
 public final class ScriptEngine: @unchecked Sendable {
     public static let defaultTimeout: TimeInterval = 5
+    /// Upper bound for one `setTimeout` delay.
+    public static let maxTimerDelay: TimeInterval = 60
 
-    private let queue = DispatchQueue(label: "prizmx.script")
-    private var virtualMachine: JSVirtualMachine?
-    private var sessions: [ObjectIdentifier: Session] = [:]
+    private let sessions = OSAllocatedUnfairLock(initialState: [ObjectIdentifier: Session]())
 
     public init() {}
 
@@ -79,26 +80,26 @@ public final class ScriptEngine: @unchecked Sendable {
         guard !source.isEmpty else { throw ScriptError.emptySource }
 
         let state = RunState()
+        // Each run gets its own queue and VM: contexts sharing a VM share its
+        // lock, so a stuck script would otherwise block every later run.
+        let queue = DispatchQueue(label: "prizmx.script.run")
         return try await withCheckedThrowingContinuation { continuation in
             state.bind(continuation)
+            // Armed before the run starts so it fires even if the queue never
+            // gets to run anything else.
+            let timeout = request.timeout.isFinite ? max(request.timeout, 0.05) : Self.defaultTimeout
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+                state.finish(.failure(ScriptError.timeout))
+            }
             queue.async {
-                self.begin(request, source: source, state: state)
+                self.begin(request, source: source, state: state, queue: queue)
             }
         }
     }
 
-    private func begin(_ request: ScriptRequest, source: String, state: RunState) {
-        let vm: JSVirtualMachine
-        if let virtualMachine {
-            vm = virtualMachine
-        } else if let created = JSVirtualMachine() {
-            virtualMachine = created
-            vm = created
-        } else {
-            state.finish(.failure(ScriptError.exception("JavaScriptCore is unavailable.")))
-            return
-        }
-        guard let context = JSContext(virtualMachine: vm) else {
+    private func begin(_ request: ScriptRequest, source: String, state: RunState, queue: DispatchQueue) {
+        guard !state.isFinished else { return }
+        guard let vm = JSVirtualMachine(), let context = JSContext(virtualMachine: vm) else {
             state.finish(.failure(ScriptError.exception("JavaScriptCore is unavailable.")))
             return
         }
@@ -111,18 +112,17 @@ public final class ScriptEngine: @unchecked Sendable {
             state: state,
             engine: self
         )
-        sessions[ObjectIdentifier(session)] = session
+        sessions.withLock { $0[ObjectIdentifier(session)] = session }
+        state.onFinish { [weak session] in
+            // Timers must not outlive the run (they retain JS values).
+            queue.async { session?.teardown() }
+        }
         session.install()
         session.evaluate()
-
-        let timeout = max(request.timeout, 0.05)
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [weak session] in
-            session?.timeout()
-        }
     }
 
     fileprivate func drop(_ session: Session) {
-        sessions[ObjectIdentifier(session)] = nil
+        sessions.withLock { $0[ObjectIdentifier(session)] = nil }
     }
 }
 
@@ -133,12 +133,24 @@ private final class RunState: @unchecked Sendable {
         var continuation: CheckedContinuation<ScriptResult, Error>?
         var pending: Result<ScriptResult, Error>?
         var resumed = false
+        var finished = false
+        var onFinish: (@Sendable () -> Void)?
     }
 
     private let storage = OSAllocatedUnfairLock(initialState: Storage())
 
     var isFinished: Bool {
-        storage.withLock { $0.resumed }
+        storage.withLock { $0.finished }
+    }
+
+    /// Runs `handler` once the run finishes (immediately if it already has).
+    func onFinish(_ handler: @escaping @Sendable () -> Void) {
+        let runNow = storage.withLock { box -> Bool in
+            if box.finished { return true }
+            box.onFinish = handler
+            return false
+        }
+        if runNow { handler() }
     }
 
     func bind(_ continuation: CheckedContinuation<ScriptResult, Error>) {
@@ -158,18 +170,22 @@ private final class RunState: @unchecked Sendable {
     }
 
     func finish(_ result: Result<ScriptResult, Error>) {
-        let continuation: CheckedContinuation<ScriptResult, Error>? = storage.withLock { box in
-            let none: CheckedContinuation<ScriptResult, Error>? = nil
-            if box.resumed { return none }
+        let (continuation, handler) = storage.withLock {
+            box -> (CheckedContinuation<ScriptResult, Error>?, (@Sendable () -> Void)?) in
+            if box.finished { return (nil, nil) }
+            box.finished = true
+            let handler = box.onFinish
+            box.onFinish = nil
             if let continuation = box.continuation {
                 box.resumed = true
                 box.continuation = nil
-                return continuation
+                return (continuation, handler)
             }
             box.pending = result
-            return none
+            return (nil, handler)
         }
         continuation?.resume(with: result)
+        handler?()
     }
 }
 
@@ -186,7 +202,9 @@ private final class Session: @unchecked Sendable {
     private var lastValue: ScriptValue = .undefined
     private var pendingWork = 0
     private var nextTimer: UInt32 = 1
-    private var timers: [UInt32: DispatchWorkItem] = [:]
+    /// Callbacks live here, not in the work items: a cancelled work item
+    /// stays queued until its deadline and must not pin the JS value.
+    private var timers: [UInt32: (work: DispatchWorkItem, callback: JSValue)] = [:]
     private var calledDone = false
 
     init(
@@ -221,6 +239,8 @@ private final class Session: @unchecked Sendable {
             self?.scheduleTimeout(callback, milliseconds: ms) ?? 0
         }
         let clearTimeout: @convention(block) (Double) -> Void = { [weak self] id in
+            // `clearTimeout(undefined)` passes NaN; `UInt32(_:)` would trap.
+            guard id.isFinite, id >= 0, id <= Double(UInt32.max) else { return }
             self?.clearTimeout(UInt32(id))
         }
 
@@ -268,41 +288,41 @@ private final class Session: @unchecked Sendable {
     private func scheduleTimeout(_ callback: JSValue?, milliseconds: Double) -> UInt32 {
         guard let callback, !state.isFinished else { return 0 }
         let id = nextTimer
-        nextTimer += 1
+        nextTimer = nextTimer == UInt32.max ? 1 : nextTimer + 1
         pendingWork += 1
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.state.isFinished else { return }
-            self.timers[id] = nil
+            guard let self, !self.state.isFinished,
+                  let entry = self.timers.removeValue(forKey: id) else { return }
             self.pendingWork -= 1
-            callback.call(withArguments: [])
+            entry.callback.call(withArguments: [])
             if let exception = self.context.exception {
                 self.fail(Self.message(from: exception))
                 return
             }
             self.finishIfIdle()
         }
-        timers[id] = work
-        queue.asyncAfter(deadline: .now() + max(0, milliseconds / 1000), execute: work)
+        timers[id] = (work, callback)
+        queue.asyncAfter(deadline: .now() + Self.timerDelay(milliseconds), execute: work)
         return id
     }
 
+    /// NaN / negative → 0; capped at `ScriptEngine.maxTimerDelay`.
+    static func timerDelay(_ milliseconds: Double) -> TimeInterval {
+        guard milliseconds.isFinite, milliseconds > 0 else {
+            return milliseconds == .infinity ? ScriptEngine.maxTimerDelay : 0
+        }
+        return min(milliseconds / 1000, ScriptEngine.maxTimerDelay)
+    }
+
     private func clearTimeout(_ id: UInt32) {
-        guard let work = timers.removeValue(forKey: id) else { return }
-        work.cancel()
+        guard let entry = timers.removeValue(forKey: id) else { return }
+        entry.work.cancel()
         pendingWork = max(0, pendingWork - 1)
     }
 
     private func finishIfIdle() {
         guard !state.isFinished, !calledDone, pendingWork == 0 else { return }
         complete(with: lastValue, fromDone: false)
-    }
-
-    func timeout() {
-        guard !state.isFinished else { return }
-        state.finish(.failure(ScriptError.timeout))
-        queue.async { [weak self] in
-            self?.teardown()
-        }
     }
 
     private func complete(with value: ScriptValue, fromDone: Bool) {
@@ -318,13 +338,15 @@ private final class Session: @unchecked Sendable {
         teardown()
     }
 
-    private func teardown() {
+    /// Engine queue only.
+    func teardown() {
         cancelTimers()
+        context.exceptionHandler = nil
         engine?.drop(self)
     }
 
     private func cancelTimers() {
-        for work in timers.values { work.cancel() }
+        for entry in timers.values { entry.work.cancel() }
         timers.removeAll()
         pendingWork = 0
     }
