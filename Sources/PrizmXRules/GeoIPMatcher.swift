@@ -100,7 +100,7 @@ public final class GeoIPMatcher: Sendable {
     }
 
     /// Returns the ISO country code (e.g. `"CN"`) or `nil` when the address is
-    /// missing / unparsable.
+    /// missing / unparsable. Multi-code records return their first code.
     public func lookup(ip: String) -> String? {
         if let address = IPv4Address(parsing: ip) { return lookup(ipv4: address) }
         if let address = IPv6Address(parsing: ip) { return lookup(ipv6: address) }
@@ -108,13 +108,23 @@ public final class GeoIPMatcher: Sendable {
     }
 
     public func lookup(ipv4 address: IPv4Address) -> String? {
+        lookupCodes(ipv4: address).first
+    }
+
+    public func lookup(ipv6 address: IPv6Address) -> String? {
+        lookupCodes(ipv6: address).first
+    }
+
+    /// All codes for the address. MetaCubeX `geoip.metadb` records can be an
+    /// array of codes (an IP in several lists); MaxMind records yield one.
+    public func lookupCodes(ipv4 address: IPv4Address) -> [String] {
         let start = ipVersion == 4 ? 0 : ipv4StartNode
         return walk(startNode: start, bitCount: 32) { index in
             UInt8(truncatingIfNeeded: (address.rawValue >> (31 - index)) & 1)
         }
     }
 
-    public func lookup(ipv6 address: IPv6Address) -> String? {
+    public func lookupCodes(ipv6 address: IPv6Address) -> [String] {
         walk(startNode: 0, bitCount: 128) { index in
             if index < 64 {
                 return UInt8(truncatingIfNeeded: (address.high >> (63 - index)) & 1)
@@ -123,8 +133,17 @@ public final class GeoIPMatcher: Sendable {
         }
     }
 
-    private func walk(startNode: UInt32, bitCount: Int, bitAt: (Int) -> UInt8) -> String? {
-        data.withUnsafeBytes { buffer -> String? in
+    /// `code` must be uppercase (rules normalize at compile time).
+    public func matches(ipv4 address: IPv4Address, code: String) -> Bool {
+        lookupCodes(ipv4: address).contains(code)
+    }
+
+    public func matches(ipv6 address: IPv6Address, code: String) -> Bool {
+        lookupCodes(ipv6: address).contains(code)
+    }
+
+    private func walk(startNode: UInt32, bitCount: Int, bitAt: (Int) -> UInt8) -> [String] {
+        data.withUnsafeBytes { buffer -> [String] in
             var node = startNode
             for index in 0..<bitCount {
                 let record = Self.readRecord(
@@ -138,15 +157,12 @@ public final class GeoIPMatcher: Sendable {
                     node = record
                     continue
                 }
-                if record == nodeCount { return nil }
+                if record == nodeCount { return [] }
                 let fileOffset = Int(record - nodeCount) + treeByteCount
-                return Self.decodeCountryCode(
-                    buffer: buffer,
-                    fileOffset: fileOffset,
-                    sectionStart: treeByteCount + 16
-                )
+                var cursor = MMDBCursor(buffer: buffer, offset: fileOffset, sectionStart: treeByteCount + 16)
+                return (Self.readCountryCodes(&cursor, depth: 0) ?? []).map { $0.uppercased() }
             }
-            return nil
+            return []
         }
     }
 
@@ -219,291 +235,152 @@ public final class GeoIPMatcher: Sendable {
         ) else {
             throw GeoIPError.metadataNotFound
         }
-        let markerEnd = range.upperBound
-        let map = data.withUnsafeBytes { buffer in
-            decodeValue(buffer: buffer, fileOffset: markerEnd, sectionStart: markerEnd)?.map
+        let markerEnd = range.upperBound - data.startIndex
+        let map = data.withUnsafeBytes { buffer -> [String: MMDBValue]? in
+            var cursor = MMDBCursor(buffer: buffer, offset: markerEnd, sectionStart: markerEnd)
+            return decodeField(&cursor, depth: 0)?.map
         }
         guard let map, !map.isEmpty else { throw GeoIPError.invalidMetadata }
         return map
     }
 
-    // MARK: Country-code decoder (avoids allocating the full value tree)
+    // MARK: Decoding (every read bounds-checked; pointer chains depth-limited)
 
-    private static func decodeCountryCode(
-        buffer: UnsafeRawBufferPointer,
-        fileOffset: Int,
-        sectionStart: Int
-    ) -> String? {
-        var cursor = fileOffset
-        return readCountryCode(buffer: buffer, cursor: &cursor, sectionStart: sectionStart, depth: 0)?
-            .uppercased()
+    /// Nesting + pointer-follow ceiling. Real country records are ~3 deep; a
+    /// self-referencing pointer in a corrupt file stops here.
+    private static let maxDepth = 32
+
+    /// Country codes without building the full value tree: a string, an
+    /// array of strings (MetaCubeX metadb), or a MaxMind country map.
+    static func readCountryCodes(_ cursor: inout MMDBCursor, depth: Int) -> [String]? {
+        guard depth < maxDepth, let field = cursor.control() else { return nil }
+        switch field {
+        case .pointer(let target):
+            var nested = cursor.at(target)
+            return readCountryCodes(&nested, depth: depth + 1)
+        case .value(let type, let size):
+            switch type {
+            case 2:
+                return cursor.string(count: size).map { [$0] }
+            case 11:
+                var codes: [String] = []
+                for _ in 0..<size {
+                    guard let item = readCountryCodes(&cursor, depth: depth + 1) else { return nil }
+                    codes.append(contentsOf: item)
+                }
+                return codes
+            case 7:
+                var country: [String]?
+                var registered: [String]?
+                var iso: [String]?
+                for _ in 0..<size {
+                    guard let key = readStringField(&cursor, depth: depth + 1) else { return nil }
+                    switch key {
+                    case "country":
+                        country = readCountryCodes(&cursor, depth: depth + 1)
+                    case "registered_country":
+                        registered = readCountryCodes(&cursor, depth: depth + 1)
+                    case "iso_code":
+                        iso = readStringField(&cursor, depth: depth + 1).map { [$0] }
+                    default:
+                        guard skipValue(&cursor, depth: depth + 1) else { return nil }
+                    }
+                }
+                return country ?? registered ?? iso
+            default:
+                return cursor.skipPayload(type: type, size: size) ? [] : nil
+            }
+        }
     }
 
-    private static func readCountryCode(
-        buffer: UnsafeRawBufferPointer,
-        cursor: inout Int,
-        sectionStart: Int,
-        depth: Int
-    ) -> String? {
-        guard depth < 16, cursor < buffer.count else { return nil }
-        let control = buffer[cursor]
-        cursor += 1
-        var type = Int(control >> 5)
-        var size = Int(control & 0x1F)
-        if type == 0 {
-            guard cursor < buffer.count else { return nil }
-            type = Int(buffer[cursor]) + 7
-            cursor += 1
+    private static func readStringField(_ cursor: inout MMDBCursor, depth: Int) -> String? {
+        guard depth < maxDepth, let field = cursor.control() else { return nil }
+        switch field {
+        case .pointer(let target):
+            var nested = cursor.at(target)
+            return readStringField(&nested, depth: depth + 1)
+        case .value(let type, let size):
+            guard type == 2 else {
+                _ = cursor.skipPayload(type: type, size: size)
+                return nil
+            }
+            return cursor.string(count: size)
         }
-        if type == 1 {
-            let pointer = decodePointer(control: control, buffer: buffer, cursor: &cursor)
-            return decodeCountryCode(
-                buffer: buffer,
-                fileOffset: sectionStart + Int(pointer),
-                sectionStart: sectionStart
-            )
+    }
+
+    /// Skips one value; `false` when the data is truncated or too deep.
+    private static func skipValue(_ cursor: inout MMDBCursor, depth: Int) -> Bool {
+        guard depth < maxDepth, let field = cursor.control() else { return false }
+        switch field {
+        case .pointer:
+            return true
+        case .value(let type, let size):
+            switch type {
+            case 7:
+                for _ in 0..<size {
+                    guard skipValue(&cursor, depth: depth + 1), skipValue(&cursor, depth: depth + 1) else {
+                        return false
+                    }
+                }
+                return true
+            case 11:
+                for _ in 0..<size where !skipValue(&cursor, depth: depth + 1) {
+                    return false
+                }
+                return true
+            default:
+                return cursor.skipPayload(type: type, size: size)
+            }
         }
-        if type != 14 {
-            size = payloadSize(size, buffer: buffer, cursor: &cursor)
+    }
+
+    private static func decodeField(_ cursor: inout MMDBCursor, depth: Int) -> MMDBValue? {
+        guard depth < maxDepth, let field = cursor.control() else { return nil }
+        let type: Int
+        let size: Int
+        switch field {
+        case .pointer(let target):
+            var nested = cursor.at(target)
+            return decodeField(&nested, depth: depth + 1)
+        case .value(let fieldType, let fieldSize):
+            type = fieldType
+            size = fieldSize
         }
         switch type {
         case 2:
-            return readString(buffer, cursor: &cursor, count: size)
-        case 7:
-            var country: String?
-            var registered: String?
-            var iso: String?
-            for _ in 0..<size {
-                guard let key = readStringField(buffer: buffer, cursor: &cursor, sectionStart: sectionStart)
-                else {
-                    skipValue(buffer: buffer, cursor: &cursor)
-                    skipValue(buffer: buffer, cursor: &cursor)
-                    continue
-                }
-                if key == "country" {
-                    country = readCountryCode(
-                        buffer: buffer, cursor: &cursor, sectionStart: sectionStart, depth: depth + 1
-                    )
-                } else if key == "registered_country" {
-                    registered = readCountryCode(
-                        buffer: buffer, cursor: &cursor, sectionStart: sectionStart, depth: depth + 1
-                    )
-                } else if key == "iso_code" {
-                    iso = readStringField(buffer: buffer, cursor: &cursor, sectionStart: sectionStart)
-                } else {
-                    skipValue(buffer: buffer, cursor: &cursor)
-                }
-            }
-            return country ?? registered ?? iso
-        default:
-            skipPayload(type: type, size: size, buffer: buffer, cursor: &cursor)
-            return nil
-        }
-    }
-
-    private static func readStringField(
-        buffer: UnsafeRawBufferPointer,
-        cursor: inout Int,
-        sectionStart: Int
-    ) -> String? {
-        guard cursor < buffer.count else { return nil }
-        let control = buffer[cursor]
-        cursor += 1
-        var type = Int(control >> 5)
-        var size = Int(control & 0x1F)
-        if type == 0 {
-            guard cursor < buffer.count else { return nil }
-            type = Int(buffer[cursor]) + 7
-            cursor += 1
-        }
-        if type == 1 {
-            let pointer = decodePointer(control: control, buffer: buffer, cursor: &cursor)
-            var nested = sectionStart + Int(pointer)
-            return readStringField(buffer: buffer, cursor: &nested, sectionStart: sectionStart)
-        }
-        if type != 14 {
-            size = payloadSize(size, buffer: buffer, cursor: &cursor)
-        }
-        guard type == 2 else {
-            skipPayload(type: type, size: size, buffer: buffer, cursor: &cursor)
-            return nil
-        }
-        return readString(buffer, cursor: &cursor, count: size)
-    }
-
-    private static func skipValue(buffer: UnsafeRawBufferPointer, cursor: inout Int) {
-        guard cursor < buffer.count else { return }
-        let control = buffer[cursor]
-        cursor += 1
-        var type = Int(control >> 5)
-        var size = Int(control & 0x1F)
-        if type == 0 {
-            guard cursor < buffer.count else { return }
-            type = Int(buffer[cursor]) + 7
-            cursor += 1
-        }
-        if type == 1 {
-            _ = decodePointer(control: control, buffer: buffer, cursor: &cursor)
-            return
-        }
-        if type != 14 {
-            size = payloadSize(size, buffer: buffer, cursor: &cursor)
-        }
-        skipPayload(type: type, size: size, buffer: buffer, cursor: &cursor)
-    }
-
-    private static func skipPayload(
-        type: Int,
-        size: Int,
-        buffer: UnsafeRawBufferPointer,
-        cursor: inout Int
-    ) {
-        switch type {
-        case 2, 4, 5, 6, 8, 9, 10:
-            cursor += size
+            return cursor.string(count: size).map(MMDBValue.string)
         case 3:
-            cursor += 8
-        case 7:
-            for _ in 0..<size {
-                skipValue(buffer: buffer, cursor: &cursor)
-                skipValue(buffer: buffer, cursor: &cursor)
-            }
-        case 11:
-            for _ in 0..<size { skipValue(buffer: buffer, cursor: &cursor) }
-        case 14:
-            break
-        case 15:
-            cursor += 4
-        default:
-            break
-        }
-    }
-
-    // MARK: Data decoder
-
-    private static func decodeValue(
-        buffer: UnsafeRawBufferPointer,
-        fileOffset: Int,
-        sectionStart: Int,
-        depth: Int = 0
-    ) -> MMDBValue? {
-        guard depth < 64, fileOffset >= 0, fileOffset < buffer.count else { return nil }
-        var cursor = fileOffset
-        guard let decoded = decodeField(buffer: buffer, cursor: &cursor, sectionStart: sectionStart, depth: depth)
-        else { return nil }
-        return decoded
-    }
-
-    private static func decodeField(
-        buffer: UnsafeRawBufferPointer,
-        cursor: inout Int,
-        sectionStart: Int,
-        depth: Int
-    ) -> MMDBValue? {
-        guard cursor < buffer.count else { return nil }
-        let control = buffer[cursor]
-        cursor += 1
-        var type = Int(control >> 5)
-        var size = Int(control & 0x1F)
-        if type == 0 {
-            guard cursor < buffer.count else { return nil }
-            type = Int(buffer[cursor]) + 7
-            cursor += 1
-        }
-
-        if type == 1 {
-            let pointer = decodePointer(control: control, buffer: buffer, cursor: &cursor)
-            return decodeValue(
-                buffer: buffer,
-                fileOffset: sectionStart + Int(pointer),
-                sectionStart: sectionStart,
-                depth: depth + 1
-            )
-        }
-
-        if type != 14 {
-            size = payloadSize(size, buffer: buffer, cursor: &cursor)
-        }
-
-        switch type {
-        case 2:
-            return .string(readString(buffer, cursor: &cursor, count: size))
-        case 3:
-            return .double(readDouble(buffer, cursor: &cursor))
+            return cursor.uint(count: 8).map { .double(Double(bitPattern: $0)) }
         case 4:
-            return .bytes(readData(buffer, cursor: &cursor, count: size))
+            return cursor.bytes(count: size).map { .bytes(Data($0)) }
         case 5, 6, 9, 10:
-            return .uint(readUInt(buffer, cursor: &cursor, count: size))
+            guard size <= 16 else { return nil }
+            return cursor.uint(count: min(size, 8), skipping: max(0, size - 8)).map(MMDBValue.uint)
         case 8:
-            return .int(readInt32(buffer, cursor: &cursor, count: size))
+            guard size <= 4 else { return nil }
+            return cursor.uint(count: size).map { .int(Int32(truncatingIfNeeded: $0)) }
         case 7:
             var map: [String: MMDBValue] = [:]
-            map.reserveCapacity(size)
             for _ in 0..<size {
-                guard let key = decodeField(buffer: buffer, cursor: &cursor, sectionStart: sectionStart, depth: depth + 1)?.string,
-                      let value = decodeField(buffer: buffer, cursor: &cursor, sectionStart: sectionStart, depth: depth + 1)
+                guard let key = decodeField(&cursor, depth: depth + 1)?.string,
+                      let value = decodeField(&cursor, depth: depth + 1)
                 else { return nil }
                 map[key] = value
             }
             return .map(map)
         case 11:
             var items: [MMDBValue] = []
-            items.reserveCapacity(size)
             for _ in 0..<size {
-                guard let item = decodeField(buffer: buffer, cursor: &cursor, sectionStart: sectionStart, depth: depth + 1)
-                else { return nil }
+                guard let item = decodeField(&cursor, depth: depth + 1) else { return nil }
                 items.append(item)
             }
             return .array(items)
         case 14:
             return .boolean(size != 0)
         case 15:
-            return .float(readFloat(buffer, cursor: &cursor))
+            return cursor.uint(count: 4).map { .float(Float(bitPattern: UInt32(truncatingIfNeeded: $0))) }
         default:
             return nil
-        }
-    }
-
-    private static func decodePointer(control: UInt8, buffer: UnsafeRawBufferPointer, cursor: inout Int) -> UInt32 {
-        let size = Int((control >> 3) & 0b11)
-        let low = UInt32(control & 0b111)
-        switch size {
-        case 0:
-            let next = UInt32(buffer[cursor]); cursor += 1
-            return (low << 8) | next
-        case 1:
-            let value = (low << 16) | (UInt32(buffer[cursor]) << 8) | UInt32(buffer[cursor + 1])
-            cursor += 2
-            return value + 2048
-        case 2:
-            let value = (low << 24)
-                | (UInt32(buffer[cursor]) << 16)
-                | (UInt32(buffer[cursor + 1]) << 8)
-                | UInt32(buffer[cursor + 2])
-            cursor += 3
-            return value + 526_336
-        default:
-            let value = uint32(buffer, cursor)
-            cursor += 4
-            return value
-        }
-    }
-
-    private static func payloadSize(_ raw: Int, buffer: UnsafeRawBufferPointer, cursor: inout Int) -> Int {
-        switch raw {
-        case 29:
-            let extra = Int(buffer[cursor]); cursor += 1
-            return 29 + extra
-        case 30:
-            let extra = Int(buffer[cursor]) << 8 | Int(buffer[cursor + 1])
-            cursor += 2
-            return 285 + extra
-        case 31:
-            let extra = Int(buffer[cursor]) << 16 | Int(buffer[cursor + 1]) << 8 | Int(buffer[cursor + 2])
-            cursor += 3
-            return 65_821 + extra
-        default:
-            return raw
         }
     }
 
@@ -517,51 +394,113 @@ public final class GeoIPMatcher: Sendable {
             | (UInt32(buffer[offset + 2]) << 8)
             | UInt32(buffer[offset + 3])
     }
+}
 
-    private static func readString(_ buffer: UnsafeRawBufferPointer, cursor: inout Int, count: Int) -> String {
-        let slice = UnsafeRawBufferPointer(rebasing: buffer[cursor..<(cursor + count)])
-        cursor += count
-        return String(decoding: slice, as: UTF8.self)
+/// Bounds-checked reader over the mapped file. `UnsafeRawBufferPointer`
+/// subscripts are unchecked in release builds, so every access goes through
+/// `byte()` / `bytes(count:)`.
+struct MMDBCursor {
+    enum Field {
+        /// Absolute file offset the pointer refers to.
+        case pointer(Int)
+        case value(type: Int, size: Int)
     }
 
-    private static func readData(_ buffer: UnsafeRawBufferPointer, cursor: inout Int, count: Int) -> Data {
-        let slice = Data(buffer[cursor..<(cursor + count)])
-        cursor += count
-        return slice
+    let buffer: UnsafeRawBufferPointer
+    var offset: Int
+    let sectionStart: Int
+
+    func at(_ target: Int) -> MMDBCursor {
+        MMDBCursor(buffer: buffer, offset: target, sectionStart: sectionStart)
     }
 
-    private static func readUInt(_ buffer: UnsafeRawBufferPointer, cursor: inout Int, count: Int) -> UInt64 {
-        var value: UInt64 = 0
-        for _ in 0..<count {
-            value = (value << 8) | UInt64(buffer[cursor])
-            cursor += 1
-        }
+    mutating func byte() -> UInt8? {
+        guard offset >= 0, offset < buffer.count else { return nil }
+        let value = buffer[offset]
+        offset += 1
         return value
     }
 
-    private static func readInt32(_ buffer: UnsafeRawBufferPointer, cursor: inout Int, count: Int) -> Int32 {
-        if count == 0 { return 0 }
-        if count == 4 {
-            let raw = uint32(buffer, cursor)
-            cursor += 4
-            return Int32(bitPattern: raw)
-        }
-        return Int32(truncatingIfNeeded: readUInt(buffer, cursor: &cursor, count: count))
+    mutating func bytes(count: Int) -> UnsafeRawBufferPointer? {
+        guard count >= 0, offset >= 0, offset <= buffer.count, buffer.count - offset >= count else { return nil }
+        let slice = UnsafeRawBufferPointer(rebasing: buffer[offset..<(offset + count)])
+        offset += count
+        return slice
     }
 
-    private static func readDouble(_ buffer: UnsafeRawBufferPointer, cursor: inout Int) -> Double {
-        var raw: UInt64 = 0
-        for _ in 0..<8 {
-            raw = (raw << 8) | UInt64(buffer[cursor])
-            cursor += 1
-        }
-        return Double(bitPattern: raw)
+    mutating func skip(_ count: Int) -> Bool {
+        bytes(count: count) != nil
     }
 
-    private static func readFloat(_ buffer: UnsafeRawBufferPointer, cursor: inout Int) -> Float {
-        let raw = uint32(buffer, cursor)
-        cursor += 4
-        return Float(bitPattern: raw)
+    /// Big-endian unsigned integer of `count` (≤ 8) bytes after `skipping` leading bytes.
+    mutating func uint(count: Int, skipping: Int = 0) -> UInt64? {
+        guard count <= 8, skip(skipping), let raw = bytes(count: count) else { return nil }
+        var value: UInt64 = 0
+        for byte in raw { value = (value << 8) | UInt64(byte) }
+        return value
+    }
+
+    mutating func string(count: Int) -> String? {
+        bytes(count: count).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    /// Control byte + extended type + size (or pointer target).
+    mutating func control() -> Field? {
+        guard let control = byte() else { return nil }
+        var type = Int(control >> 5)
+        if type == 1 {
+            let size = Int((control >> 3) & 0b11)
+            let low = UInt64(control & 0b111)
+            let target: UInt64
+            switch size {
+            case 0:
+                guard let next = uint(count: 1) else { return nil }
+                target = (low << 8) | next
+            case 1:
+                guard let next = uint(count: 2) else { return nil }
+                target = ((low << 16) | next) + 2048
+            case 2:
+                guard let next = uint(count: 3) else { return nil }
+                target = ((low << 24) | next) + 526_336
+            default:
+                guard let next = uint(count: 4) else { return nil }
+                target = next
+            }
+            return .pointer(sectionStart + Int(target))
+        }
+        var size = Int(control & 0x1F)
+        if type == 0 {
+            guard let extended = byte() else { return nil }
+            type = Int(extended) + 7
+        }
+        if type != 14 {
+            switch size {
+            case 29:
+                guard let extra = uint(count: 1) else { return nil }
+                size = 29 + Int(extra)
+            case 30:
+                guard let extra = uint(count: 2) else { return nil }
+                size = 285 + Int(extra)
+            case 31:
+                guard let extra = uint(count: 3) else { return nil }
+                size = 65_821 + Int(extra)
+            default:
+                break
+            }
+        }
+        return .value(type: type, size: size)
+    }
+
+    /// Skips a scalar payload; containers are handled by the caller.
+    mutating func skipPayload(type: Int, size: Int) -> Bool {
+        switch type {
+        case 2, 4, 5, 6, 8, 9, 10: return skip(size)
+        case 3: return skip(8)
+        case 14: return true
+        case 15: return skip(4)
+        case 7, 11: return false
+        default: return false
+        }
     }
 }
 

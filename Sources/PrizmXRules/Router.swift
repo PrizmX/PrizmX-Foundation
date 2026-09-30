@@ -168,17 +168,26 @@ public struct RouteRule: Hashable, Sendable {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
         let host = String(parts[0])
-        let prefixText = parts.count == 2 ? String(parts[1]) : nil
+        // A present-but-malformed prefix (`/`, `/abc`, `/-1`) is an error, not a host route.
+        var prefix: UInt8?
+        if parts.count == 2 {
+            let digits = parts[1]
+            guard !digits.isEmpty, digits.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+                  let parsed = UInt8(digits) else {
+                throw RuleCompileError.invalidCIDR(text)
+            }
+            prefix = parsed
+        }
 
         if let v4 = IPv4Address(parsing: host) {
-            let prefix = prefixText.flatMap { UInt8($0) } ?? 32
-            guard prefix <= 32 else { throw RuleCompileError.invalidCIDR(text) }
-            return prefix == 32 ? .ipv4(v4) : .ipv4CIDR(v4, prefixLength: prefix)
+            let length = prefix ?? 32
+            guard length <= 32 else { throw RuleCompileError.invalidCIDR(text) }
+            return length == 32 ? .ipv4(v4) : .ipv4CIDR(v4, prefixLength: length)
         }
         if let v6 = IPv6Address(parsing: host) {
-            let prefix = prefixText.flatMap { UInt8($0) } ?? 128
-            guard prefix <= 128 else { throw RuleCompileError.invalidCIDR(text) }
-            return prefix == 128 ? .ipv6(v6) : .ipv6CIDR(v6, prefixLength: prefix)
+            let length = prefix ?? 128
+            guard length <= 128 else { throw RuleCompileError.invalidCIDR(text) }
+            return length == 128 ? .ipv6(v6) : .ipv6CIDR(v6, prefixLength: length)
         }
         throw RuleCompileError.invalidCIDR(text)
     }
@@ -192,14 +201,38 @@ public struct RouteRule: Hashable, Sendable {
     }
 }
 
+/// Real addresses for a domain destination, looked up at most once per match.
+public struct ResolvedAddresses: Sendable, Equatable {
+    public var ipv4: IPv4Address?
+    public var ipv6: IPv6Address?
+
+    public init(ipv4: IPv4Address? = nil, ipv6: IPv6Address? = nil) {
+        self.ipv4 = ipv4
+        self.ipv6 = ipv6
+    }
+}
+
 /// Clash / sing-box style routing: rules are tried **in list order**, first
 /// match wins. Port-scoped rules that do not match the port are skipped.
 public final class Router: Sendable {
 
     public let rules: [RouteRule]
     public let defaultPolicy: Policy
+    /// True when any rule needs a real IP (GEOIP / CIDR) unless `no-resolve`.
+    public let needsIPResolution: Bool
     private let geoIP: GeoIPMatcher?
     private let geosite: GeositeMatcher?
+    /// `rules` with host payloads normalized once (not per match).
+    private let compiled: [CompiledRule]
+
+    private struct CompiledRule: Sendable {
+        var rule: RouteRule
+        var matcher: RouteRule.HostMatcher
+        /// `"." + suffix` for `.domainSuffix`, precomputed.
+        var dottedSuffix: String
+        /// Domain destinations need a DNS answer before this rule can match.
+        var needsResolution: Bool
+    }
 
     public init(
         rules: [RouteRule] = [],
@@ -211,17 +244,33 @@ public final class Router: Sendable {
         self.defaultPolicy = defaultPolicy
         self.geoIP = geoIP
         self.geosite = geosite
+        let compiled = rules.map(Self.compile)
+        self.compiled = compiled
+        self.needsIPResolution = compiled.contains(where: \.needsResolution)
     }
 
-    /// True when any rule needs a real IP (GEOIP / CIDR) unless `no-resolve`.
-    public var needsIPResolution: Bool {
-        rules.contains { rule in
-            if rule.noResolve { return false }
-            switch rule.matcher {
-            case .geoIP, .ipv4, .ipv4CIDR, .ipv6, .ipv6CIDR: return true
-            default: return false
-            }
+    private static func compile(_ rule: RouteRule) -> CompiledRule {
+        var matcher = rule.matcher
+        var dotted = ""
+        var needsResolution = false
+        switch rule.matcher {
+        case .domain(let value):
+            matcher = .domain(value.lowercased())
+        case .domainSuffix(let value):
+            let key = RouteRule.normalizeSuffix(value)
+            matcher = .domainSuffix(key)
+            dotted = "." + key
+        case .domainKeyword(let value):
+            matcher = .domainKeyword(value.lowercased())
+        case .geoIP(let code):
+            matcher = .geoIP(code: code.uppercased())
+            needsResolution = !rule.noResolve
+        case .ipv4, .ipv4CIDR, .ipv6, .ipv6CIDR:
+            needsResolution = !rule.noResolve
+        case .geosite, .matchAll:
+            break
         }
+        return CompiledRule(rule: rule, matcher: matcher, dottedSuffix: dotted, needsResolution: needsResolution)
     }
 
     /// Primary API: policy for a destination endpoint.
@@ -238,12 +287,35 @@ public final class Router: Sendable {
         resolvedIPv4: IPv4Address? = nil,
         resolvedIPv6: IPv6Address? = nil
     ) -> (policy: Policy, rule: RouteRule?) {
-        for rule in rules {
-            if matches(rule, endpoint: endpoint, resolvedIPv4: resolvedIPv4, resolvedIPv6: resolvedIPv6) {
-                return (rule.policy, rule)
+        for entry in compiled {
+            if matches(entry, endpoint: endpoint, resolvedIPv4: resolvedIPv4, resolvedIPv6: resolvedIPv6) {
+                return (entry.rule.policy, entry.rule)
             }
         }
         return (defaultPolicy, nil)
+    }
+
+    /// Lazy variant: rules run in order and `resolve` is called at most once,
+    /// only when a domain destination first reaches a rule that needs a real
+    /// IP (GEOIP / IP-CIDR without `no-resolve`). A domain rule that matches
+    /// earlier never triggers a lookup. Returns the addresses if one happened.
+    public func matchResult(
+        endpoint: Endpoint,
+        resolve: () async -> ResolvedAddresses
+    ) async -> (policy: Policy, rule: RouteRule?, resolved: ResolvedAddresses?) {
+        var resolved: ResolvedAddresses?
+        let isDomain: Bool
+        if case .domain = endpoint.host { isDomain = true } else { isDomain = false }
+        for entry in compiled {
+            if let port = entry.rule.port, port != endpoint.port { continue }
+            if isDomain, entry.needsResolution, resolved == nil {
+                resolved = await resolve()
+            }
+            if matches(entry, endpoint: endpoint, resolvedIPv4: resolved?.ipv4, resolvedIPv6: resolved?.ipv6) {
+                return (entry.rule.policy, entry.rule, resolved)
+            }
+        }
+        return (defaultPolicy, nil, resolved)
     }
 
     /// Queries a policy given a host name (domain or IP literal) and a port.
@@ -265,24 +337,23 @@ public final class Router: Sendable {
     }
 
     private func matches(
-        _ rule: RouteRule,
+        _ entry: CompiledRule,
         endpoint: Endpoint,
-        resolvedIPv4: IPv4Address? = nil,
-        resolvedIPv6: IPv6Address? = nil
+        resolvedIPv4: IPv4Address?,
+        resolvedIPv6: IPv6Address?
     ) -> Bool {
+        let rule = entry.rule
         if let port = rule.port, port != endpoint.port { return false }
-        switch rule.matcher {
+        switch entry.matcher {
         case .domain(let domain):
             guard case .domain(let host) = endpoint.host else { return false }
-            return host == domain.lowercased()
-        case .domainSuffix(let suffix):
-            guard case .domain(let host) = endpoint.host else { return false }
-            let key = RouteRule.normalizeSuffix(suffix)
-            guard !key.isEmpty else { return false }
-            return host == key || host.hasSuffix("." + key)
+            return host == domain
+        case .domainSuffix(let key):
+            guard case .domain(let host) = endpoint.host, !key.isEmpty else { return false }
+            return host == key || host.hasSuffix(entry.dottedSuffix)
         case .domainKeyword(let keyword):
             guard case .domain(let host) = endpoint.host else { return false }
-            return host.contains(keyword.lowercased())
+            return host.contains(keyword)
         case .ipv4(let address):
             if case .ipv4(let host) = endpoint.host { return host == address }
             return !rule.noResolve && resolvedIPv4 == address
@@ -302,15 +373,16 @@ public final class Router: Sendable {
             guard !rule.noResolve, let resolvedIPv6 else { return false }
             return Self.ipv6(resolvedIPv6, in: network, prefix: prefixLength)
         case .geoIP(code: let code):
+            guard let geoIP else { return false }
             switch endpoint.host {
             case .ipv4(let address):
-                return geoIP?.lookup(ipv4: address) == code
+                return geoIP.matches(ipv4: address, code: code)
             case .ipv6(let address):
-                return geoIP?.lookup(ipv6: address) == code
+                return geoIP.matches(ipv6: address, code: code)
             case .domain:
                 if rule.noResolve { return false }
-                if let resolvedIPv4, geoIP?.lookup(ipv4: resolvedIPv4) == code { return true }
-                if let resolvedIPv6, geoIP?.lookup(ipv6: resolvedIPv6) == code { return true }
+                if let resolvedIPv4, geoIP.matches(ipv4: resolvedIPv4, code: code) { return true }
+                if let resolvedIPv6, geoIP.matches(ipv6: resolvedIPv6, code: code) { return true }
                 return false
             }
         case .geosite(tag: let tag):
