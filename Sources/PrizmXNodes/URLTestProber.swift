@@ -1,4 +1,5 @@
 import Foundation
+import os
 import PrizmXProtocols
 
 /// Clash/Surge url-test: time a request to `url` through the node.
@@ -12,18 +13,46 @@ enum URLTestProber: Sendable {
         url: URL,
         timeout: Duration = .seconds(5)
     ) async -> Duration? {
-        await withTaskGroup(of: Duration?.self) { group in
-            group.addTask {
-                await run(node: node, url: url)
+        guard let request = request(for: url),
+              let connection = try? NodeFactory.makeConnection(from: node, to: request.endpoint)
+        else { return nil }
+        return await probe(connection: connection, url: url, timeout: timeout)
+    }
+
+    /// Outbound reads ignore task cancellation, so a group-based race would
+    /// wait for the stuck read anyway. The deadline instead closes the
+    /// connection (unblocking the read) and returns without awaiting it.
+    static func probe(
+        connection: any OutboundConnection,
+        url: URL,
+        timeout: Duration
+    ) async -> Duration? {
+        let work = Task { await run(connection: connection, url: url) }
+        let outcome: Duration?? = await withCheckedContinuation { continuation in
+            let slot = OSAllocatedUnfairLock<CheckedContinuation<Duration??, Never>?>(initialState: continuation)
+            let take: @Sendable () -> CheckedContinuation<Duration??, Never>? = {
+                slot.withLock { current in
+                    let value = current
+                    current = nil
+                    return value
+                }
             }
-            group.addTask {
+            let timer = Task {
                 try? await Task.sleep(for: timeout)
-                return nil
+                take()?.resume(returning: nil)
             }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first ?? nil
+            Task {
+                let value = await work.value
+                timer.cancel()
+                take()?.resume(returning: .some(value))
+            }
         }
+        guard let finished = outcome else {
+            work.cancel()
+            Task { await connection.close() }
+            return nil
+        }
+        return finished
     }
 
     static func request(for url: URL) -> (endpoint: Endpoint, payload: Data?, https: Bool)? {
@@ -47,11 +76,10 @@ enum URLTestProber: Sendable {
         return (endpoint, Data(header.utf8), false)
     }
 
-    private static func run(node: OutboundNode, url: URL) async -> Duration? {
+    private static func run(connection: any OutboundConnection, url: URL) async -> Duration? {
         guard let request = request(for: url) else { return nil }
         let start = ContinuousClock.now
         do {
-            let connection = try NodeFactory.makeConnection(from: node, to: request.endpoint)
             try await connection.open()
             if request.https {
                 guard let host = url.host else { return nil }
@@ -70,6 +98,7 @@ enum URLTestProber: Sendable {
             await connection.close()
             return ContinuousClock.now - start
         } catch {
+            await connection.close()
             return nil
         }
     }
