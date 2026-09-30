@@ -19,9 +19,33 @@ public enum TrafficSniffer: Sendable {
             return sniffTLS(data)
         }
         if first >= 0x41 && first <= 0x5A {
-            return sniffHTTP(data)
+            // Only wait for a header block when the bytes start like a
+            // request line; `SSH-2.0-…` and other text banners end here.
+            switch methodPrefix(data) {
+            case .needMore: return .needMore
+            case .none: return .none
+            case .hostname: return sniffHTTP(data)
+            }
         }
         return .none
+    }
+
+    private static let methods: [[UInt8]] = [
+        "GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "TRACE", "CONNECT", "PRI",
+    ].map { Array($0.utf8) + [0x20] }
+
+    /// `.hostname("")` = request-line method matched, `.needMore` = still a
+    /// possible method prefix, `.none` = not HTTP.
+    private static func methodPrefix(_ data: Data) -> TrafficSniff {
+        let head = Array(data.prefix(8))
+        var possible = false
+        for method in methods {
+            let count = min(head.count, method.count)
+            guard head[0..<count].elementsEqual(method[0..<count]) else { continue }
+            if head.count >= method.count { return .hostname("") }
+            possible = true
+        }
+        return possible ? .needMore : .none
     }
 
     private static func sniffHTTP(_ data: Data) -> TrafficSniff {

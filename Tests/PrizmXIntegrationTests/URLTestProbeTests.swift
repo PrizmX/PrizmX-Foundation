@@ -117,3 +117,31 @@ private func anytlsNode(id: String, host: String, port: UInt16) -> OutboundNode 
     #expect(hello.first == 0x16)
     #expect(TrafficSniffer.sniff(hello) == .hostname("example.com"))
 }
+
+@Test func urlTestProbeTimesOutOnStuckReadAndClosesConnection() async throws {
+    // Read never completes on its own and ignores cancellation.
+    let stuck = ScriptedOutbound(halfClose: false)
+    let started = ContinuousClock.now
+    let result = await URLTestProber.probe(
+        connection: stuck,
+        url: URL(string: "http://probe.example/generate_204")!,
+        timeout: .milliseconds(150)
+    )
+    #expect(result == nil)
+    #expect(ContinuousClock.now - started < .seconds(2))
+    for _ in 0..<100 where !stuck.closed {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(stuck.closed)
+}
+
+@Test func urlTestProbeMeasuresRespondingConnection() async {
+    let peer = ScriptedOutbound(halfClose: false)
+    peer.feed(Data("HTTP/1.1 204 No Content\r\n\r\n".utf8))
+    let result = await URLTestProber.probe(
+        connection: peer,
+        url: URL(string: "http://probe.example/generate_204")!,
+        timeout: .seconds(5)
+    )
+    #expect(result != nil)
+}

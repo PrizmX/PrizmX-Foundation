@@ -119,9 +119,46 @@ public final class Engine: Sendable {
         }
     }
 
+    /// Rule match that resolves a domain only when the walk first reaches a
+    /// GEOIP / IP-CIDR rule that needs it (once). A domain rule matching
+    /// earlier never sends the name to the direct resolver.
+    public func resolveAndMatch(_ endpoint: Endpoint) async -> (policy: Policy, rule: String) {
+        let state = runtime.withLock { $0 }
+        guard state.mode == .rule else { return matchTarget(endpoint) }
+        let dns = self.dns
+        let result = await router.matchResult(endpoint: endpoint) {
+            guard case .domain(let domain) = endpoint.host else { return ResolvedAddresses() }
+            // The answer lands in DNSClient's cache, so a DIRECT dial of the
+            // same name reuses it instead of querying again.
+            return ResolvedAddresses(ipv4: try? await dns.resolve(domain, role: .direct))
+        }
+        return (result.policy, result.rule?.inspectorLabel ?? "FINAL")
+    }
+
+    /// Effective policy with lazy resolution (see `resolveAndMatch`).
+    public func resolvePolicy(for endpoint: Endpoint) async -> Policy {
+        if let hosts = hostsMapping(for: endpoint) {
+            return policy(for: endpoint, resolvedIPv4: hosts.ipv4.first, resolvedIPv6: hosts.ipv6.first)
+        }
+        return await resolveAndMatch(endpoint).policy
+    }
+
     /// Matches `target` and returns the corresponding outbound connection.
     public func dispatch(target: Endpoint, command: VLESSCommand = .tcp) throws -> any OutboundConnection {
         try dispatchDetailed(target: target, command: command).connection
+    }
+
+    /// `dispatchDetailed` with lazy IP resolution: the relay entry point.
+    public func resolveAndDispatch(
+        target: Endpoint,
+        command: VLESSCommand = .tcp
+    ) async throws -> (connection: any OutboundConnection, rule: String) {
+        if let hosts = hostsMapping(for: target) {
+            let matched = matchTarget(target, resolvedIPv4: hosts.ipv4.first, resolvedIPv6: hosts.ipv6.first)
+            return try connection(for: target, command: command, matched: matched, hosts: hosts)
+        }
+        let matched = await resolveAndMatch(target)
+        return try connection(for: target, command: command, matched: matched, hosts: nil)
     }
 
     public func dispatchDetailed(
@@ -130,17 +167,26 @@ public final class Engine: Sendable {
         resolvedIPv4: IPv4Address? = nil,
         resolvedIPv6: IPv6Address? = nil
     ) throws -> (connection: any OutboundConnection, rule: String) {
-        // Hosts-file hit: the mapping is a local binding. Dial it here even
-        // when the rule would proxy — a remote node cannot apply /etc/hosts,
-        // and `127.0.0.1` / LAN entries would otherwise never take effect
-        // once the system proxy is on. REJECT still wins (IP rules see the
-        // mapped address).
         let hosts = hostsMapping(for: target)
         let matched = matchTarget(
             target,
             resolvedIPv4: hosts?.ipv4.first ?? resolvedIPv4,
             resolvedIPv6: hosts?.ipv6.first ?? resolvedIPv6
         )
+        return try connection(for: target, command: command, matched: matched, hosts: hosts)
+    }
+
+    private func connection(
+        for target: Endpoint,
+        command: VLESSCommand,
+        matched: (policy: Policy, rule: String),
+        hosts: SystemHosts.Mapping?
+    ) throws -> (connection: any OutboundConnection, rule: String) {
+        // Hosts-file hit: the mapping is a local binding. Dial it here even
+        // when the rule would proxy — a remote node cannot apply /etc/hosts,
+        // and `127.0.0.1` / LAN entries would otherwise never take effect
+        // once the system proxy is on. REJECT still wins (IP rules see the
+        // mapped address).
         if let hosts {
             if case .reject = matched.policy {
                 TunnelLog.write(.info, "reject \(target)")
@@ -185,8 +231,7 @@ public final class Engine: Sendable {
     /// `select` → DIRECT) still receives FakeIP so the flow enters TUN.
     public func dnsPolicy(host: String) async -> Policy {
         let endpoint = Endpoint(domain: host, port: 443)
-        let ipv4 = await resolveIPv4(for: endpoint)
-        switch matchTarget(endpoint, resolvedIPv4: ipv4).policy {
+        switch await resolvePolicy(for: endpoint) {
         case .direct:
             return .direct
         case .reject:

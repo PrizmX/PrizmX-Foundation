@@ -21,9 +21,16 @@ public protocol InboundStream: Sendable {
     func read() async throws -> Data?
     func write(_ data: Data) async throws
     func close() async
+    /// Half-close: send end-of-stream to the client (TCP FIN) while `read`
+    /// keeps delivering its remaining upload. Only called when
+    /// `supportsHalfClose` is true.
+    func closeWrite() async
+    var supportsHalfClose: Bool { get }
 }
 
 extension InboundStream {
+    public func closeWrite() async { await close() }
+    public var supportsHalfClose: Bool { false }
     public var clientAddress: String { "" }
     public var clientPort: UInt16 { 0 }
     public var isTunnelInbound: Bool { false }
@@ -55,11 +62,10 @@ public enum EngineTCPRelay: Sendable {
         } else {
             attribution = nil
         }
-        let ipv4 = await engine.resolveIPv4(for: target)
         let outbound: any OutboundConnection
         let rule: String
         do {
-            let dispatched = try engine.dispatchDetailed(target: target, resolvedIPv4: ipv4)
+            let dispatched = try await engine.resolveAndDispatch(target: target)
             outbound = dispatched.connection
             rule = dispatched.rule
             try await DNSClient.$current.withValue(engine.dns) {
@@ -91,47 +97,12 @@ public enum EngineTCPRelay: Sendable {
             "flow opened \(target) via \(via)\(attribution.map { " app=\($0.accountingKey)" } ?? "")"
         )
         let started = ContinuousClock.now
-        let tally = FlowTally()
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                do {
-                    while let chunk = try await inbound.read() {
-                        try await outbound.writeAll(chunk)
-                        tally.addUp(chunk.count)
-                        let bytes = UInt64(chunk.count)
-                        engine.traffic.addBytes(up: bytes, down: 0, via: via, app: attribution, transport: .tcp)
-                        engine.traffic.addFlowBytes(id: flowID, up: bytes, down: 0)
-                    }
-                    tally.clientEnded("eof")
-                } catch {
-                    tally.clientEnded("write-error")
-                }
-                await outbound.close()
-            }
-            group.addTask {
-                do {
-                    while true {
-                        let data = try await outbound.readData(upTo: 16 * 1024)
-                        if data.isEmpty {
-                            tally.remoteEnded("eof")
-                            break
-                        }
-                        try await inbound.write(data)
-                        tally.addDown(data.count)
-                        let bytes = UInt64(data.count)
-                        engine.traffic.addBytes(up: 0, down: bytes, via: via, app: attribution, transport: .tcp)
-                        engine.traffic.addFlowBytes(id: flowID, up: 0, down: bytes)
-                    }
-                } catch {
-                    tally.remoteEnded("error")
-                }
-                await inbound.close()
-            }
-            await group.waitForAll()
+        let snapshot = await splice(inbound: inbound, outbound: outbound) { up, down in
+            engine.traffic.addBytes(up: up, down: down, via: via, app: attribution, transport: .tcp)
+            engine.traffic.addFlowBytes(id: flowID, up: up, down: down)
         }
         let elapsed = started.duration(to: ContinuousClock.now)
         let ms = Int(elapsed / .milliseconds(1))
-        let snapshot = tally.snapshot()
         engine.traffic.flowDidClose(
             FlowRecord(
                 id: flowID,
@@ -155,6 +126,72 @@ public enum EngineTCPRelay: Sendable {
         )
     }
 
+    /// Bidirectional copy until both directions end. Inbound EOF half-closes
+    /// the outbound when it supports that (else closes it); outbound EOF
+    /// half-closes the inbound likewise. Once one side has finished, the
+    /// other is bounded by `LingerWatch`.
+    static func splice(
+        inbound: any InboundStream,
+        outbound: any OutboundConnection,
+        record: @escaping @Sendable (_ up: UInt64, _ down: UInt64) -> Void
+    ) async -> FlowTally.Snapshot {
+        let tally = FlowTally()
+        let linger = LingerWatch()
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                do {
+                    while let chunk = try await inbound.read() {
+                        tally.touch()
+                        guard !chunk.isEmpty else { continue }
+                        try await outbound.writeAll(chunk)
+                        tally.addUp(chunk.count)
+                        record(UInt64(chunk.count), 0)
+                    }
+                    tally.clientEnded("eof")
+                    if outbound.supportsHalfClose {
+                        // Keep the downlink until the remote finishes too
+                        // (bounded by the linger watch).
+                        await outbound.closeWrite()
+                        linger.start(tally: tally, outbound: outbound, inbound: inbound)
+                        return
+                    }
+                } catch {
+                    tally.clientEnded("write-error")
+                }
+                await outbound.close()
+            }
+            group.addTask {
+                do {
+                    while true {
+                        let data = try await outbound.readData(upTo: 16 * 1024)
+                        tally.touch()
+                        if data.isEmpty {
+                            tally.remoteEnded("eof")
+                            break
+                        }
+                        try await inbound.write(data)
+                        tally.addDown(data.count)
+                        record(0, UInt64(data.count))
+                    }
+                    if inbound.supportsHalfClose {
+                        // FIN toward the client; its remaining upload still flows.
+                        await inbound.closeWrite()
+                        linger.start(tally: tally, outbound: outbound, inbound: inbound)
+                        return
+                    }
+                } catch {
+                    tally.remoteEnded("error")
+                }
+                await inbound.close()
+            }
+            await group.waitForAll()
+        }
+        linger.cancel()
+        await outbound.close()
+        await inbound.close()
+        return tally.snapshot()
+    }
+
     static func isLoopbackClient(_ address: String) -> Bool {
         if address.isEmpty { return true }
         var host = address
@@ -168,107 +205,188 @@ public enum EngineTCPRelay: Sendable {
         return host == "127.0.0.1" || host.hasPrefix("127.") || lowered == "::1" || lowered == "localhost"
     }
 
+    /// Total sniff budget. Server-speaks-first protocols (SSH, SMTP, MySQL)
+    /// send nothing, so the wait must end on time without losing a late read.
+    static let sniffBudget: Duration = .milliseconds(400)
+
     /// Peek at the first client bytes on IP destinations so DOMAIN / GEOSITE
     /// rules can match (Clash sniffing). Domain endpoints (FakeIP) skip this.
-    private static func prepare(stream: some InboundStream) async -> PreparedStream {
+    ///
+    /// `read()` implementations ignore task cancellation, so a timed-out read
+    /// is never abandoned: it keeps running and the returned stream's first
+    /// `read()` awaits it, so bytes arriving after the budget are not lost.
+    static func prepare(
+        stream: some InboundStream,
+        budget: Duration = sniffBudget
+    ) async -> PreparedStream {
         if case .domain = stream.endpoint.host {
             return PreparedStream(stream: stream, endpoint: stream.endpoint)
         }
         var prefix = Data()
-        let deadline = ContinuousClock.now + .milliseconds(400)
-        while prefix.count < TrafficSniffer.maxPrefix {
-            switch TrafficSniffer.sniff(prefix) {
-            case .hostname(let name):
-                return PreparedStream(
-                    stream: PrefixedInboundStream(inner: stream, prefix: prefix),
-                    endpoint: Endpoint(domain: name, port: stream.endpoint.port)
-                )
-            case .none:
-                return PreparedStream(
-                    stream: PrefixedInboundStream(inner: stream, prefix: prefix),
-                    endpoint: stream.endpoint
-                )
-            case .needMore:
-                break
-            }
+        var pending: Task<Result<Data?, Error>, Never>?
+        let deadline = ContinuousClock.now + budget
+        sniffing: while prefix.count < TrafficSniffer.maxPrefix {
+            if case .needMore = TrafficSniffer.sniff(prefix) {} else { break }
             let remaining = deadline - ContinuousClock.now
             if remaining <= .zero { break }
-            let chunk: Data?
-            do {
-                chunk = try await read(stream, timeout: remaining)
-            } catch {
-                break
+            let read = pending ?? Task {
+                do { return .success(try await stream.read()) } catch { return .failure(error) }
             }
-            guard let chunk, !chunk.isEmpty else { break }
-            prefix.append(chunk)
+            pending = read
+            guard let outcome = await Self.value(of: read, within: remaining) else { break }
+            switch outcome {
+            case .success(let chunk?) where !chunk.isEmpty:
+                pending = nil
+                prefix.append(chunk)
+            case .success(let chunk?) where chunk.isEmpty:
+                pending = nil
+            default:
+                // EOF / error: keep the finished task so the relay sees it.
+                break sniffing
+            }
         }
-        if case .hostname(let name) = TrafficSniffer.sniff(prefix) {
-            return PreparedStream(
-                stream: PrefixedInboundStream(inner: stream, prefix: prefix),
-                endpoint: Endpoint(domain: name, port: stream.endpoint.port)
-            )
+        let wrapped = PrefixedInboundStream(inner: stream, prefix: prefix, pending: pending)
+        if case .hostname(let name) = TrafficSniffer.sniff(prefix),
+           let endpoint = sniffedEndpoint(name, port: stream.endpoint.port) {
+            return PreparedStream(stream: wrapped, endpoint: endpoint)
         }
-        return PreparedStream(
-            stream: PrefixedInboundStream(inner: stream, prefix: prefix),
-            endpoint: stream.endpoint
-        )
+        return PreparedStream(stream: wrapped, endpoint: stream.endpoint)
     }
 
-    private static func read(_ stream: some InboundStream, timeout: Duration) async throws -> Data? {
-        try await withThrowingTaskGroup(of: Data?.self) { group in
-            group.addTask { try await stream.read() }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                return nil
+    /// A sniffed name becomes the routing target only when it is a real
+    /// domain. IP literals (`Host: 192.168.1.1`, `[::1]`) keep the original
+    /// IP endpoint so IP-CIDR / GEOIP rules and the direct dial still work.
+    static func sniffedEndpoint(_ name: String, port: UInt16) -> Endpoint? {
+        var host = name
+        if host.hasPrefix("["), host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        if host.hasSuffix(".") { host.removeLast() }
+        guard !host.isEmpty,
+              IPv4Address(parsing: host) == nil,
+              IPv6Address(parsing: host) == nil
+        else { return nil }
+        return Endpoint(domain: host, port: port)
+    }
+
+    /// Waits for `task` up to `timeout` without cancelling or awaiting it
+    /// past the deadline. `nil` means the deadline won.
+    static func value<T: Sendable>(of task: Task<T, Never>, within timeout: Duration) async -> T? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+            let slot = OSAllocatedUnfairLock<CheckedContinuation<T?, Never>?>(initialState: continuation)
+            let take: @Sendable () -> CheckedContinuation<T?, Never>? = { slot.withLock { current in
+                let value = current
+                current = nil
+                return value
+            } }
+            let timer = Task {
+                try? await Task.sleep(for: timeout)
+                take()?.resume(returning: nil)
             }
-            let first = try await group.next() ?? nil
-            group.cancelAll()
-            return first ?? nil
+            Task {
+                let value = await task.value
+                timer.cancel()
+                take()?.resume(returning: value)
+            }
         }
     }
 }
 
-private struct PreparedStream: Sendable {
+struct PreparedStream: Sendable {
     var stream: any InboundStream
     var endpoint: Endpoint
 }
 
-private final class PrefixedInboundStream: InboundStream, @unchecked Sendable {
+/// Replays the sniffed prefix, then the read still in flight from sniffing
+/// (if any), then the inner stream.
+final class PrefixedInboundStream: InboundStream, @unchecked Sendable {
     let endpoint: Endpoint
     var clientAddress: String { inner.clientAddress }
     var clientPort: UInt16 { inner.clientPort }
     var isTunnelInbound: Bool { inner.isTunnelInbound }
     var listenPort: UInt16? { inner.listenPort }
+    var supportsHalfClose: Bool { inner.supportsHalfClose }
     private let inner: any InboundStream
-    private let leftover = OSAllocatedUnfairLock<Data>(initialState: Data())
+    private struct Buffered {
+        var prefix: Data
+        var pending: Task<Result<Data?, Error>, Never>?
+    }
+    private let buffered: OSAllocatedUnfairLock<Buffered>
 
-    init(inner: some InboundStream, prefix: Data) {
+    init(inner: some InboundStream, prefix: Data, pending: Task<Result<Data?, Error>, Never>? = nil) {
         self.endpoint = inner.endpoint
         self.inner = inner
-        leftover.withLock { $0 = prefix }
+        self.buffered = OSAllocatedUnfairLock(initialState: Buffered(prefix: prefix, pending: pending))
     }
 
     func read() async throws -> Data? {
-        let pending = leftover.withLock { buffer -> Data? in
-            guard !buffer.isEmpty else { return nil }
-            let data = buffer
-            buffer = Data()
-            return data
+        let (prefix, pending) = buffered.withLock { state -> (Data, Task<Result<Data?, Error>, Never>?) in
+            if !state.prefix.isEmpty {
+                let data = state.prefix
+                state.prefix = Data()
+                return (data, nil)
+            }
+            let task = state.pending
+            state.pending = nil
+            return (Data(), task)
         }
-        if let pending { return pending.isEmpty ? try await inner.read() : pending }
+        if !prefix.isEmpty { return prefix }
+        if let pending { return try await pending.value.get() }
         return try await inner.read()
     }
 
     func write(_ data: Data) async throws { try await inner.write(data) }
     func close() async { await inner.close() }
+    func closeWrite() async { await inner.closeWrite() }
 }
 
-private final class FlowTally: @unchecked Sendable {
+/// Bounds a half-closed flow: once one direction has finished, the flow is
+/// torn down after `limit` without activity on the other.
+final class LingerWatch: @unchecked Sendable {
+    static let limit: Duration = .seconds(60)
+    private let task = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
+
+    func start(tally: FlowTally, outbound: any OutboundConnection, inbound: any InboundStream) {
+        task.withLock { current in
+            guard current == nil else { return }
+            current = Task {
+                while !Task.isCancelled {
+                    let idle = ContinuousClock.now - tally.lastActivity
+                    if idle >= Self.limit {
+                        await outbound.close()
+                        await inbound.close()
+                        return
+                    }
+                    try? await Task.sleep(for: Self.limit - idle)
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        task.withLock { current in
+            current?.cancel()
+            current = Task {}
+        }
+    }
+}
+
+final class FlowTally: @unchecked Sendable {
     private let lock = NSLock()
     private var up = 0
     private var down = 0
     private var client = "eof"
     private var remote = "eof"
+    private var activity = ContinuousClock.now
+
+    var lastActivity: ContinuousClock.Instant {
+        lock.lock(); defer { lock.unlock() }
+        return activity
+    }
+
+    func touch() {
+        lock.lock(); activity = ContinuousClock.now; lock.unlock()
+    }
 
     func addUp(_ count: Int) {
         lock.lock(); up += count; lock.unlock()
