@@ -52,6 +52,10 @@ protocol AnyTLSSessionCore: AnyObject, Sendable {
 /// One stream inside an `AnyTLSSession`. Feeds `OutboundConnection` adapters:
 /// `readData` blocks until PSH payload, FIN, or failure.
 public final class AnyTLSSessionStream: @unchecked Sendable {
+    /// Per-stream receive cap. Past it the session pump stops reading the
+    /// shared TLS connection until this stream's consumer drains below it.
+    static let receiveBufferLimit = 2 * 1024 * 1024
+
     public let id: UInt32
     public let target: Endpoint
 
@@ -64,6 +68,7 @@ public final class AnyTLSSessionStream: @unchecked Sendable {
     private var closed = false
     private var ackContinuation: CheckedContinuation<Void, Error>?
     private var acknowledged = false
+    private var drainWaiter: CheckedContinuation<Void, Never>?
 
     init(id: UInt32, target: Endpoint, core: AnyTLSSessionCore) {
         self.id = id
@@ -79,16 +84,46 @@ public final class AnyTLSSessionStream: @unchecked Sendable {
 
     // MARK: Session → stream events
 
-    func ingest(_ payload: Data) {
+    /// Delivers a PSH payload. Returns `true` when the unread backlog is at
+    /// or above `receiveBufferLimit` (caller should `waitUntilDrained`).
+    @discardableResult
+    func ingest(_ payload: Data) -> Bool {
         lock.lock()
+        if closed || failure != nil {
+            lock.unlock()
+            return false
+        }
         if let waiter {
             self.waiter = nil
             lock.unlock()
             waiter.resume(returning: payload)
-            return
+            return false
         }
         buffer.append(payload)
+        let full = buffer.count >= Self.receiveBufferLimit
         lock.unlock()
+        return full
+    }
+
+    /// Suspends until the backlog drops below `receiveBufferLimit`, or the
+    /// stream is closed / failed.
+    func waitUntilDrained() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if buffer.count < Self.receiveBufferLimit || closed || failure != nil || drainWaiter != nil {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            drainWaiter = continuation
+            lock.unlock()
+        }
+    }
+
+    var bufferedByteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer.count
     }
 
     func finishInput() {
@@ -108,17 +143,29 @@ public final class AnyTLSSessionStream: @unchecked Sendable {
         self.waiter = nil
         let ack = ackContinuation
         ackContinuation = nil
+        let drain = drainWaiter
+        drainWaiter = nil
         lock.unlock()
         waiter?.resume(throwing: error)
         ack?.resume(throwing: error)
+        drain?.resume()
     }
 
+    /// SYNACK. An error payload fails the stream: a blocked reader wakes
+    /// with the error and later writes are refused.
     func acknowledge(errorMessage: String?) {
+        if let errorMessage {
+            lock.lock()
+            acknowledged = true
+            let alreadyFailed = failure != nil
+            lock.unlock()
+            if !alreadyFailed {
+                fail(AnyTLSError.streamFailed(errorMessage))
+            }
+            return
+        }
         lock.lock()
         acknowledged = true
-        if let errorMessage, failure == nil {
-            failure = AnyTLSError.streamFailed(errorMessage)
-        }
         let currentFailure = failure
         let ack = ackContinuation
         ackContinuation = nil
@@ -189,8 +236,11 @@ public final class AnyTLSSessionStream: @unchecked Sendable {
         lock.lock()
         if !buffer.isEmpty {
             let data = buffer
-            buffer.removeAll(keepingCapacity: true)
+            buffer = Data()
+            let drain = drainWaiter
+            drainWaiter = nil
             lock.unlock()
+            drain?.resume()
             continuation.resume(returning: data)
             return
         }
@@ -213,6 +263,7 @@ public final class AnyTLSSessionStream: @unchecked Sendable {
         guard !bytes.isEmpty else { return }
         var offset = 0
         while offset < bytes.count {
+            try checkWritable()
             let take = min(bytes.count - offset, 0xFFFF)
             let slice = UnsafeRawBufferPointer(rebasing: bytes[offset..<(offset + take)])
             try await core.send(AnyTLSFrame(command: .psh, streamID: id, payload: Data(slice)))
@@ -220,22 +271,33 @@ public final class AnyTLSSessionStream: @unchecked Sendable {
         }
     }
 
+    private func checkWritable() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        if let failure { throw failure }
+        if closed { throw OutboundError.alreadyClosed(target) }
+    }
+
     /// FIN this stream; the session itself stays alive for reuse.
     func close() async {
-        let (didClose, pending) = closeOnce()
+        let (didClose, pending, drain) = closeOnce()
         guard didClose else { return }
         pending?.resume(returning: nil)
+        drain?.resume()
         await core.closeStream(id)
     }
 
-    private func closeOnce() -> (Bool, CheckedContinuation<Data?, Error>?) {
+    private func closeOnce() -> (Bool, CheckedContinuation<Data?, Error>?, CheckedContinuation<Void, Never>?) {
         lock.lock()
         defer { lock.unlock() }
-        if closed { return (false, nil) }
+        if closed { return (false, nil, nil) }
         closed = true
         let pending = waiter
         waiter = nil
-        return (true, pending)
+        let drain = drainWaiter
+        drainWaiter = nil
+        buffer = Data()
+        return (true, pending, drain)
     }
 }
 
@@ -258,14 +320,25 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
     public var onTerminate: (@Sendable (AnyTLSSession) -> Void)?
     /// Called when the last stream FINs and the session is still up (return to idle pool).
     public var onBecameIdle: (@Sendable (AnyTLSSession) -> Void)?
+    /// Test seam: replaces the `waste`-frame probe.
+    var probeOverrideForTesting: (@Sendable () async -> Bool)?
 
     private let queue = DispatchQueue(label: "prizmx.anytls.session", qos: .userInitiated)
     private let lock = OSAllocatedUnfairLock(initialState: SessionState())
     private let writeMutex = AsyncMutex()
     private let auth: AnyTLSAuth
-    private var connection: NWConnection?
-    private var pumpTask: Task<Void, Never>?
+    /// Written by attach / terminate, read by the pump and senders.
+    private let wire = OSAllocatedUnfairLock(initialState: Wire())
     private let recvWire = DirectBuffer()
+
+    private struct Wire: Sendable {
+        var connection: NWConnection?
+        var pumpTask: Task<Void, Never>?
+    }
+
+    private var connection: NWConnection? {
+        wire.withLock { $0.connection }
+    }
 
     private struct SessionState: Sendable {
         var state: State = .established
@@ -276,7 +349,7 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
     private init(identity: AnyTLSServerIdentity, connection: NWConnection?) {
         self.identity = identity
         self.auth = AnyTLSAuth(password: identity.password)
-        self.connection = connection
+        self.wire.withLock { $0.connection = connection }
     }
 
     /// Test seam: a session without a live connection (pool/singleflight tests).
@@ -292,6 +365,7 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
     /// dropped *before* we hand it to the browser / Grok.
     public func probe(timeout: Duration = .seconds(1)) async -> Bool {
         guard isUsable else { return false }
+        if let probeOverrideForTesting { return await probeOverrideForTesting() }
         guard connection != nil else { return true }
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -370,10 +444,11 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
     }
 
     private func attach(_ nw: NWConnection) {
-        connection = nw
-        pumpTask = Task { [weak self] in
+        wire.withLock { $0.connection = nw }
+        let task = Task<Void, Never> { [weak self] in
             await self?.pump()
         }
+        wire.withLock { $0.pumpTask = task }
     }
 
     // MARK: Streams
@@ -474,9 +549,15 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
             return true
         }
         guard shouldTerminate else { return }
-        pumpTask?.cancel()
-        connection?.cancel()
-        connection = nil
+        let (pump, nw) = wire.withLock { box -> (Task<Void, Never>?, NWConnection?) in
+            defer {
+                box.pumpTask = nil
+                box.connection = nil
+            }
+            return (box.pumpTask, box.connection)
+        }
+        pump?.cancel()
+        nw?.cancel()
         let streams = lock.withLock { state -> [AnyTLSSessionStream] in
             let all = Array(state.streams.values)
             state.streams.removeAll()
@@ -498,7 +579,11 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
                 recvWire.append(chunk)
                 while let (frame, consumed) = AnyTLSFrame.consume(recvWire.readableBytes) {
                     recvWire.consume(consumed)
-                    handle(frame)
+                    if let backlogged = handle(frame) {
+                        // Session-level backpressure: stop reading the shared
+                        // connection until this stream's consumer catches up.
+                        await backlogged.waitUntilDrained()
+                    }
                 }
             }
         } catch {
@@ -507,16 +592,19 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
         }
     }
 
-    private func handle(_ frame: AnyTLSFrame) {
+    /// Returns the stream whose backlog hit the receive cap, if any.
+    private func handle(_ frame: AnyTLSFrame) -> AnyTLSSessionStream? {
         switch frame.command {
         case .waste, .settings, .updatePaddingScheme, .serverSettings, .heartResponse, .syn:
-            return
+            return nil
         case .heartRequest:
             let reply = AnyTLSFrame(command: .heartResponse, streamID: frame.streamID)
             Task { [weak self] in try? await self?.send(reply) }
         case .psh:
             let stream = lock.withLock { $0.streams[frame.streamID] }
-            if !frame.payload.isEmpty { stream?.ingest(frame.payload) }
+            if !frame.payload.isEmpty, let stream, stream.ingest(frame.payload) {
+                return stream
+            }
         case .fin:
             let stream = lock.withLock { $0.streams[frame.streamID] }
             stream?.finishInput()
@@ -532,6 +620,7 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
             TunnelLog.write(.warn, "anytls alert \(identity.server): \(message)")
             terminate()
         }
+        return nil
     }
 
     private func receiveOnce() async throws -> Data {

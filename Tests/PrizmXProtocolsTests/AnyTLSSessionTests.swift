@@ -130,3 +130,118 @@ private final class CallCounter: @unchecked Sendable {
     var value: Int { count.withLock { $0 } }
     func increment() { count.withLock { $0 += 1 } }
 }
+
+// MARK: - Backpressure / SYNACK failure
+
+@Test func streamSignalsBackpressureAtCapAndResumesAfterDrain() async throws {
+    let core = StubCore()
+    let stream = AnyTLSSessionStream(id: 3, target: testTarget, core: core)
+    #expect(!stream.ingest(Data(count: 1024)))
+    #expect(stream.ingest(Data(count: AnyTLSSessionStream.receiveBufferLimit)))
+
+    let drained = OSAllocatedUnfairLock(initialState: false)
+    let waiter = Task {
+        await stream.waitUntilDrained()
+        drained.withLock { $0 = true }
+    }
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(!drained.withLock { $0 })
+
+    let data = try await stream.readData()
+    #expect(data?.count == 1024 + AnyTLSSessionStream.receiveBufferLimit)
+    await waiter.value
+    #expect(drained.withLock { $0 })
+    #expect(stream.bufferedByteCount == 0)
+}
+
+@Test func streamCloseReleasesBackpressureWaiter() async throws {
+    let core = StubCore()
+    let stream = AnyTLSSessionStream(id: 4, target: testTarget, core: core)
+    #expect(stream.ingest(Data(count: AnyTLSSessionStream.receiveBufferLimit)))
+    let waiter = Task { await stream.waitUntilDrained() }
+    try await Task.sleep(for: .milliseconds(20))
+    await stream.close()
+    await waiter.value
+}
+
+@Test func synAckErrorWakesBlockedReaderAndRefusesWrites() async throws {
+    let core = StubCore()
+    let stream = AnyTLSSessionStream(id: 5, target: testTarget, core: core)
+    let reader = Task { try await stream.readData() }
+    try await Task.sleep(for: .milliseconds(30))
+    stream.acknowledge(errorMessage: "dial tcp: refused")
+    await #expect(throws: AnyTLSError.self) {
+        _ = try await reader.value
+    }
+    let scratch = UnsafeMutableRawBufferPointer.allocate(byteCount: 3, alignment: 8)
+    defer { scratch.deallocate() }
+    scratch.copyBytes(from: [1, 2, 3] as [UInt8])
+    let raw = UnsafeRawBufferPointer(scratch)
+    await #expect(throws: AnyTLSError.self) {
+        try await stream.write(raw)
+    }
+    #expect(core.frames.isEmpty)
+}
+
+// MARK: - Pool idle cleanup under reentrancy
+
+private final class Gate: @unchecked Sendable {
+    private let state = OSAllocatedUnfairLock<(open: Bool, waiters: [CheckedContinuation<Void, Never>])>(
+        initialState: (false, [])
+    )
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let resumeNow = state.withLock { box -> Bool in
+                if box.open { return true }
+                box.waiters.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    var hasWaiter: Bool { state.withLock { !$0.waiters.isEmpty } }
+
+    func open() {
+        let waiters = state.withLock { box -> [CheckedContinuation<Void, Never>] in
+            box.open = true
+            defer { box.waiters.removeAll() }
+            return box.waiters
+        }
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
+@Test func idleCleanupDoesNotClobberConcurrentPoolChanges() async throws {
+    let pool = AnyTLSSessionPool()
+    let now = ContinuousClock.now
+    let older = AnyTLSSession.makeForTesting(identity: testIdentity)
+    let newer = AnyTLSSession.makeForTesting(identity: testIdentity)
+    await pool.insertIdleForTesting(newer, identity: testIdentity, idleSince: now)
+    await pool.insertIdleForTesting(older, identity: testIdentity, idleSince: now)
+    #expect(await pool.nextSeqForTesting(testIdentity) == 2)
+
+    // The first probe suspends; meanwhile the pool hands `newer` out and a
+    // third session is created.
+    let gate = Gate()
+    newer.probeOverrideForTesting = {
+        await gate.wait()
+        return true
+    }
+    let cleanup = Task { await pool.idleCleanup() }
+    while !gate.hasWaiter { try await Task.sleep(for: .milliseconds(5)) }
+
+    let taken = await pool.takeIdleForTesting(testIdentity)
+    #expect(taken === newer)
+    let third = AnyTLSSession.makeForTesting(identity: testIdentity)
+    await pool.insertIdleForTesting(third, identity: testIdentity, idleSince: now)
+    gate.open()
+    await cleanup.value
+
+    #expect(await pool.nextSeqForTesting(testIdentity) == 3)
+    #expect(await pool.idleCount(for: testIdentity) == 2)
+    // The taken session must not be resurrected into the idle list.
+    #expect(await pool.takeIdleForTesting(testIdentity) !== newer)
+    #expect(await pool.takeIdleForTesting(testIdentity) !== newer)
+}

@@ -144,9 +144,17 @@ public actor AnyTLSSessionPool {
     }
 
     /// Reuse newest, cleanup oldest. Keep `minIdleSession` newest even if expired.
-    private func idleCleanup() async {
+    ///
+    /// `probe()` suspends, and actor reentrancy lets `openStream` / `putIdle`
+    /// / `remove` run meanwhile. So decisions come from a synchronous pass
+    /// over the *current* idle list, and every mutation is an incremental
+    /// removal applied to whatever the group holds at that moment — never a
+    /// wholesale write-back of a stale snapshot (which would resurrect taken
+    /// sessions, drop freshly idled ones, or reset `nextSeq`).
+    func idleCleanup() async {
         let now = ContinuousClock.now
-        for (identity, var group) in groups {
+        for identity in Array(groups.keys) {
+            guard let idle = groups[identity]?.idle, !idle.isEmpty else { continue }
             let timeout = identity.sessionConfig.idleTimeout
             // Never empty the idle pool: a cold TLS+SYNACK after a pause was
             // taking down every proxied site (browser included).
@@ -154,7 +162,7 @@ public actor AnyTLSSessionPool {
             var kept = 0
             var remain: [AnyTLSSession] = []
             var drop: [AnyTLSSession] = []
-            for session in group.idle {
+            for session in idle {
                 let idleFor = session.idleSince.map { now - $0 } ?? .seconds(0)
                 if idleFor < .seconds(timeout) {
                     kept += 1
@@ -169,18 +177,53 @@ public actor AnyTLSSessionPool {
                 }
                 drop.append(session)
             }
-            var alive: [AnyTLSSession] = []
-            for session in remain {
-                if await session.probe() {
-                    alive.append(session)
-                }
-            }
-            group.idle = alive
-            groups[identity] = group
+            removeIdle(drop, identity: identity)
             for session in drop {
                 TunnelLog.write(.debug, "anytls session idle-close \(identity.server) seq=\(session.seq)")
                 session.terminate()
             }
+            for session in remain {
+                // Taken by `openStream` while we were suspended: not ours to probe.
+                guard isIdle(session, identity: identity) else { continue }
+                if !(await session.probe()) {
+                    // `probe` already terminated it; drop it from idle now
+                    // rather than waiting for the async `onTerminate` hop.
+                    removeIdle([session], identity: identity)
+                }
+            }
         }
+    }
+
+    private func isIdle(_ session: AnyTLSSession, identity: AnyTLSServerIdentity) -> Bool {
+        groups[identity]?.idle.contains { $0 === session } ?? false
+    }
+
+    private func removeIdle(_ sessions: [AnyTLSSession], identity: AnyTLSServerIdentity) {
+        guard !sessions.isEmpty, groups[identity] != nil else { return }
+        groups[identity]?.idle.removeAll { candidate in sessions.contains { $0 === candidate } }
+    }
+
+    /// Test seam: registers `session` as idle with a given idle-start instant.
+    func insertIdleForTesting(
+        _ session: AnyTLSSession,
+        identity: AnyTLSServerIdentity,
+        idleSince: ContinuousClock.Instant
+    ) {
+        var group = groups[identity] ?? Group()
+        group.nextSeq += 1
+        session.seq = group.nextSeq
+        session.idleSince = idleSince
+        group.sessions[session.seq] = session
+        group.idle.append(session)
+        groups[identity] = group
+        installHooks(session, identity: identity)
+    }
+
+    func takeIdleForTesting(_ identity: AnyTLSServerIdentity) -> AnyTLSSession? {
+        takeIdle(identity)
+    }
+
+    func nextSeqForTesting(_ identity: AnyTLSServerIdentity) -> UInt64 {
+        groups[identity]?.nextSeq ?? 0
     }
 }
