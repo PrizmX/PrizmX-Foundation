@@ -355,7 +355,14 @@ public final class TrafficCounter: Sendable {
                 Self.addProtocol(added, transport: transport, tcp: &state.appTCP, udp: &state.appUDP, key: key)
             }
             if let domain, !domain.isEmpty {
-                Self.addProtocol(added, transport: transport, tcp: &state.domainTCP, udp: &state.domainUDP, key: domain)
+                Self.addProtocol(
+                    added,
+                    transport: transport,
+                    tcp: &state.domainTCP,
+                    udp: &state.domainUDP,
+                    key: domain,
+                    cap: domainCap
+                )
             }
         }
     }
@@ -395,7 +402,14 @@ public final class TrafficCounter: Sendable {
                 count.down &+= record.downlinkBytes
                 state.domains[domain] = count
                 let added = record.uplinkBytes &+ record.downlinkBytes
-                Self.addProtocol(added, transport: .tcp, tcp: &state.domainTCP, udp: &state.domainUDP, key: domain)
+                Self.addProtocol(
+                    added,
+                    transport: .tcp,
+                    tcp: &state.domainTCP,
+                    udp: &state.domainUDP,
+                    key: domain,
+                    cap: domainCap
+                )
             }
         }
     }
@@ -444,12 +458,18 @@ public final class TrafficCounter: Sendable {
         transport: FlowTransport?,
         tcp: inout [String: UInt64],
         udp: inout [String: UInt64],
-        key: String
+        key: String,
+        cap: Int = .max
     ) {
         guard bytes > 0, let transport else { return }
         switch transport {
-        case .tcp: tcp[key, default: 0] &+= bytes
-        case .udp: udp[key, default: 0] &+= bytes
+        case .tcp:
+            // Bounded like `domains`: a new key only enters below `cap`.
+            guard tcp[key] != nil || tcp.count < cap else { return }
+            tcp[key, default: 0] &+= bytes
+        case .udp:
+            guard udp[key] != nil || udp.count < cap else { return }
+            udp[key, default: 0] &+= bytes
         }
     }
 
