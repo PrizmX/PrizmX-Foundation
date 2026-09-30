@@ -36,13 +36,12 @@ public enum TunnelMetricsStore: Sendable {
     ) -> Bool {
         let url = fileURL(kitRoot: kitRoot)
         do {
-            try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
             let data = try JSONEncoder().encode(File(writtenAt: writtenAt, metrics: snapshot))
-            try data.write(to: url, options: .atomic)
-            try? inheritOwnership(of: url)
+            // The extension writes as root into the user's kit. World-readable
+            // is not enough inside a container, so the file is handed to the
+            // kit directory owner — via fds only, never following a planted
+            // symlink / hard link at `metrics.json`.
+            try SafeFileWriter.replace(data, at: url, mode: 0o644)
             return true
         } catch {
             TunnelLog.write(.error, "metrics file write failed: \(error.localizedDescription)")
@@ -66,23 +65,5 @@ public enum TunnelMetricsStore: Sendable {
 
     public static func clear(kitRoot: URL? = nil) {
         try? FileManager.default.removeItem(at: fileURL(kitRoot: kitRoot))
-    }
-
-    /// The extension writes as root into the user's kit. World-readable is
-    /// not enough inside a container — chown to the kit directory owner so
-    /// the sandboxed host can open the file.
-    private static func inheritOwnership(of url: URL) throws {
-        let directory = url.deletingLastPathComponent()
-        let attrs = try FileManager.default.attributesOfItem(atPath: directory.path)
-        var update: [FileAttributeKey: Any] = [
-            .posixPermissions: NSNumber(value: 0o644)
-        ]
-        if let owner = attrs[.ownerAccountID] {
-            update[.ownerAccountID] = owner
-        }
-        if let group = attrs[.groupOwnerAccountID] {
-            update[.groupOwnerAccountID] = group
-        }
-        try FileManager.default.setAttributes(update, ofItemAtPath: url.path)
     }
 }

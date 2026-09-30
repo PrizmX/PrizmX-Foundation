@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Low-volume runtime event log for the tunnel, appended to a file in the
 /// App Group container. Per-flow request data belongs to the Inspector's
@@ -33,6 +34,7 @@ public enum TunnelLog: Sendable {
     private static let keepBytes = 256 * 1024
 
     private static let ioQueue = DispatchQueue(label: "prizmx.tunnellog")
+    private static let osLog = Logger(subsystem: "app.prizmx", category: "TunnelLog")
     nonisolated(unsafe) private static var writtenOnceKeys = Set<String>()
     nonisolated(unsafe) private static var cachedFormatter: DateFormatter?
 
@@ -125,33 +127,41 @@ public enum TunnelLog: Sendable {
             NSLog("PrizmX TunnelLog skipped (no file URL): %@", message)
             return
         }
-        let fileManager = FileManager.default
-        let line = "\(timestamp()) [\(level.rawValue)] \(message)\n"
+        let escaped = escapedLine(message)
+        // Mirrored to the unified log so events stay visible when the file
+        // cannot be written (e.g. the root extension denied the kit).
+        osLog.log(level: level == .error ? .error : .default, "\(escaped, privacy: .public)")
+        let line = "\(timestamp()) [\(level.rawValue)] \(escaped)\n"
         guard let data = line.data(using: .utf8) else { return }
         do {
-            try fileManager.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            rotateIfNeeded(url)
-            if fileManager.fileExists(atPath: url.path) {
-                let handle = try FileHandle(forWritingTo: url)
-                defer { try? handle.close() }
-                _ = try handle.seekToEnd()
-                try handle.write(contentsOf: data)
-            } else {
-                try data.write(to: url, options: .atomic)
-            }
+            // The macOS system extension appends as root into the user kit:
+            // symlink-safe, fd-anchored writes only.
+            try SafeFileWriter.append(data, to: url, rotateAbove: maxBytes, keepBytes: keepBytes)
         } catch {
-            NSLog("PrizmX TunnelLog write failed %@: %@", url.path, error.localizedDescription)
+            osLog.error("TunnelLog write failed \(url.path, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 
-    private static func rotateIfNeeded(_ url: URL) {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        guard let size = attributes?[.size] as? Int, size > maxBytes,
-              let data = try? Data(contentsOf: url) else { return }
-        try? Data(data.suffix(keepBytes)).write(to: url)
+    /// One event per line: SNI / Host / DNS names come from the network, so
+    /// CR / LF and other control characters must not forge extra lines.
+    static func escapedLine(_ message: String) -> String {
+        guard message.unicodeScalars.contains(where: isControl) else { return message }
+        var out = String.UnicodeScalarView()
+        for scalar in message.unicodeScalars {
+            switch scalar {
+            case "\n": out.append(contentsOf: "\\n".unicodeScalars)
+            case "\r": out.append(contentsOf: "\\r".unicodeScalars)
+            case _ where isControl(scalar):
+                out.append(contentsOf: "\\u{\(String(scalar.value, radix: 16))}".unicodeScalars)
+            default: out.append(scalar)
+            }
+        }
+        return String(out)
+    }
+
+    private static func isControl(_ scalar: Unicode.Scalar) -> Bool {
+        (scalar.value < 0x20 && scalar != "\t") || scalar.value == 0x7F
+            || scalar.value == 0x2028 || scalar.value == 0x2029
     }
 
     private static func timestamp() -> String {

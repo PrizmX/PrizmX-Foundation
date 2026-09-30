@@ -75,3 +75,25 @@ import PrizmXProtocols
     TunnelMetricsStore.clear(kitRoot: kit)
     #expect(TunnelMetricsStore.load(kitRoot: kit, now: 1) == nil)
 }
+
+@Test func tunnelMetricsStoreDoesNotWriteThroughSymlink() throws {
+    let kit = FileManager.default.temporaryDirectory
+        .appendingPathComponent("metrics-symlink-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: kit) }
+    let victim = kit.appendingPathComponent("victim.txt")
+    let target = TunnelMetricsStore.fileURL(kitRoot: kit)
+    try FileManager.default.createDirectory(
+        at: target.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try Data("keep".utf8).write(to: victim)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: victim.path)
+    try FileManager.default.createSymbolicLink(at: target, withDestinationURL: victim)
+
+    #expect(TunnelMetricsStore.save(TrafficSnapshot(uplinkBytes: 1, downlinkBytes: 2), kitRoot: kit, writtenAt: 5))
+
+    #expect(try Data(contentsOf: victim) == Data("keep".utf8))
+    let attrs = try FileManager.default.attributesOfItem(atPath: victim.path)
+    #expect((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+    #expect(TunnelMetricsStore.load(maxAge: 5, kitRoot: kit, now: 6) == TrafficSnapshot(uplinkBytes: 1, downlinkBytes: 2))
+}

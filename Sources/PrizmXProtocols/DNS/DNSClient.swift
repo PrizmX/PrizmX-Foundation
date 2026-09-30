@@ -483,11 +483,8 @@ extension DNSClient {
             Dictionary(uniqueKeysWithValues: map.map { ($0.key.persistKey, $0.value.addresses.map(\.description)) })
         }
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        try? FileManager.default.createDirectory(
-            at: persistenceURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try? data.write(to: persistenceURL, options: .atomic)
+        // May run as root (macOS system extension) inside the user kit.
+        try? SafeFileWriter.replace(data, at: persistenceURL)
     }
 
     private func loadPersisted() {
