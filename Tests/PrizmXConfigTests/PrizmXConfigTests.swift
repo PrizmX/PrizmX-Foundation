@@ -99,7 +99,7 @@ private let expectedNodeCount = 2
         cipher: .aes256GCM
     ))
     let vless = try #require(nodes.node(id: "vless-us"))
-    guard case .vless(let server, let uuid, let sni, let tls, let reality, let flow) = vless.protocolConfig else {
+    guard case .vless(let server, let uuid, let sni, let tls, let reality, let flow, _, _) = vless.protocolConfig else {
         Issue.record("expected vless node")
         return
     }
@@ -128,7 +128,7 @@ private let expectedNodeCount = 2
     """
     let (_, nodes) = try ClashConfigParser().parse(rawString: yaml)
     let node = try #require(nodes.node(id: "vis"))
-    guard case .vless(_, _, let sni, let tls, let reality, let flow) = node.protocolConfig else {
+    guard case .vless(_, _, let sni, let tls, let reality, let flow, _, _) = node.protocolConfig else {
         Issue.record("expected vless node")
         return
     }
@@ -156,7 +156,7 @@ private let expectedNodeCount = 2
     """
     let (_, nodes) = try SingboxConfigParser().parse(rawString: json)
     let node = try #require(nodes.node(id: "vis"))
-    guard case .vless(_, _, _, _, _, let flow) = node.protocolConfig else {
+    guard case .vless(_, _, _, _, _, let flow, _, _) = node.protocolConfig else {
         Issue.record("expected vless node")
         return
     }

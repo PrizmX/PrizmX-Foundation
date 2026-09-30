@@ -103,7 +103,9 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
                 sni: sni,
                 tls: tls || sni != nil || reality != nil,
                 reality: reality,
-                flow: flow
+                flow: flow,
+                skipCertVerify: outbound.tls?.insecure ?? false,
+                alpn: outbound.tls?.alpn.flatMap { $0.values.isEmpty ? nil : $0.values }
             )
         )
     }
@@ -120,7 +122,8 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
             protocolConfig: .trojan(
                 server: try ConfigMapping.endpoint(host: server, port: port, field: "server_port"),
                 password: password,
-                sni: sni
+                sni: sni,
+                skipCertVerify: outbound.tls?.insecure ?? false
             )
         )
     }
@@ -249,12 +252,14 @@ struct SingboxTLS: Codable, Sendable {
     var enabled: Bool?
     var serverName: String?
     var insecure: Bool?
+    var alpn: StringOrArray?
     var reality: SingboxReality?
 
     enum CodingKeys: String, CodingKey {
         case enabled
         case serverName = "server_name"
         case insecure
+        case alpn
         case reality
     }
 }

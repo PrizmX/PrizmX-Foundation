@@ -14,9 +14,11 @@ public enum ProtocolConfig: Sendable, Hashable {
         sni: String?,
         tls: Bool,
         reality: REALITYConfig?,
-        flow: String? = nil
+        flow: String? = nil,
+        skipCertVerify: Bool = false,
+        alpn: [String]? = nil
     )
-    case trojan(server: Endpoint, password: String, sni: String?)
+    case trojan(server: Endpoint, password: String, sni: String?, skipCertVerify: Bool = false)
     case anytls(
         server: Endpoint,
         password: String,
@@ -145,7 +147,7 @@ public enum NodeFactory: Sendable {
                 cipher: cipher,
                 target: target
             )
-        case .vless(let server, let uuid, let sni, let tls, let reality, let flow):
+        case .vless(let server, let uuid, let sni, let tls, let reality, let flow, let skipCertVerify, let alpn):
             return try VLESSOutboundConnection(
                 server: server,
                 uuid: uuid,
@@ -154,15 +156,18 @@ public enum NodeFactory: Sendable {
                 tls: tls,
                 reality: reality,
                 flow: flow,
-                command: command
+                command: command,
+                skipCertVerify: skipCertVerify,
+                alpn: alpn
             )
-        case .trojan(let server, let password, let sni):
+        case .trojan(let server, let password, let sni, let skipCertVerify):
             return TrojanOutboundConnection(
                 server: server,
                 password: password,
                 target: target,
                 sni: sni,
-                command: command == .udp ? .udpAssociate : .connect
+                command: command == .udp ? .udpAssociate : .connect,
+                skipCertVerify: skipCertVerify
             )
         case .anytls(let server, let password, let sni, let skipCertVerify, let session):
             return AnyTLSOutboundConnection(
@@ -531,9 +536,9 @@ extension OutboundNode {
         switch protocolConfig {
         case .shadowsocks(let server, _, _):
             return server
-        case .vless(let server, _, _, _, _, _):
+        case .vless(let server, _, _, _, _, _, _, _):
             return server
-        case .trojan(let server, _, _):
+        case .trojan(let server, _, _, _):
             return server
         case .anytls(let server, _, _, _, _):
             return server

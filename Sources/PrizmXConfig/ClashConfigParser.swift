@@ -91,7 +91,12 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             return OutboundNode(
                 id: name,
                 name: name,
-                protocolConfig: .trojan(server: endpoint, password: password, sni: sni)
+                protocolConfig: .trojan(
+                    server: endpoint,
+                    password: password,
+                    sni: sni,
+                    skipCertVerify: node.bool(for: "skip-cert-verify", default: false)
+                )
             )
         case "anytls":
             let server = try node.requiredString("server")
@@ -139,9 +144,25 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                 sni: sni,
                 tls: tls || reality != nil,
                 reality: reality,
-                flow: flow
+                flow: flow,
+                skipCertVerify: node.bool(for: "skip-cert-verify", default: false),
+                alpn: Self.alpn(node.mapping?["alpn"])
             )
         )
+    }
+
+    /// Clash `alpn`: a list, or a single comma-separated string.
+    static func alpn(_ node: YAMLNode?) -> [String]? {
+        let values: [String]
+        if let list = node?.sequence {
+            values = list.compactMap(\.string)
+        } else if let raw = node?.string {
+            values = raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        } else {
+            return nil
+        }
+        let cleaned = values.filter { !$0.isEmpty }
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     private func parseREALITY(from node: YAMLNode, sni: String?) throws -> REALITYConfig? {
@@ -291,7 +312,9 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                     sni: sni,
                     tls: tls || reality != nil,
                     reality: reality,
-                    flow: flow
+                    flow: flow,
+                    skipCertVerify: named("skip-cert-verify")?.lowercased() == "true",
+                    alpn: named("alpn").flatMap { Self.alpn(.scalar($0)) }
                 )
             )
         case "trojan":
@@ -304,7 +327,12 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             return OutboundNode(
                 id: String(name),
                 name: String(name),
-                protocolConfig: .trojan(server: endpoint, password: password, sni: sni)
+                protocolConfig: .trojan(
+                    server: endpoint,
+                    password: password,
+                    sni: sni,
+                    skipCertVerify: named("skip-cert-verify")?.lowercased() == "true"
+                )
             )
         case "anytls":
             guard parts.count >= 3 else { throw ConfigError.malformedRule(line) }
