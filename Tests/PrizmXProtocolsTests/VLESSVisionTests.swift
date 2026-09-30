@@ -204,3 +204,83 @@ struct VLESSVisionPaddingTests {
         #expect(layer.drainRawIncoming() == rawBytes)
     }
 }
+
+@Suite("VLESS Vision over plain TLS")
+struct VLESSVisionPlainTLSTests {
+    private let server = Endpoint(domain: "vless.example", port: 443)
+    private let target = Endpoint(host: .ipv4(IPv4Address(1, 2, 3, 4)), port: 443)
+
+    @Test func visionOverTLSUsesUserspaceTLS13() throws {
+        let vision = try VLESSOutboundConnection(
+            server: server, uuid: testUUIDString, target: target, tls: true, flow: "xtls-rprx-vision"
+        )
+        #expect(vision.usesUserspaceTLS)
+        let plainTLS = try VLESSOutboundConnection(server: server, uuid: testUUIDString, target: target, tls: true)
+        #expect(!plainTLS.usesUserspaceTLS)
+        let noTLS = try VLESSOutboundConnection(
+            server: server, uuid: testUUIDString, target: target, tls: false, flow: "xtls-rprx-vision"
+        )
+        #expect(!noTLS.usesUserspaceTLS)
+        // Vision on UDP is disabled, so plain NW TLS stays.
+        let udp = try VLESSOutboundConnection(
+            server: server, uuid: testUUIDString, target: target, tls: true, flow: "xtls-rprx-vision", command: .udp
+        )
+        #expect(!udp.usesUserspaceTLS)
+    }
+
+    @Test func skipCertVerifyAndALPNAreStored() throws {
+        let factory = VLESSOutboundFactory(server: server, uuid: testUUIDString, skipCertVerify: true, alpn: ["h2"])
+        #expect(factory.skipCertVerify)
+        #expect(factory.alpn == ["h2"])
+        let connection = try VLESSOutboundConnection(
+            server: server, uuid: testUUIDString, target: target, skipCertVerify: true
+        )
+        #expect(connection.skipCertVerify)
+    }
+
+    @Test func directCommandSwitchesTLS13PathToRaw() throws {
+        let connection = try VLESSOutboundConnection(
+            server: server, uuid: testUUIDString, target: target, tls: true, flow: "xtls-rprx-vision"
+        )
+        let suite = try TLS13CipherSuite.parse(TLS13.aes256GCMSha384)
+        let pair = TLS13KeySchedule.applicationSecrets(
+            suite: suite,
+            master: Data(repeating: 7, count: 48),
+            transcript: Data("hs".utf8)
+        )
+        connection.installUserspaceTLSForTesting(TLS13RecordLayer(application: pair, suite: suite))
+        #expect(!connection.downlinkIsRaw)
+
+        var first = Data([0x00, 0x00]) // VLESS response header, no addons
+        first.append(VLESSVision.frame(
+            command: VLESSVision.commandContinue,
+            content: Data("SERVERHELLO".utf8),
+            padding: Data(repeating: 0x01, count: 8),
+            uuid: testUUIDBytes
+        ))
+        let direct = VLESSVision.frame(
+            command: VLESSVision.commandDirect,
+            content: Data("TICKET".utf8),
+            padding: Data(repeating: 0x02, count: 4)
+        )
+        let raw = Data([0x17, 0x03, 0x03, 0x00, 0x02, 0xAB, 0xCD])
+
+        var server = pair.server
+        var wire = try TLS13AEAD.seal(plaintext: first, keys: &server, contentType: TLS13.contentApplicationData)
+        wire.append(try TLS13AEAD.seal(plaintext: direct, keys: &server, contentType: TLS13.contentApplicationData))
+        wire.append(raw)
+
+        let reader = VLESSVisionReader(userID: testUUID)
+        // Split mid-record to exercise buffering.
+        let cut = 10
+        #expect(try connection.ingestVisionWire(wire.prefix(cut), reader: reader) == .needMore)
+        _ = try connection.ingestVisionWire(Data(wire.dropFirst(cut)), reader: reader)
+        #expect(connection.downlinkIsRaw)
+        #expect(connection.takeVisionAppForTesting() == Data("SERVERHELLO".utf8) + Data("TICKET".utf8) + raw)
+
+        // After the switch, wire bytes pass through untouched.
+        let later = Data([0x17, 0x03, 0x03, 0x00, 0x01, 0xEE])
+        #expect(try connection.ingestVisionWire(later, reader: reader) == .bytes(later.count))
+        #expect(connection.takeVisionAppForTesting() == later)
+    }
+}

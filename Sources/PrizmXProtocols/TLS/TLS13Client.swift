@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Network
+import os
 
 // MARK: - TLS 1.3 constants
 
@@ -19,6 +20,12 @@ enum TLS13 {
     static let handshakeCertificateVerify: UInt8 = 15
     static let handshakeFinished: UInt8 = 20
     static let handshakeNewSessionTicket: UInt8 = 4
+    static let handshakeKeyUpdate: UInt8 = 24
+    /// RFC 8446 §5.1: TLSCiphertext.length must not exceed 2^14 + 256.
+    static let maxCiphertext = (1 << 14) + 256
+    /// Bound on buffered post-handshake handshake bytes (tickets / KeyUpdate).
+    static let maxPostHandshakeBuffer = 64 * 1024
+    static let defaultALPN = ["h2", "http/1.1"]
     static let contentChangeCipherSpec: UInt8 = 20
     static let contentAlert: UInt8 = 21
     static let contentHandshake: UInt8 = 22
@@ -169,11 +176,14 @@ struct TLS13ClientHelloBuilt {
 
 enum TLS13ClientHelloBuilder {
     /// Builds a TLS 1.3 ClientHello with a 32-byte Session ID (REALITY offset 39).
+    /// `serverName` nil / empty omits SNI (IP-literal servers); an empty
+    /// `alpn` omits the ALPN extension.
     static func build(
-        serverName: String,
+        serverName: String?,
         ephemeral: Curve25519.KeyAgreement.PrivateKey,
         sessionID: [UInt8] = [UInt8](repeating: 0, count: REALITY.sessionIDByteCount),
-        random: [UInt8]? = nil
+        random: [UInt8]? = nil,
+        alpn: [String] = TLS13.defaultALPN
     ) -> TLS13ClientHelloBuilt {
         precondition(sessionID.count == REALITY.sessionIDByteCount)
         let random = random ?? TLS13Random.bytes(32)
@@ -195,11 +205,15 @@ enum TLS13ClientHelloBuilder {
         body.u8(0)
 
         body.withU16Length { extensions in
-            writeServerName(&extensions, serverName)
+            if let serverName, !serverName.isEmpty {
+                writeServerName(&extensions, serverName)
+            }
             writeSupportedGroups(&extensions)
             writeECPointFormats(&extensions)
             writeSignatureAlgorithms(&extensions)
-            writeALPN(&extensions)
+            if !alpn.isEmpty {
+                writeALPN(&extensions, alpn)
+            }
             writeSupportedVersions(&extensions)
             writePSKModes(&extensions)
             writeKeyShare(&extensions, publicKey)
@@ -273,12 +287,14 @@ enum TLS13ClientHelloBuilder {
         }
     }
 
-    private static func writeALPN(_ writer: inout TLS13ByteWriter) {
+    private static func writeALPN(_ writer: inout TLS13ByteWriter, _ protocols: [String]) {
         writer.u16(TLS13.extALPN)
         writer.withU16Length { body in
             body.withU16Length { list in
-                list.withU8Length { $0.append(Array("h2".utf8)) }
-                list.withU8Length { $0.append(Array("http/1.1".utf8)) }
+                for name in protocols {
+                    let bytes = Array(name.utf8.prefix(255))
+                    list.withU8Length { $0.append(bytes) }
+                }
             }
         }
     }
@@ -432,6 +448,8 @@ struct TLS13TrafficKeys {
     var iv: [UInt8]
     var sequence: UInt64 = 0
     let aead: TLS13AEADKind
+    /// Traffic secret these keys derive from (needed for KeyUpdate).
+    var secret = Data()
 }
 
 struct TLS13TrafficPair {
@@ -627,14 +645,26 @@ enum TLS13KeySchedule {
         return hash.hmac(key: finishedKey, data: hash.hash(transcript))
     }
 
-    private static func trafficKeys(secret: Data, suite: TLS13CipherSuite) -> TLS13TrafficKeys {
+    static func trafficKeys(secret: Data, suite: TLS13CipherSuite) -> TLS13TrafficKeys {
         let key = suite.hash.expandLabel(secret: secret, label: "key", context: Data(), length: suite.keyByteCount)
         let iv = suite.hash.expandLabel(secret: secret, label: "iv", context: Data(), length: 12)
         return TLS13TrafficKeys(
             key: SymmetricKey(data: key),
             iv: Array(iv),
-            aead: suite.aead
+            aead: suite.aead,
+            secret: secret
         )
+    }
+
+    /// RFC 8446 §7.2: `secret_N+1 = HKDF-Expand-Label(secret_N, "traffic upd", "", Hash.length)`.
+    static func nextTrafficKeys(_ current: TLS13TrafficKeys, suite: TLS13CipherSuite) -> TLS13TrafficKeys {
+        let next = suite.hash.expandLabel(
+            secret: current.secret,
+            label: "traffic upd",
+            context: Data(),
+            length: suite.hash.byteCount
+        )
+        return trafficKeys(secret: next, suite: suite)
     }
 
 }
@@ -778,31 +808,77 @@ struct DERReader {
 // MARK: - Record layer (post-handshake)
 
 final class TLS13RecordLayer: @unchecked Sendable {
-    private var application: TLS13TrafficPair
+    /// Client write keys. The read task also touches them when the server
+    /// requests a KeyUpdate, so they live behind a lock (never held across
+    /// an `await`).
+    private let writer: OSAllocatedUnfairLock<WriteState>
+    // Read side: only the (serialized) reader touches these.
+    private var serverKeys: TLS13TrafficKeys
     private var incoming = DirectBuffer()
     private var pendingPlaintext = DirectBuffer()
+    private var postHandshake: [UInt8] = []
+    /// `nil` only in tests that build keys by hand; KeyUpdate then fails.
+    private let suite: TLS13CipherSuite?
     /// XTLS Vision direct-copy: after a downlink `command=direct` frame the
     /// peer writes inner TLS records unencrypted, so decryption must stop.
     private(set) var isRawMode = false
 
-    init(application: TLS13TrafficPair) {
-        self.application = application
+    private struct WriteState: Sendable {
+        var keys: TLS13TrafficKeys
+        /// Peer sent `KeyUpdate(update_requested)`: our own KeyUpdate goes
+        /// out ahead of the next record we seal.
+        var keyUpdatePending = false
+    }
+
+    init(application: TLS13TrafficPair, suite: TLS13CipherSuite? = nil) {
+        self.writer = OSAllocatedUnfairLock(initialState: WriteState(keys: application.client))
+        self.serverKeys = application.server
+        self.suite = suite
     }
 
     func sealApplication(_ plaintext: Data) throws -> Data {
-        var output = Data()
-        var offset = 0
-        while offset < plaintext.count {
-            let end = min(offset + TLS13.maxPlaintext, plaintext.count)
-            let chunk = plaintext.subdata(in: offset..<end)
-            output.append(try TLS13AEAD.seal(
-                plaintext: chunk,
-                keys: &application.client,
-                contentType: TLS13.contentApplicationData
-            ))
-            offset = end
+        try seal(plaintext, contentType: TLS13.contentApplicationData)
+    }
+
+    /// `close_notify` alert sealed with the current write keys.
+    func sealCloseNotify() throws -> Data {
+        try seal(Data([1, 0]), contentType: TLS13.contentAlert)
+    }
+
+    private func seal(_ plaintext: Data, contentType: UInt8) throws -> Data {
+        let suite = self.suite
+        return try writer.withLock { state in
+            var output = Data()
+            if state.keyUpdatePending {
+                guard let suite else {
+                    throw REALITYError.handshakeFailed("KeyUpdate without cipher suite")
+                }
+                // KeyUpdate(update_not_requested) under the old keys, then rotate.
+                output.append(try TLS13AEAD.seal(
+                    plaintext: Data([TLS13.handshakeKeyUpdate, 0, 0, 1, 0]),
+                    keys: &state.keys,
+                    contentType: TLS13.contentHandshake
+                ))
+                state.keys = TLS13KeySchedule.nextTrafficKeys(state.keys, suite: suite)
+                state.keyUpdatePending = false
+            }
+            var offset = 0
+            while offset < plaintext.count {
+                let end = min(offset + TLS13.maxPlaintext, plaintext.count)
+                let chunk = plaintext.subdata(in: offset..<end)
+                output.append(try TLS13AEAD.seal(
+                    plaintext: chunk,
+                    keys: &state.keys,
+                    contentType: contentType
+                ))
+                offset = end
+            }
+            return output
         }
-        return output
+    }
+
+    var hasPendingKeyUpdate: Bool {
+        writer.withLock { $0.keyUpdatePending }
     }
 
     func feedWire(_ chunk: Data) throws {
@@ -832,11 +908,13 @@ final class TLS13RecordLayer: @unchecked Sendable {
         guard incoming.readableByteCount >= TLS13.recordHeaderByteCount else { return nil }
         let headerView = incoming.readableBytes
         let length = (Int(headerView[3]) << 8) | Int(headerView[4])
+        guard length <= TLS13.maxCiphertext else {
+            throw REALITYError.handshakeFailed("TLS record overflow (\(length) bytes)")
+        }
         let total = TLS13.recordHeaderByteCount + length
         guard incoming.readableByteCount >= total else { return nil }
-        let raw = Array(headerView)
-        let header = Array(raw.prefix(TLS13.recordHeaderByteCount))
-        let fragment = Array(raw[TLS13.recordHeaderByteCount..<total])
+        let header = Array(headerView.prefix(TLS13.recordHeaderByteCount))
+        let fragment = Array(headerView[TLS13.recordHeaderByteCount..<total])
         incoming.consume(total)
 
         let recordType = header[0]
@@ -853,12 +931,13 @@ final class TLS13RecordLayer: @unchecked Sendable {
         let (innerType, plaintext) = try TLS13AEAD.open(
             recordHeader: header,
             fragment: fragment,
-            keys: &application.server
+            keys: &serverKeys
         )
         switch innerType {
         case TLS13.contentApplicationData:
             return plaintext
         case TLS13.contentHandshake:
+            try handlePostHandshake(plaintext)
             return Data()
         case TLS13.contentAlert:
             let bytes = Array(plaintext)
@@ -868,6 +947,39 @@ final class TLS13RecordLayer: @unchecked Sendable {
             throw REALITYError.alert(0, 0)
         default:
             return Data()
+        }
+    }
+
+    /// NewSessionTicket is ignored (no resumption); KeyUpdate rotates the
+    /// server read keys and, when requested, schedules our own KeyUpdate.
+    private func handlePostHandshake(_ plaintext: Data) throws {
+        postHandshake.append(contentsOf: plaintext)
+        guard postHandshake.count <= TLS13.maxPostHandshakeBuffer else {
+            throw REALITYError.handshakeFailed("post-handshake message too large")
+        }
+        while postHandshake.count >= 4 {
+            let type = postHandshake[0]
+            let length = (Int(postHandshake[1]) << 16) | (Int(postHandshake[2]) << 8) | Int(postHandshake[3])
+            guard postHandshake.count >= 4 + length else { return }
+            let body = Array(postHandshake[4..<(4 + length)])
+            postHandshake.removeFirst(4 + length)
+            switch type {
+            case TLS13.handshakeNewSessionTicket:
+                continue
+            case TLS13.handshakeKeyUpdate:
+                guard body.count == 1, body[0] <= 1 else {
+                    throw REALITYError.handshakeFailed("malformed KeyUpdate")
+                }
+                guard let suite else {
+                    throw REALITYError.handshakeFailed("KeyUpdate without cipher suite")
+                }
+                serverKeys = TLS13KeySchedule.nextTrafficKeys(serverKeys, suite: suite)
+                if body[0] == 1 {
+                    writer.withLock { $0.keyUpdatePending = true }
+                }
+            default:
+                throw REALITYError.unexpectedMessage(type)
+            }
         }
     }
 
@@ -897,11 +1009,17 @@ final class TLS13RecordLayer: @unchecked Sendable {
 // MARK: - Handshake
 
 enum TLS13Handshake {
+    /// - Parameters:
+    ///   - offeredALPN: protocols sent in the ClientHello; a server-selected
+    ///     protocol outside this list fails the handshake.
+    ///   - verifyCertificate: chain (leaf first, DER) + parsed leaf. The
+    ///     CertificateVerify signature is always checked against the leaf key.
     static func run(
         connection: NWConnection,
         queue _: DispatchQueue,
         clientHello: TLS13ClientHelloBuilt,
-        verifyCertificate: (TLS13Certificate) throws -> Void
+        offeredALPN: [String] = TLS13.defaultALPN,
+        verifyCertificate: ([[UInt8]], TLS13Certificate) throws -> Void
     ) async throws -> TLS13RecordLayer {
         let incoming = DirectBuffer()
 
@@ -1021,33 +1139,47 @@ enum TLS13Handshake {
             }
         }
 
-        func parseCertificate(_ body: [UInt8]) throws -> TLS13Certificate {
+        func parseCertificate(_ body: [UInt8]) throws -> [[UInt8]] {
             var reader = TLS13ByteReader(bytes: body)
             _ = try reader.vec8()
             let list = try reader.vec24()
             var listReader = TLS13ByteReader(bytes: list)
-            let certDER = try listReader.vec24()
-            _ = try listReader.vec16()
-            return try TLS13X509.parse(certDER)
+            var chain: [[UInt8]] = []
+            while listReader.remaining > 0 {
+                chain.append(try listReader.vec24())
+                _ = try listReader.vec16()
+            }
+            guard !chain.isEmpty else {
+                throw TLS13PeerVerificationError.emptyCertificateChain
+            }
+            return chain
         }
 
         func parseCertificateVerify(_ body: [UInt8], certificate: TLS13Certificate, transcriptBefore: Data) throws {
             var reader = TLS13ByteReader(bytes: body)
             let scheme = try reader.u16()
             let signature = try reader.vec16()
-            guard scheme == TLS13.signatureEd25519 else {
-                throw REALITYError.handshakeFailed("CertificateVerify scheme \(scheme) is not ed25519")
-            }
-            guard certificate.isEd25519, certificate.publicKey.count == 32 else {
-                throw REALITYError.unverifiedCertificate
-            }
-            var signed = Data(repeating: 0x20, count: 64)
-            signed.append(contentsOf: Array("TLS 1.3, server CertificateVerify".utf8))
-            signed.append(0)
-            signed.append(suite!.hash.hash(transcriptBefore))
-            let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: Data(certificate.publicKey))
-            guard publicKey.isValidSignature(Data(signature), for: signed) else {
-                throw REALITYError.handshakeFailed("CertificateVerify Ed25519 failed")
+            try TLS13PeerVerifier.verifyCertificateVerify(
+                scheme: scheme,
+                signature: signature,
+                transcriptHash: suite!.hash.hash(transcriptBefore),
+                leaf: certificate
+            )
+        }
+
+        func checkEncryptedExtensions(_ body: [UInt8]) throws {
+            var reader = TLS13ByteReader(bytes: body)
+            var extReader = TLS13ByteReader(bytes: try reader.vec16())
+            while extReader.remaining > 0 {
+                let type = try extReader.u16()
+                let data = try extReader.vec16()
+                guard type == TLS13.extALPN else { continue }
+                var inner = TLS13ByteReader(bytes: data)
+                var list = TLS13ByteReader(bytes: try inner.vec16())
+                let selected = String(decoding: try list.vec8(), as: UTF8.self)
+                guard list.remaining == 0, offeredALPN.contains(selected) else {
+                    throw TLS13PeerVerificationError.alpnMismatch(selected)
+                }
             }
         }
 
@@ -1110,12 +1242,14 @@ enum TLS13Handshake {
             while let (type, body, raw) = try popHandshake() {
                 switch type {
                 case TLS13.handshakeEncryptedExtensions:
+                    try checkEncryptedExtensions(body)
                     sawEncryptedExtensions = true
                     transcript.append(raw)
                 case TLS13.handshakeCertificate:
                     sawCertificate = true
-                    leaf = try parseCertificate(body)
-                    try verifyCertificate(leaf!)
+                    let chain = try parseCertificate(body)
+                    leaf = try TLS13X509.parse(chain[0])
+                    try verifyCertificate(chain, leaf!)
                     transcript.append(raw)
                 case TLS13.handshakeCertificateVerify:
                     guard let leaf else {
@@ -1180,7 +1314,7 @@ enum TLS13Handshake {
             master: master,
             transcript: transcript
         )
-        let layer = TLS13RecordLayer(application: application)
+        let layer = TLS13RecordLayer(application: application, suite: currentSuite)
         if incoming.readableByteCount > 0 {
             let leftover = Data(incoming.readableBytes)
             try layer.feedWire(leftover)

@@ -14,6 +14,10 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
     public let tls: Bool
     public let reality: REALITYConfig?
     public let flow: String?
+    /// Clash `skip-cert-verify`: accept any server certificate (plain TLS only).
+    public let skipCertVerify: Bool
+    /// Offered ALPN (`nil` = `h2`, `http/1.1`).
+    public let alpn: [String]?
 
     public init(
         server: Endpoint,
@@ -21,7 +25,9 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
         sni: String? = nil,
         tls: Bool = true,
         reality: REALITYConfig? = nil,
-        flow: String? = nil
+        flow: String? = nil,
+        skipCertVerify: Bool = false,
+        alpn: [String]? = nil
     ) {
         self.server = server
         self.uuid = uuid
@@ -29,6 +35,8 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
         self.tls = tls
         self.reality = reality
         self.flow = VLESSVision.normalized(flow)
+        self.skipCertVerify = skipCertVerify
+        self.alpn = alpn
     }
 
     public func connect(to endpoint: Endpoint) async throws -> any OutboundConnection {
@@ -39,7 +47,9 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
             sni: sni,
             tls: tls,
             reality: reality,
-            flow: flow
+            flow: flow,
+            skipCertVerify: skipCertVerify,
+            alpn: alpn
         )
         return connection
     }
@@ -60,9 +70,15 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
 ///
 /// When `flow` is `xtls-rprx-vision` and `command` is TCP, the header carries
 /// the protobuf Flow addon and the stream is Vision-padded until end/direct.
-/// Uplink stays REALITY-sealed (`end` only); after a downlink `direct` frame
+/// Uplink stays TLS-sealed (`end` only); after a downlink `direct` frame
 /// the peer splices raw inner-TLS bytes, so the record layer stops decrypting
 /// and the rest of the stream is delivered untouched.
+///
+/// Vision over plain TLS (no REALITY) therefore also uses the userspace
+/// TLS 1.3 client — Network.framework TLS cannot surrender the raw socket
+/// after `direct` — with standard Web-PKI authentication (system trust +
+/// hostname, CertificateVerify, ALPN). Xray requires TLS 1.3 for Vision,
+/// which is all this client speaks.
 public final class VLESSOutboundConnection: OutboundConnection, @unchecked Sendable {
 
     public let endpoint: Endpoint
@@ -73,6 +89,8 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     public let reality: REALITYConfig?
     public let flow: String?
     public let command: VLESSCommand
+    public let skipCertVerify: Bool
+    public let alpn: [String]?
 
     public var state: OutboundConnectionState {
         transport.state
@@ -81,7 +99,13 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     /// Downlink switched to raw passthrough after a Vision `direct` frame
     /// (tests / diagnostics).
     var downlinkIsRaw: Bool {
-        realitySession?.isRawMode ?? false
+        userspaceTLS?.isRawMode ?? false
+    }
+
+    /// REALITY, or Vision over plain TLS: TLS 1.3 runs in userspace on a raw
+    /// TCP connection instead of Network.framework TLS.
+    var usesUserspaceTLS: Bool {
+        reality != nil || (tlsEnabled && visionWriter != nil)
     }
 
     private let transport: NWStreamTransport
@@ -89,7 +113,9 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     /// (downlink) and writes (uplink) from concurrent tasks; without this the
     /// TLS record sequence and wire order race.
     private let sendMutex = AsyncMutex()
-    private var realitySession: REALITYSession?
+    /// Userspace TLS 1.3 record layer (REALITY or Vision+TLS). Set once in
+    /// `connectAndHandshake` before `markEstablished`.
+    private var userspaceTLS: TLS13RecordLayer?
     private var visionWriter: VLESSVisionWriter?
     private var visionReader: VLESSVisionReader?
     private var visionApp = Data()
@@ -98,7 +124,7 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     private var requestHeaderSent = false
     private var responseHeaderConsumed = false
 
-    private enum WireReceive {
+    enum WireReceive: Equatable {
         case bytes(Int)
         case needMore
         case eof
@@ -114,6 +140,8 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     ///   - reality: Optional REALITY handshake provider.
     ///   - flow: Optional VLESS flow (`xtls-rprx-vision`). Applied on TCP only.
     ///   - command: `tcp` (default) or `udp`.
+    ///   - skipCertVerify: Accept any server certificate (explicit opt-in).
+    ///   - alpn: Offered ALPN; `nil` keeps the platform / `h2,http/1.1` default.
     public init(
         server: Endpoint,
         uuid: String,
@@ -122,7 +150,9 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         tls: Bool = true,
         reality: REALITYConfig? = nil,
         flow: String? = nil,
-        command: VLESSCommand = .tcp
+        command: VLESSCommand = .tcp,
+        skipCertVerify: Bool = false,
+        alpn: [String]? = nil
     ) throws {
         self.server = server
         self.endpoint = target
@@ -132,6 +162,8 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         self.reality = reality
         self.flow = VLESSVision.normalized(flow)
         self.command = command
+        self.skipCertVerify = skipCertVerify
+        self.alpn = alpn
         self.transport = NWStreamTransport(
             queueLabel: "prizmx.vless.outbound",
             endpoint: target,
@@ -166,7 +198,11 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         defer { transport.readMutex.release() }
         try transport.ensureNotClosed()
 
-        try await flushHeaderIfNeeded()
+        // Lock-free check: only the very first read may need `sendMutex`,
+        // so a stalled upload never blocks the download direction.
+        if !transport.isHandshakeFlushed {
+            try await flushHeaderIfNeeded()
+        }
         if visionReader != nil {
             return try await readVision(into: buffer)
         }
@@ -224,33 +260,49 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         guard let visionReader else { return .eof }
         guard let chunk = try await transport.receiveRaw() else { return .eof }
 
-        guard let realitySession else {
-            // Vision over Network.framework TLS: chunks are already plaintext.
+        return try ingestVisionWire(chunk, reader: visionReader)
+    }
+
+    /// Feeds one wire chunk through the Vision downlink (split out for tests).
+    func ingestVisionWire(_ chunk: Data, reader visionReader: VLESSVisionReader) throws -> WireReceive {
+        guard let tlsLayer = userspaceTLS else {
+            // Vision without TLS: chunks are already plaintext.
             let plain = try stripVisionResponseHeader(from: chunk)
             guard !plain.isEmpty else { return .needMore }
             let out = visionReader.feed(plain)
             visionApp.append(out)
             return out.isEmpty ? .needMore : .bytes(out.count)
         }
-        if realitySession.isRawMode {
+        if tlsLayer.isRawMode {
             visionApp.append(chunk)
             return .bytes(chunk.count)
         }
-        realitySession.appendWire(chunk)
+        tlsLayer.appendWire(chunk)
         var produced = 0
-        while let record = try realitySession.decryptNextRecord() {
+        while let record = try tlsLayer.decryptNextRecord() {
             produced += record.count
             let plain = try stripVisionResponseHeader(from: record)
             if !plain.isEmpty {
                 visionApp.append(visionReader.feed(plain))
             }
             if visionReader.sawDirectCommand {
-                realitySession.enableRawMode()
-                visionApp.append(realitySession.drainRawIncoming())
+                tlsLayer.enableRawMode()
+                visionApp.append(tlsLayer.drainRawIncoming())
                 break
             }
         }
         return produced > 0 ? .bytes(produced) : .needMore
+    }
+
+    /// Test hook: installs a record layer as if the userspace TLS handshake ran.
+    func installUserspaceTLSForTesting(_ layer: TLS13RecordLayer) {
+        userspaceTLS = layer
+    }
+
+    /// Test hook: drains decoded Vision downlink bytes.
+    func takeVisionAppForTesting() -> Data {
+        defer { visionApp.removeAll() }
+        return visionApp
     }
 
     /// Strips the 2-byte (plus addons) VLESS response header from the first
@@ -258,9 +310,12 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     private func stripVisionResponseHeader(from record: Data) throws -> Data {
         guard !responseHeaderConsumed else { return record }
         visionResponsePending.append(record)
-        guard let parsed = try VLESSResponseHeader.consume(
-            visionResponsePending.withUnsafeBytes { $0 }
-        ) else {
+        // Parse inside the closure: the buffer pointer must not escape it
+        // (small `Data` is stored inline and would dangle).
+        let parsed = try visionResponsePending.withUnsafeBytes { raw in
+            try VLESSResponseHeader.consume(raw)
+        }
+        guard let parsed else {
             return Data()
         }
         responseHeaderConsumed = true
@@ -272,6 +327,28 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     public func close() async {
         await transport.close()
     }
+
+    /// Half-close the uplink: flushes a still-pending request header, sends
+    /// TLS `close_notify` on the userspace TLS path (Network.framework TLS
+    /// emits its own), then TCP FIN. Reads keep working.
+    public func closeWrite() async {
+        guard state == .established else { return }
+        if !transport.isHandshakeFlushed {
+            try? await flushHeaderIfNeeded()
+        }
+        let tlsLayer = userspaceTLS
+        await transport.finishWriting {
+            await self.sendMutex.acquire()
+            defer { self.sendMutex.release() }
+            // The uplink stays TLS-sealed even after a downlink Vision
+            // `direct` switch, so close_notify is always well-formed here.
+            if let tlsLayer {
+                try await self.transport.send(try tlsLayer.sealCloseNotify())
+            }
+        }
+    }
+
+    public var supportsHalfClose: Bool { true }
 
     @discardableResult
     public func write(_ data: Data) async throws -> Int {
@@ -299,20 +376,15 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
 
-        let useREALITY = reality != nil
         let tlsOptions: NWProtocolTLS.Options?
-        if useREALITY {
+        if usesUserspaceTLS || !tlsEnabled {
             tlsOptions = nil
-        } else if tlsEnabled {
-            let tls = NWProtocolTLS.Options()
-            if let name = tlsServerName {
-                name.withCString { pointer in
-                    sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, pointer)
-                }
-            }
-            tlsOptions = tls
         } else {
-            tlsOptions = nil
+            tlsOptions = TLSClient.options(
+                serverName: tlsServerName,
+                skipVerification: skipCertVerify,
+                alpn: alpn
+            )
         }
 
         let parameters = NWParameters(tls: tlsOptions, tcp: tcp)
@@ -325,8 +397,18 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         do {
             try await transport.waitUntilReady(nw)
             if let reality {
-                self.realitySession = try await REALITYHandshaker(config: reality)
+                self.userspaceTLS = try await REALITYHandshaker(config: reality)
                     .handshake(on: nw, queue: transport.queue)
+                    .recordLayer
+            } else if usesUserspaceTLS {
+                self.userspaceTLS = try await TLS13ClientHandshake.run(
+                    on: nw,
+                    queue: transport.queue,
+                    serverName: tlsServerName,
+                    verifyName: tlsServerName ?? serverIPLiteral,
+                    alpn: alpn ?? TLS13.defaultALPN,
+                    skipCertificateVerification: skipCertVerify
+                )
             }
             try await sendRequestHeader()
         } catch {
@@ -342,6 +424,12 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         if let sni, !sni.isEmpty { return sni }
         if case .domain(let domain) = server.host { return domain }
         return nil
+    }
+
+    /// IP-literal server with no SNI: the certificate must cover the IP.
+    private var serverIPLiteral: String? {
+        if case .domain = server.host { return nil }
+        return server.host.description
     }
 
     private func sendRequestHeader() async throws {
@@ -391,6 +479,7 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     private func takeHeaderPayload(extra: Data?) -> Data {
         guard let header = unsentHeader else { return extra ?? Data() }
         unsentHeader = nil
+        transport.markHandshakeFlushed()
         var payload = header
         if let extra, !extra.isEmpty {
             payload.append(extra)
@@ -423,8 +512,8 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
 
     private func sendWire(_ data: Data) async throws {
         let wire: Data
-        if let realitySession {
-            wire = try realitySession.sealApplication(data)
+        if let userspaceTLS {
+            wire = try userspaceTLS.sealApplication(data)
         } else {
             wire = data
         }
@@ -434,9 +523,9 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     private func receiveOnce() async throws -> WireReceive {
         guard let chunk = try await transport.receiveRaw() else { return .eof }
 
-        if let realitySession {
-            try realitySession.feedWire(chunk)
-            let plain = realitySession.drainPlaintext()
+        if let userspaceTLS {
+            try userspaceTLS.feedWire(chunk)
+            let plain = userspaceTLS.drainPlaintext()
             if plain.isEmpty { return .needMore }
             transport.inbox.append(plain)
             return .bytes(plain.count)

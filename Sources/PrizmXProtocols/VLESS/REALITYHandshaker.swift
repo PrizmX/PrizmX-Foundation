@@ -228,7 +228,7 @@ public struct REALITYHandshaker: Sendable {
                     connection: connection,
                     queue: queue,
                     clientHello: prepared.hello
-                ) { certificate in
+                ) { _, certificate in
                     try Self.verifyPeerCertificate(authKey: prepared.authKey, certificate: certificate)
                 }
             }
@@ -300,6 +300,9 @@ public final class REALITYSession: @unchecked Sendable {
     func drainPlaintext() -> Data {
         layer.drainPlaintext()
     }
+
+    /// Record layer shared with the non-REALITY userspace TLS path.
+    var recordLayer: TLS13RecordLayer { layer }
 
     // MARK: Vision direct copy
 
