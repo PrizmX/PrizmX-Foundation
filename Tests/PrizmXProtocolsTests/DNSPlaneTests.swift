@@ -327,3 +327,41 @@ private final class LocalUDPDNS: @unchecked Sendable {
     packet.append(rdata)
     #expect(DNSWire.ptrNames(in: packet, expectedID: 0x1234) == ["iPhone.local"])
 }
+
+@Test func dohHonorsContentLengthAndChunkedBodies() throws {
+    let body = Data([0x12, 0x34, 0x81, 0x80, 0x00, 0x00])
+    var sized = Data("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n".utf8)
+    #expect(try DoHNameserver.httpBody(in: sized, atEOF: false) == nil)
+    sized.append(body)
+    sized.append(Data("GARBAGE".utf8)) // keep-alive leftovers must be ignored
+    #expect(try DoHNameserver.httpBody(in: sized, atEOF: false) == body)
+    #expect(try DoHNameserver.dnsMessage(from: sized) == body)
+
+    var chunked = Data("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n4;ext=1\r\n".utf8)
+    chunked.append(body.prefix(4))
+    chunked.append(Data("\r\n2\r\n".utf8))
+    #expect(try DoHNameserver.httpBody(in: chunked, atEOF: false) == nil)
+    chunked.append(body.suffix(2))
+    chunked.append(Data("\r\n0\r\n\r\n".utf8))
+    #expect(try DoHNameserver.httpBody(in: chunked, atEOF: false) == body)
+
+    let truncated = Data("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc".utf8)
+    #expect(throws: DNSError.self) { try DoHNameserver.dnsMessage(from: truncated) }
+    let notFound = Data("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".utf8)
+    #expect(throws: DNSError.self) { try DoHNameserver.dnsMessage(from: notFound) }
+    let eofDelimited = Data("HTTP/1.1 200 OK\r\n\r\n".utf8) + body
+    #expect(try DoHNameserver.httpBody(in: eofDelimited, atEOF: false) == nil)
+    #expect(try DoHNameserver.dnsMessage(from: eofDelimited) == body)
+}
+
+@Test func dohRequestTargetKeepsExistingQuery() throws {
+    let plain = try #require(URL(string: "https://dns.example/dns-query"))
+    #expect(DoHNameserver.requestTarget(for: plain, dnsParameter: "AAAB") == "/dns-query?dns=AAAB")
+    let templated = try #require(URL(string: "https://dns.example/dns-query?ct=a%2Bb&x=1"))
+    #expect(
+        DoHNameserver.requestTarget(for: templated, dnsParameter: "AAAB")
+            == "/dns-query?ct=a%2Bb&x=1&dns=AAAB"
+    )
+    let root = try #require(URL(string: "https://dns.example"))
+    #expect(DoHNameserver.requestTarget(for: root, dnsParameter: "Q") == "/?dns=Q")
+}
