@@ -385,6 +385,8 @@ public actor TUNStack {
         var question: DNSMessage.Question
         var client: Endpoint
         var server: Endpoint
+        /// Wire query as received (forwarded verbatim for other types).
+        var raw: Data
 
         var isIPv6: Bool {
             if case .ipv6 = server.host { return true }
@@ -411,7 +413,8 @@ public actor TUNStack {
             server: Endpoint(
                 host: .ipv4(IPv4Address(packet[16], packet[17], packet[18], packet[19])),
                 port: destPort
-            )
+            ),
+            raw: payload
         )
         await answer(query: query, fakeIP: fakeIP)
         return true
@@ -432,7 +435,8 @@ public actor TUNStack {
             id: parsed.id,
             question: parsed.question,
             client: Endpoint(host: .ipv6(ipv6(packet, at: 8)), port: srcPort),
-            server: Endpoint(host: .ipv6(dest), port: destPort)
+            server: Endpoint(host: .ipv6(dest), port: destPort),
+            raw: payload
         )
         await answer(query: query, fakeIP: fakeIP)
         return true
@@ -446,7 +450,7 @@ public actor TUNStack {
         let isA = type == 1
         let isAAAA = type == 28
         guard isA || isAAAA else {
-            writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
+            answerOther(query: query)
             return
         }
         let name = query.question.name
@@ -504,6 +508,33 @@ public actor TUNStack {
             return
         }
         writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
+    }
+
+    /// SRV / TXT / MX / PTR …: forwarded to the direct plane (like mihomo's
+    /// fake-ip mode). FakeIP reverse lookups get a local NODATA, and so does
+    /// everything when there is no DNS client. REJECT is enforced when the
+    /// flow opens, not here.
+    ///
+    /// HTTPS / SVCB always get NODATA: a real record advertises `alpn=h3`
+    /// (QUIC to the FakeIP, which TCP-only proxies black-hole) and carries
+    /// real-address hints that bypass FakeIP.
+    ///
+    /// Never awaits on the packet path: a slow upstream would otherwise
+    /// queue every FakeDNS answer behind it.
+    private func answerOther(query: DNSQuery) {
+        let local = DNSMessage.response(id: query.id, question: query.question)
+        let type = query.question.type
+        guard type != 64, type != 65, let dns, !DNSForwarder.isFakeIPReverseName(query.question.name) else {
+            writeDNSReply(local, to: query)
+            return
+        }
+        let mailbox = self.mailbox
+        let settings = dns.settings
+        Task {
+            let answer = await DNSForwarder.forward(query.raw, settings: settings) ?? local
+            let reply = Self.encode(answer, to: query)
+            mailbox.write(bytes: reply, protocolFamily: query.isIPv6 ? 30 : AddressFamily.inet)
+        }
     }
 
     /// Only REJECT is decided at DNS time; filter names never reach this
