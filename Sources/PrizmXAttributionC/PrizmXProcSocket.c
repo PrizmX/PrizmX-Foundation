@@ -149,6 +149,9 @@ static int fill_pcblist_n(
     int written = 0;
     uint16_t pending_lport = 0;
     uint16_t pending_fport = 0;
+    uint8_t pending_v6 = 0;
+    uint8_t pending_laddr[16];
+    uint8_t pending_faddr[16];
     int pending = 0;
     while (p + 8 <= end && written < max_count) {
         uint32_t rec_len = *(uint32_t *)(void *)p;
@@ -159,6 +162,23 @@ static int fill_pcblist_n(
         if (rec_kind == XSO_INPCB && rec_len >= 20) {
             pending_fport = ntohs(*(uint16_t *)(void *)(p + 16));
             pending_lport = ntohs(*(uint16_t *)(void *)(p + 18));
+            memset(pending_laddr, 0, sizeof(pending_laddr));
+            memset(pending_faddr, 0, sizeof(pending_faddr));
+            pending_v6 = 0;
+            // xinpcb_n (pack 4): inp_vflag @44, inp_dependfaddr @48,
+            // inp_dependladdr @64; IPv4 sits in the last 4 bytes of each
+            // union (in_addr_4in6). Same offsets mihomo reads.
+            if (rec_len >= 80) {
+                uint8_t vflag = *(uint8_t *)(p + 44);
+                if (vflag & 0x1) {
+                    memcpy(pending_faddr, p + 60, 4);
+                    memcpy(pending_laddr, p + 76, 4);
+                } else if (vflag & 0x2) {
+                    pending_v6 = 1;
+                    memcpy(pending_faddr, p + 48, 16);
+                    memcpy(pending_laddr, p + 64, 16);
+                }
+            }
             pending = 1;
         } else if (rec_kind == XSO_SOCKET && rec_len >= 76 && pending) {
             pid_t last_pid = *(pid_t *)(void *)(p + 68);
@@ -170,8 +190,11 @@ static int fill_pcblist_n(
                 memset(row, 0, sizeof(*row));
                 row->pid = pid;
                 row->transport = transport;
+                row->is_ipv6 = pending_v6;
                 row->local_port = pending_lport;
                 row->remote_port = pending_fport;
+                memcpy(row->local_addr, pending_laddr, sizeof(row->local_addr));
+                memcpy(row->remote_addr, pending_faddr, sizeof(row->remote_addr));
                 written += 1;
             }
         }
@@ -181,7 +204,7 @@ static int fill_pcblist_n(
     return written;
 }
 
-int prizmx_list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid) {
+static int list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid, int guard_filtered) {
     if (out == NULL || max_count <= 0) {
         errno = EINVAL;
         return -EINVAL;
@@ -208,13 +231,25 @@ int prizmx_list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid)
         );
     }
     int written = tcp + udp;
+    if (written >= max_count) {
+        // Buffer full: not a filtered table. The caller grows and retries.
+        return max_count;
+    }
     int claimed = claimed_tcp + claimed_udp;
     // Filtered table (only the caller's own sockets) looks non-empty but is
     // useless for attribution — report failure so callers use libproc instead.
-    if (claimed >= 16 && written < claimed / 4) {
+    if (guard_filtered && claimed >= 16 && written < claimed / 4) {
         return 0;
     }
     return written;
+}
+
+int prizmx_list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid) {
+    return list_pcblist_n(out, max_count, skip_pid, 1);
+}
+
+int prizmx_list_pcblist_n_raw(prizmx_socket_row *out, int max_count, pid_t skip_pid) {
+    return list_pcblist_n(out, max_count, skip_pid, 0);
 }
 
 pid_t prizmx_find_pid_pcblist_n(uint16_t local_port_host, int is_tcp) {

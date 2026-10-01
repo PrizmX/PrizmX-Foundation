@@ -21,9 +21,15 @@ typedef struct prizmx_socket_row {
 /// 0 when none, or a negative `-errno` on failure.
 int prizmx_list_sockets(prizmx_socket_row *out, int max_count, pid_t skip_pid);
 
-/// Parse `net.inet.{tcp,udp}.pcblist_n` tagged xinpcb_n + xsocket_n.
-/// PID comes from so_e_pid, falling back to so_last_pid.
+/// Parse `net.inet.{tcp,udp}.pcblist_n` tagged xinpcb_n + xsocket_n,
+/// including local / foreign addresses. PID comes from so_e_pid (the app a
+/// delegated socket works for), falling back to so_last_pid. Returns
+/// `max_count` when the buffer filled up (callers grow and retry).
 int prizmx_list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid);
+
+/// Same parse without the filtered-table guard: on systems that only show a
+/// non-root caller its own sockets, this still returns those (tests, probes).
+int prizmx_list_pcblist_n_raw(prizmx_socket_row *out, int max_count, pid_t skip_pid);
 
 /// Look up one local port in pcblist_n. Returns 0 if not found.
 pid_t prizmx_find_pid_pcblist_n(uint16_t local_port_host, int is_tcp);

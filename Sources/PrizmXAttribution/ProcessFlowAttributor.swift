@@ -3,61 +3,63 @@ import Foundation
 import os
 import PrizmXCore
 
-/// Cache / snapshot policy for process attribution.
+/// Timing policy for process attribution.
 public struct AttributionCachePolicy: Sendable, Equatable {
-    public var tcpTTL: Duration
-    public var udpTTL: Duration
-    public var negativeTTL: Duration
-    public var minRefresh: Duration
+    /// A snapshot this recent may answer an exact match without re-reading
+    /// the socket table (bursts of new flows share one read).
+    public var snapshotReuse: Duration
+    /// PID → app identity (`proc_pidpath` / bundle) cache lifetime.
     public var identityTTL: Duration
 
     public static let `default` = AttributionCachePolicy(
-        /// Safety bound if FIN/RST never arrives (NAT drop, crash).
-        tcpTTL: .seconds(600),
-        udpTTL: .seconds(5),
-        negativeTTL: .milliseconds(200),
-        minRefresh: .milliseconds(250),
+        snapshotReuse: .seconds(1),
         identityTTL: .seconds(30)
     )
+
+    public init(snapshotReuse: Duration, identityTTL: Duration) {
+        self.snapshotReuse = snapshotReuse
+        self.identityTTL = identityTTL
+    }
 }
 
-/// Thread-safe 5-tuple → process lookup.
+/// Socket → process lookup at flow open (mihomo-style, from `pcblist_n`).
 ///
-/// Lives in the Packet Tunnel process (jetsam ~50 MB). Stores only PIDs and
-/// short strings — never app icons. TCP is populated at SYN and dropped at
-/// FIN/RST. UDP is cache-first; a miss walks `pcblist_n` and slides a short TTL.
+/// A client creates its socket before the first packet leaves it, so a
+/// socket table read that starts after the lookup was requested always
+/// contains the flow's socket. Lookups first try the current snapshot
+/// (exact match only, while it is recent) and re-read the table only when
+/// that snapshot predates the request, so a burst of new flows costs one
+/// read. Matching never guesses:
 ///
-/// Hot-path invariants:
-/// - cache hit: one lock, one dictionary probe, no syscalls, no allocations
-///   (UDP re-touches expiry at most once per half TTL);
-/// - identity resolution (`proc_pidpath` / `Bundle`) happens outside the
-///   lookup lock under its own lock, so one slow PID never stalls lookups.
+/// - TCP: local port + remote port, plus the remote address when the
+///   caller knows it (TUN passes the wire destination, FakeIP included;
+///   mixed-port passes none and matches on its listen port).
+/// - UDP: connected sockets match the same way; otherwise an unconnected
+///   socket on the local port, if all such sockets belong to one process.
+///
+/// Lives in the Packet Tunnel (jetsam ~50 MB): stores PIDs and short
+/// strings only. Identity resolution runs outside the snapshot lock.
 public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
-    struct CacheKey: Hashable {
-        var transport: FlowTransport
-        var localPort: UInt16
-        var remotePort: UInt16
-        var remoteAddress: String
-    }
-
-    private struct CacheEntry {
-        var attribution: FlowAttribution?
-        var expiresAt: ContinuousClock.Instant
-    }
-
     private struct IdentityEntry {
         var attribution: FlowAttribution
         var expiresAt: ContinuousClock.Instant
     }
 
-    /// Owners indexed once per refresh so a miss is bucket lookup, not a scan.
     private struct State {
-        var cache: [CacheKey: CacheEntry] = [:]
-        var owners: [SocketOwner] = []
-        var ownerIndex: [FlowTransport: [UInt16: [SocketOwner]]] = [:]
-        var lastRefresh: ContinuousClock.Instant?
+        var index: [FlowTransport: [UInt16: [SocketOwner]]] = [:]
+        var count = 0
+        /// When the current snapshot's table read began.
+        var takenAt: ContinuousClock.Instant?
     }
 
+    private struct Query {
+        var transport: FlowTransport
+        var localPort: UInt16
+        var remotePort: UInt16
+        var remote: SocketAddress?
+    }
+
+    /// Held across the table read: concurrent lookups wait and then reuse it.
     private let lock = OSAllocatedUnfairLock(initialState: State())
     private let identityLock = OSAllocatedUnfairLock(initialState: [Int32: IdentityEntry]())
     private let table: any SocketTableReading
@@ -65,7 +67,6 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
     private let policy: AttributionCachePolicy
     private let ownPID: Int32
     private let now: @Sendable () -> ContinuousClock.Instant
-    private let maxCacheEntries = 1_024
 
     public convenience init(policy: AttributionCachePolicy = .default) {
         self.init(
@@ -91,6 +92,9 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
         self.now = now
     }
 
+    /// `remoteAddress` is the destination as the client's socket sees it;
+    /// empty means "any" (match on ports only). `localAddress` is unused:
+    /// the local port plus the remote side already identify the socket.
     public func attribute(
         transport: FlowTransport,
         localAddress: String,
@@ -98,169 +102,51 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
         remoteAddress: String,
         remotePort: UInt16
     ) -> FlowAttribution? {
-        lookup(
-            transport: transport,
-            localAddress: localAddress,
-            localPort: localPort,
-            remoteAddress: remoteAddress,
-            remotePort: remotePort,
-            allowCachedNegative: true
-        )
-    }
-
-    /// Flow-open lookup: cached negatives are ignored and retried against a
-    /// fresh socket table, so a transient warm-up miss cannot pin a flow to
-    /// "unattributed" for its whole lifetime.
-    public func attributeFresh(
-        transport: FlowTransport,
-        localAddress: String,
-        localPort: UInt16,
-        remoteAddress: String,
-        remotePort: UInt16
-    ) -> FlowAttribution? {
-        lookup(
-            transport: transport,
-            localAddress: localAddress,
-            localPort: localPort,
-            remoteAddress: remoteAddress,
-            remotePort: remotePort,
-            allowCachedNegative: false
-        )
-    }
-
-    private func lookup(
-        transport: FlowTransport,
-        localAddress: String,
-        localPort: UInt16,
-        remoteAddress: String,
-        remotePort: UInt16,
-        allowCachedNegative: Bool
-    ) -> FlowAttribution? {
         _ = localAddress
         guard localPort > 0 else { return nil }
-        let key = Self.key(
+        let query = Query(
             transport: transport,
             localPort: localPort,
-            remoteAddress: remoteAddress,
-            remotePort: remotePort
+            remotePort: remotePort,
+            remote: SocketAddress(remoteAddress)
         )
-        let instant = now()
-        // Fast path: one lock, one dictionary probe, no syscalls.
-        if let hit = lock.withLock({ state -> CacheEntry? in
-            guard let hit = state.cache[key], hit.expiresAt > instant else { return nil }
-            if transport == .udp,
-               hit.attribution != nil,
-               instant.duration(to: hit.expiresAt) < policy.udpTTL / 2 {
-                // Slide lazily: one dictionary write per half TTL at most.
-                state.cache[key] = CacheEntry(
-                    attribution: hit.attribution,
-                    expiresAt: instant + policy.udpTTL
-                )
-            }
-            return hit
-        }), hit.attribution != nil || allowCachedNegative {
-            return hit.attribution
-        }
-        // Slow path: find the owner under the lookup lock, then resolve the
-        // identity (syscalls / plist reads) under its own lock.
+        let requested = now()
         let owner: SocketOwner? = lock.withLock { state in
-            let refreshed = refreshIfNeeded(&state, at: instant)
-            if let found = Self.match(
-                transport: transport,
-                localPort: localPort,
-                remoteAddress: remoteAddress,
-                remotePort: remotePort,
-                in: state.ownerIndex
-            ) {
-                return found
+            if let takenAt = state.takenAt,
+               takenAt.duration(to: requested) <= policy.snapshotReuse,
+               let hit = Self.match(query, in: state.index) {
+                return hit
             }
-            guard !refreshed else { return nil }
-            refresh(&state, at: instant)
-            return Self.match(
-                transport: transport,
-                localPort: localPort,
-                remoteAddress: remoteAddress,
-                remotePort: remotePort,
-                in: state.ownerIndex
-            )
-        }
-
-        let attribution = owner.flatMap { resolvedIdentity(for: $0.pid) }
-        let ttl: Duration
-        if attribution == nil {
-            ttl = policy.negativeTTL
-        } else if transport == .udp {
-            ttl = policy.udpTTL
-        } else {
-            ttl = policy.tcpTTL
-        }
-        lock.withLock { state in
-            state.cache[key] = CacheEntry(attribution: attribution, expiresAt: instant + ttl)
-            if state.cache.count > maxCacheEntries {
-                state.cache = state.cache.filter { $0.value.expiresAt > instant }
+            // Only a read that starts after the request is sure to include
+            // the socket; a newer one (taken by a concurrent lookup) counts.
+            if state.takenAt.map({ $0 < requested }) ?? true {
+                refresh(&state)
             }
+            return Self.match(query, in: state.index)
         }
-        return attribution
+        return owner.flatMap { resolvedIdentity(for: $0.pid) }
     }
 
-    public func forget(
-        transport: FlowTransport,
-        localPort: UInt16,
-        remoteAddress: String,
-        remotePort: UInt16
-    ) {
-        let key = Self.key(
-            transport: transport,
-            localPort: localPort,
-            remoteAddress: remoteAddress,
-            remotePort: remotePort
-        )
-        lock.withLock { state in
-            state.cache[key] = nil
-            guard var bucket = state.ownerIndex[transport]?[localPort] else { return }
-            if transport == .tcp {
-                bucket.removeAll { $0.transport == .tcp }
-            } else {
-                bucket.removeAll { $0.remotePort == remotePort }
-            }
-            state.ownerIndex[transport]?[localPort] = bucket.isEmpty ? nil : bucket
-            state.owners.removeAll {
-                transport == .tcp
-                    ? ($0.transport == .tcp && $0.localPort == localPort)
-                    : ($0.transport == .udp && $0.localPort == localPort && $0.remotePort == remotePort)
-            }
-        }
-    }
-
-    /// Force a socket-table walk. Used by the startup probe.
+    /// Re-reads the socket table. Used by the startup probe.
     public func refresh() -> Int {
         lock.withLock { state in
-            let instant = now()
-            refresh(&state, at: instant)
-            return state.owners.count
+            refresh(&state)
+            return state.count
         }
     }
 
-    @discardableResult
-    private func refreshIfNeeded(_ state: inout State, at instant: ContinuousClock.Instant) -> Bool {
-        if let last = state.lastRefresh, last.duration(to: instant) < policy.minRefresh {
-            return false
-        }
-        refresh(&state, at: instant)
-        return true
-    }
-
-    private func refresh(_ state: inout State, at instant: ContinuousClock.Instant) {
-        state.owners = table.snapshot(skipPID: ownPID)
+    private func refresh(_ state: inout State) {
+        let started = now()
+        let owners = table.snapshot(skipPID: ownPID)
         var index: [FlowTransport: [UInt16: [SocketOwner]]] = [:]
-        for owner in state.owners {
+        for owner in owners {
             index[owner.transport, default: [:]][owner.localPort, default: []].append(owner)
         }
-        state.ownerIndex = index
-        state.lastRefresh = instant
-        state.cache = state.cache.filter { $0.value.expiresAt > instant }
+        state.index = index
+        state.count = owners.count
+        state.takenAt = started
         identityLock.withLock { identities in
-            identities = identities.filter { $0.value.expiresAt > instant }
+            identities = identities.filter { $0.value.expiresAt > started }
         }
     }
 
@@ -279,45 +165,29 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
         return resolved
     }
 
-    static func key(
-        transport: FlowTransport,
-        localPort: UInt16,
-        remoteAddress: String,
-        remotePort: UInt16
-    ) -> CacheKey {
-        CacheKey(
-            transport: transport,
-            localPort: localPort,
-            remotePort: transport == .udp ? remotePort : 0,
-            remoteAddress: transport == .udp ? remoteAddress : ""
-        )
-    }
-
     private static func match(
-        transport: FlowTransport,
-        localPort: UInt16,
-        remoteAddress: String,
-        remotePort: UInt16,
+        _ query: Query,
         in index: [FlowTransport: [UInt16: [SocketOwner]]]
     ) -> SocketOwner? {
-        guard let candidates = index[transport]?[localPort], !candidates.isEmpty else { return nil }
-        if transport == .udp {
-            if let exact = candidates.first(where: {
-                $0.remotePort == remotePort && $0.remoteAddress == remoteAddress
-            }) {
-                return exact
-            }
-            if let byPort = candidates.first(where: { $0.remotePort == remotePort }) {
-                return byPort
-            }
-            // Unconnected UDP sockets (WebRTC / STUN / QUIC probes) record
-            // remotePort 0 in the socket table. When every candidate on this
-            // local port agrees on one PID the owner is still unambiguous.
-            if Set(candidates.map(\.pid)).count == 1 {
-                return candidates.first
-            }
+        guard let candidates = index[query.transport]?[query.localPort], !candidates.isEmpty else {
             return nil
         }
-        return candidates.first { $0.remotePort == remotePort } ?? candidates.first
+        if let connected = candidates.first(where: {
+            $0.remotePort == query.remotePort
+                && (query.remote == nil || $0.remoteAddress == query.remote)
+        }) {
+            return connected
+        }
+        guard query.transport == .udp else { return nil }
+        // Unconnected UDP (QUIC / STUN / DNS clients that sendto()) records
+        // no peer. Accept it only when every such socket on this port is
+        // owned by one process.
+        let unconnected = candidates.filter { $0.remotePort == 0 && $0.remoteAddress == nil }
+        guard let first = unconnected.first,
+              unconnected.allSatisfy({ $0.pid == first.pid })
+        else {
+            return nil
+        }
+        return first
     }
 }

@@ -18,6 +18,9 @@ public protocol InboundStream: Sendable {
     /// Mixed-port listen port. Process attribution looks up the socket to
     /// this port, not the ultimate destination port.
     var listenPort: UInt16? { get }
+    /// The destination as the client's socket sees it (TUN: the original
+    /// IP, FakeIP included). nil: attribution matches on `listenPort`.
+    var socketRemote: (address: String, port: UInt16)? { get }
     func read() async throws -> Data?
     func write(_ data: Data) async throws
     func close() async
@@ -35,6 +38,7 @@ extension InboundStream {
     public var clientPort: UInt16 { 0 }
     public var isTunnelInbound: Bool { false }
     public var listenPort: UInt16? { nil }
+    public var socketRemote: (address: String, port: UInt16)? { nil }
 }
 
 /// Splices an inbound TCP stream through `Engine.dispatch`, recording traffic
@@ -45,19 +49,18 @@ public enum EngineTCPRelay: Sendable {
         let prepared = await Self.prepare(stream: stream)
         let inbound = prepared.stream
         let target = prepared.endpoint
-        // Mixed-port LAN clients are remote sockets. libproc matching their
-        // ephemeral port against this Mac can pin the row on a random local app.
-        // Flow-open is the last chance to name the process: bypass cached
-        // negatives so a transient SYN-warm-up miss cannot stick for the
-        // whole lifetime of the flow.
+        // Mixed-port LAN clients are remote sockets: their ephemeral port
+        // says nothing about apps on this Mac. TUN flows match the client
+        // socket by its wire destination; mixed-port ones by the listener.
         let attribution: FlowAttribution?
         if inbound.isTunnelInbound || Self.isLoopbackClient(inbound.clientAddress) {
+            let remote = inbound.socketRemote
             attribution = engine.flowAttributor?.attributeFresh(
                 transport: .tcp,
                 localAddress: inbound.clientAddress,
                 localPort: inbound.clientPort,
-                remoteAddress: target.host.description,
-                remotePort: inbound.listenPort ?? target.port
+                remoteAddress: remote?.address ?? "",
+                remotePort: remote?.port ?? inbound.listenPort ?? target.port
             )
         } else {
             attribution = nil
@@ -305,6 +308,7 @@ final class PrefixedInboundStream: InboundStream, @unchecked Sendable {
     var clientPort: UInt16 { inner.clientPort }
     var isTunnelInbound: Bool { inner.isTunnelInbound }
     var listenPort: UInt16? { inner.listenPort }
+    var socketRemote: (address: String, port: UInt16)? { inner.socketRemote }
     var supportsHalfClose: Bool { inner.supportsHalfClose }
     private let inner: any InboundStream
     private struct Buffered {

@@ -16,6 +16,7 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
     public var clientAddress: String { flow.src.description }
     public var clientPort: UInt16 { flow.srcPort }
     public var isTunnelInbound: Bool { true }
+    public var socketRemote: (address: String, port: UInt16)? { (flow.dst.description, flow.dstPort) }
     let flow: FlowKey
     private let byteStream: any TCPByteStream
     private let lock = NSLock()
@@ -145,7 +146,6 @@ public actor TUNStack {
     /// Clash `dns.ipv6`: FakeIPv6 pool + pass IPv6 into SwiftTCP.
     private let ipv6Enabled: Bool
     /// TCP SYN/FIN hooks; nil on iOS.
-    private let flowAttributor: (any FlowAttributing)?
     private var stack: SwiftStack?
     private var started = false
     private var pendingIngest: [Data] = []
@@ -157,7 +157,6 @@ public actor TUNStack {
         dns: DNSClient? = nil,
         dnsPolicy: (@Sendable (String) async -> Policy)? = nil,
         ipv6: Bool = false,
-        flowAttributor: (any FlowAttributing)? = nil,
         onOutput: @escaping @Sendable ([Data]) -> Void
     ) {
         self.fakeIP = fakeIP
@@ -165,7 +164,6 @@ public actor TUNStack {
         self.dns = dns
         self.dnsPolicy = dnsPolicy
         self.ipv6Enabled = ipv6
-        self.flowAttributor = flowAttributor
         self.mailbox = TUNMailbox(fakeIP: fakeIP, onOutput: onOutput)
     }
 
@@ -268,7 +266,6 @@ public actor TUNStack {
                         }
                         continue
                     }
-                    noteTCP(packet, ipv6: true)
                     forwarded.append(packet)
                 } else if let reply = ICMPReply.ipv6Unreachable(original: packet) {
                     mailbox.write(bytes: reply, protocolFamily: 30)
@@ -276,7 +273,6 @@ public actor TUNStack {
                 continue
             }
             if await handleDNSIfNeeded(packet) { continue }
-            noteTCP(packet, ipv6: false)
             forwarded.append(packet)
         }
         guard !forwarded.isEmpty else { return }
@@ -302,80 +298,6 @@ public actor TUNStack {
             }
             await stack?.ingestBatch(batch)
         }
-    }
-
-    /// TCP SYN (no ACK) populates the process cache; FIN/RST drops it.
-    /// One contiguous byte pass — no per-index Data subscripts on the hot path.
-    private func noteTCP(_ packet: Data, ipv6: Bool) {
-        guard let attributor = flowAttributor else { return }
-        packet.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            let header: Int
-            if ipv6 {
-                guard raw.count >= 54, base.load(fromByteOffset: 6, as: UInt8.self) == 6 else { return }
-                header = 40
-            } else {
-                guard raw.count >= 40,
-                      base.load(fromByteOffset: 0, as: UInt8.self) >> 4 == 4,
-                      base.load(fromByteOffset: 9, as: UInt8.self) == 6
-                else { return }
-                header = Int(base.load(fromByteOffset: 0, as: UInt8.self) & 0x0F) << 2
-                guard raw.count >= header + 14 else { return }
-            }
-            let flags = base.load(fromByteOffset: header + 13, as: UInt8.self)
-            let synOnly = flags & 0x12 == 0x02
-            let finOrRst = flags & 0x05 != 0
-            guard synOnly || finOrRst else { return }
-            let srcPort = UInt16(base.load(fromByteOffset: header, as: UInt8.self)) << 8
-                | UInt16(base.load(fromByteOffset: header + 1, as: UInt8.self))
-            let dstPort = UInt16(base.load(fromByteOffset: header + 2, as: UInt8.self)) << 8
-                | UInt16(base.load(fromByteOffset: header + 3, as: UInt8.self))
-            let src: String
-            let dst: String
-            if ipv6 {
-                src = Self.ipv6String(base, at: 8)
-                dst = Self.ipv6String(base, at: 24)
-            } else {
-                src = Self.ipv4String(base, at: 12)
-                dst = Self.ipv4String(base, at: 16)
-            }
-            if synOnly {
-                _ = attributor.attribute(
-                    transport: .tcp,
-                    localAddress: src,
-                    localPort: srcPort,
-                    remoteAddress: dst,
-                    remotePort: dstPort
-                )
-            } else {
-                attributor.forget(
-                    transport: .tcp,
-                    localPort: srcPort,
-                    remoteAddress: dst,
-                    remotePort: dstPort
-                )
-            }
-        }
-    }
-
-    private static func ipv4String(_ base: UnsafeRawPointer, at offset: Int) -> String {
-        "\(base.load(fromByteOffset: offset, as: UInt8.self))."
-            + "\(base.load(fromByteOffset: offset + 1, as: UInt8.self))."
-            + "\(base.load(fromByteOffset: offset + 2, as: UInt8.self))."
-            + "\(base.load(fromByteOffset: offset + 3, as: UInt8.self))"
-    }
-
-    private static func ipv6String(_ base: UnsafeRawPointer, at offset: Int) -> String {
-        var parts: [String] = []
-        parts.reserveCapacity(8)
-        var index = offset
-        while index < offset + 16 {
-            let word = UInt16(base.load(fromByteOffset: index, as: UInt8.self)) << 8
-                | UInt16(base.load(fromByteOffset: index + 1, as: UInt8.self))
-            parts.append(String(format: "%x", word))
-            index += 2
-        }
-        return parts.joined(separator: ":")
     }
 
     /// One intercepted DNS query: wire id/question plus the UDP 4-tuple to

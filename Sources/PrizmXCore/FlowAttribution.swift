@@ -34,11 +34,12 @@ public struct FlowAttribution: Sendable, Hashable, Codable, Equatable {
     }
 }
 
-/// Looks up which process owns a 5-tuple. Implementations are platform-
-/// specific; iOS / tvOS pass `nil` and attribution stays empty.
+/// Looks up which process owns a socket, at flow open. Implementations are
+/// platform-specific; iOS / tvOS pass `nil` and attribution stays empty.
 ///
-/// TCP: call `attribute` on SYN and `forget` on FIN/RST/timeout.
-/// UDP: `attribute` is cache-first and populates on miss.
+/// `remoteAddress` / `remotePort` are the destination as the client's socket
+/// sees it (TUN: the wire IP, FakeIP included; mixed-port: its listener, with
+/// an empty address meaning "any").
 public protocol FlowAttributing: Sendable {
     func attribute(
         transport: FlowTransport,
@@ -47,27 +48,10 @@ public protocol FlowAttributing: Sendable {
         remoteAddress: String,
         remotePort: UInt16
     ) -> FlowAttribution?
-
-    func forget(
-        transport: FlowTransport,
-        localPort: UInt16,
-        remoteAddress: String,
-        remotePort: UInt16
-    )
 }
 
 extension FlowAttributing {
-    public func forget(
-        transport: FlowTransport,
-        localPort: UInt16,
-        remoteAddress: String,
-        remotePort: UInt16
-    ) {}
-
-    /// Flow-open lookup. Default forwards to `attribute`; implementations
-    /// with a negative cache should retry cached misses with a fresh table
-    /// match so a transient warm-up miss cannot pin a flow to "unattributed"
-    /// for its whole lifetime.
+    /// Flow-open lookup; the same as `attribute`.
     public func attributeFresh(
         transport: FlowTransport,
         localAddress: String,

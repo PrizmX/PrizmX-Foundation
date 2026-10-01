@@ -213,8 +213,8 @@ private struct UDPSessionOpener: Sendable {
             transport: .udp,
             localAddress: key.client.description,
             localPort: key.clientPort,
-            remoteAddress: datagram.destination.host.description,
-            remotePort: datagram.destination.port
+            remoteAddress: datagram.flow.dst.description,
+            remotePort: datagram.flow.dstPort
         )
     }
 

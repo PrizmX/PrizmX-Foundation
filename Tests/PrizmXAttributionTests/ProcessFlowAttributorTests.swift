@@ -4,218 +4,159 @@ import Testing
 import PrizmXAttributionC
 import PrizmXCore
 
+private func v4(_ text: String) -> SocketAddress? { SocketAddress(text) }
+
+private func owner(
+    pid: Int32,
+    _ transport: FlowTransport,
+    lport: UInt16,
+    remote: String = "",
+    rport: UInt16
+) -> SocketOwner {
+    SocketOwner(
+        pid: pid,
+        transport: transport,
+        localPort: lport,
+        remotePort: rport,
+        localAddress: v4("198.18.0.1"),
+        remoteAddress: SocketAddress(remote)
+    )
+}
+
+private final class TestClock: @unchecked Sendable {
+    var now = ContinuousClock.now
+}
+
 struct ProcessFlowAttributorTests {
-    @Test func tcpMatchesLocalPort() {
-        let pid = getpid()
+    @Test func tcpMatchesTheExactRemoteNeverJustThePort() {
+        let me = getpid()
         let table = FakeSocketTable(owners: [
-            SocketOwner(
-                pid: pid,
-                transport: .tcp,
-                localPort: 52_000,
-                remotePort: 443,
-                localAddress: "10.0.0.2",
-                remoteAddress: "1.1.1.1"
-            )
+            owner(pid: me, .tcp, lport: 52_000, remote: "198.18.0.3", rport: 443),
+            owner(pid: 1, .tcp, lport: 52_000, remote: "198.18.0.9", rport: 443),
         ])
-        let attributor = ProcessFlowAttributor(table: table, ownPID: 1, now: { ContinuousClock.now })
+        let attributor = ProcessFlowAttributor(table: table, ownPID: 2, now: { ContinuousClock.now })
         let hit = attributor.attribute(
-            transport: .tcp,
-            localAddress: "10.0.0.2",
-            localPort: 52_000,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
+            transport: .tcp, localAddress: "198.18.0.1", localPort: 52_000,
+            remoteAddress: "198.18.0.3", remotePort: 443
         )
-        #expect(hit?.pid == pid)
+        #expect(hit?.pid == me)
         #expect(hit?.processName.isEmpty == false)
+        // Same local port, different peer: no "first socket on the port" guess.
+        #expect(attributor.attribute(
+            transport: .tcp, localAddress: "198.18.0.1", localPort: 52_000,
+            remoteAddress: "198.18.0.4", remotePort: 443
+        ) == nil)
     }
 
-    @Test func udpMatchesRemoteTriple() {
-        let pid = getpid()
+    @Test func mixedPortMatchesOnTheListenPortWithoutAnAddress() {
+        let me = getpid()
         let table = FakeSocketTable(owners: [
-            SocketOwner(
-                pid: pid,
-                transport: .udp,
-                localPort: 53_000,
-                remotePort: 53,
-                localAddress: "10.0.0.2",
-                remoteAddress: "8.8.8.8"
-            )
-        ])
-        let attributor = ProcessFlowAttributor(table: table, ownPID: 1, now: { ContinuousClock.now })
-        let hit = attributor.attribute(
-            transport: .udp,
-            localAddress: "10.0.0.2",
-            localPort: 53_000,
-            remoteAddress: "8.8.8.8",
-            remotePort: 53
-        )
-        #expect(hit?.pid == pid)
-    }
-
-    @Test func udpFallsBackToSingleOwner() {
-        // Unconnected UDP sockets record remotePort 0, so a port mismatch
-        // still attributes when the local-port bucket holds a single PID.
-        let pid = getpid()
-        let table = FakeSocketTable(owners: [
-            SocketOwner(
-                pid: pid,
-                transport: .udp,
-                localPort: 53_000,
-                remotePort: 0,
-                localAddress: "10.0.0.2",
-                remoteAddress: ""
-            )
-        ])
-        let attributor = ProcessFlowAttributor(table: table, ownPID: 1, now: { ContinuousClock.now })
-        let hit = attributor.attribute(
-            transport: .udp,
-            localAddress: "10.0.0.2",
-            localPort: 53_000,
-            remoteAddress: "1.1.1.1",
-            remotePort: 9_999
-        )
-        #expect(hit?.pid == pid)
-    }
-
-    @Test func udpAmbiguousOwnersStayUnattributed() {
-        // Two PIDs share the local port: no remotePort match means the owner
-        // is ambiguous and must stay unattributed.
-        let pid = getpid()
-        let table = FakeSocketTable(owners: [
-            SocketOwner(
-                pid: pid,
-                transport: .udp,
-                localPort: 53_001,
-                remotePort: 0,
-                localAddress: "10.0.0.2",
-                remoteAddress: ""
-            ),
-            SocketOwner(
-                pid: 1,
-                transport: .udp,
-                localPort: 53_001,
-                remotePort: 0,
-                localAddress: "10.0.0.2",
-                remoteAddress: ""
-            )
+            owner(pid: me, .tcp, lport: 52_100, remote: "127.0.0.1", rport: 7_890),
         ])
         let attributor = ProcessFlowAttributor(table: table, ownPID: 2, now: { ContinuousClock.now })
-        let miss = attributor.attribute(
-            transport: .udp,
-            localAddress: "10.0.0.2",
-            localPort: 53_001,
-            remoteAddress: "1.1.1.1",
-            remotePort: 9_999
-        )
-        #expect(miss == nil)
+        #expect(attributor.attribute(
+            transport: .tcp, localAddress: "127.0.0.1", localPort: 52_100,
+            remoteAddress: "", remotePort: 7_890
+        )?.pid == me)
+        #expect(attributor.attribute(
+            transport: .tcp, localAddress: "127.0.0.1", localPort: 52_100,
+            remoteAddress: "", remotePort: 7_891
+        ) == nil)
     }
 
-    @Test func attributeFreshRetriesCachedNegative() {
-        let pid = getpid()
+    @Test func udpPrefersConnectedThenUnambiguousUnconnected() {
+        let me = getpid()
+        let table = FakeSocketTable(owners: [
+            owner(pid: me, .udp, lport: 53_000, remote: "8.8.8.8", rport: 53),
+            owner(pid: me, .udp, lport: 53_100, rport: 0),
+            owner(pid: me, .udp, lport: 53_200, rport: 0),
+            owner(pid: 1, .udp, lport: 53_200, rport: 0),
+        ])
+        let attributor = ProcessFlowAttributor(table: table, ownPID: 2, now: { ContinuousClock.now })
+        func lookup(_ port: UInt16, _ remote: String, _ rport: UInt16) -> Int32? {
+            attributor.attribute(
+                transport: .udp, localAddress: "", localPort: port,
+                remoteAddress: remote, remotePort: rport
+            )?.pid
+        }
+        #expect(lookup(53_000, "8.8.8.8", 53) == me)
+        // Connected socket to another peer: not this flow.
+        #expect(lookup(53_000, "1.1.1.1", 53) == nil)
+        // Unconnected socket (sendto): one owner on the port.
+        #expect(lookup(53_100, "1.1.1.1", 443) == me)
+        // Two processes share the port unconnected: ambiguous.
+        #expect(lookup(53_200, "1.1.1.1", 443) == nil)
+    }
+
+    @Test func rereadsWhenTheSnapshotPredatesTheRequest() {
+        let me = getpid()
+        let clock = TestClock()
         let table = CountingSocketTable(owners: [])
-        let attributor = ProcessFlowAttributor(table: table, ownPID: 2, now: { ContinuousClock.now })
-        // Warm-up (SYN) misses and caches a negative.
+        let attributor = ProcessFlowAttributor(table: table, ownPID: 2, now: { clock.now })
+        func lookup(_ port: UInt16) -> Int32? {
+            attributor.attribute(
+                transport: .tcp, localAddress: "", localPort: port,
+                remoteAddress: "198.18.0.3", remotePort: 443
+            )?.pid
+        }
+        #expect(lookup(52_010) == nil)
+        #expect(table.snapshots == 1)
+        // The client opens a socket after that read; its lookup comes later.
+        table.owners = [owner(pid: me, .tcp, lport: 52_010, remote: "198.18.0.3", rport: 443)]
+        clock.now += .milliseconds(5)
+        #expect(lookup(52_010) == me)
+        #expect(table.snapshots == 2)
+    }
+
+    @Test func aBurstOfLookupsSharesOneRead() {
+        let me = getpid()
+        let clock = TestClock()
+        let table = CountingSocketTable(owners: (0..<20).map {
+            owner(pid: me, .tcp, lport: 52_200 + UInt16($0), remote: "198.18.0.3", rport: 443)
+        })
+        let attributor = ProcessFlowAttributor(table: table, ownPID: 2, now: { clock.now })
+        for index in 0..<20 {
+            clock.now += .milliseconds(1)
+            #expect(attributor.attribute(
+                transport: .tcp, localAddress: "", localPort: 52_200 + UInt16(index),
+                remoteAddress: "198.18.0.3", remotePort: 443
+            )?.pid == me)
+        }
+        // Exact hits within the reuse window never re-read the table.
+        #expect(table.snapshots == 1)
+        // A miss re-reads once (the socket may be newer than the snapshot)…
         #expect(attributor.attribute(
-            transport: .tcp,
-            localAddress: "10.0.0.2",
-            localPort: 52_020,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
+            transport: .tcp, localAddress: "", localPort: 60_000,
+            remoteAddress: "198.18.0.3", remotePort: 443
         ) == nil)
-        // The socket becomes visible before the flow opens.
-        table.owners = [
-            SocketOwner(
-                pid: pid,
-                transport: .tcp,
-                localPort: 52_020,
-                remotePort: 443,
-                localAddress: "10.0.0.2",
-                remoteAddress: "1.1.1.1"
-            )
-        ]
-        // Plain lookups keep serving the cached negative within its TTL…
-        #expect(attributor.attribute(
-            transport: .tcp,
-            localAddress: "10.0.0.2",
-            localPort: 52_020,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
-        ) == nil)
-        // …while the flow-open path retries fresh and names the process.
-        #expect(attributor.attributeFresh(
-            transport: .tcp,
-            localAddress: "10.0.0.2",
-            localPort: 52_020,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
-        )?.pid == pid)
+        #expect(table.snapshots == 2)
+        // …and a snapshot older than the reuse window is not trusted.
+        clock.now += .seconds(2)
+        _ = attributor.attribute(
+            transport: .tcp, localAddress: "", localPort: 52_200,
+            remoteAddress: "198.18.0.3", remotePort: 443
+        )
+        #expect(table.snapshots == 3)
     }
 
     @Test func skipsOwnPID() {
         let pid = getpid()
-        let table = FakeSocketTable(owners: [
-            SocketOwner(
-                pid: pid,
-                transport: .tcp,
-                localPort: 52_001,
-                remotePort: 443,
-                localAddress: "10.0.0.2",
-                remoteAddress: "1.1.1.1"
-            )
-        ])
+        let table = FakeSocketTable(owners: [owner(pid: pid, .tcp, lport: 52_001, remote: "1.1.1.1", rport: 443)])
         let attributor = ProcessFlowAttributor(table: table, ownPID: pid, now: { ContinuousClock.now })
-        let hit = attributor.attribute(
-            transport: .tcp,
-            localAddress: "10.0.0.2",
-            localPort: 52_001,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
-        )
-        #expect(hit == nil)
+        #expect(attributor.attribute(
+            transport: .tcp, localAddress: "", localPort: 52_001,
+            remoteAddress: "1.1.1.1", remotePort: 443
+        ) == nil)
     }
 
-    @Test func tcpCacheSurvivesUntilForget() {
-        let pid = getpid()
-        let table = CountingSocketTable(owners: [
-            SocketOwner(
-                pid: pid,
-                transport: .tcp,
-                localPort: 52_010,
-                remotePort: 443,
-                localAddress: "10.0.0.2",
-                remoteAddress: "1.1.1.1"
-            )
-        ])
-        let attributor = ProcessFlowAttributor(table: table, ownPID: 1, now: { ContinuousClock.now })
-        #expect(attributor.attribute(
-            transport: .tcp,
-            localAddress: "10.0.0.2",
-            localPort: 52_010,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
-        )?.pid == pid)
-        table.owners = []
-        #expect(attributor.attribute(
-            transport: .tcp,
-            localAddress: "10.0.0.2",
-            localPort: 52_010,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
-        )?.pid == pid)
-        #expect(table.snapshots == 1)
-        attributor.forget(
-            transport: .tcp,
-            localPort: 52_010,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
-        )
-        #expect(attributor.attribute(
-            transport: .tcp,
-            localAddress: "10.0.0.2",
-            localPort: 52_010,
-            remoteAddress: "1.1.1.1",
-            remotePort: 443
-        ) == nil)
+    @Test func socketAddressNormalizesTextForms() {
+        #expect(SocketAddress("1.2.3.4") == .v4(0x0102_0304))
+        #expect(SocketAddress("::ffff:1.2.3.4") == .v4(0x0102_0304))
+        #expect(SocketAddress("fe80::1%en0") == .v6(0xFE80_0000_0000_0000, 1))
+        #expect(SocketAddress("") == nil)
+        #expect(SocketAddress("0.0.0.0") == nil)
+        #expect(SocketAddress("::") == nil)
+        #expect(SocketAddress("example.com") == nil)
     }
 
     @Test func accountingKeyPrefersBundleID() {
@@ -229,40 +170,114 @@ struct ProcessFlowAttributorTests {
         #expect(daemon.accountingKey == "mDNSResponder")
     }
 
-    @Test func pcblistNFindsSelfPID() throws {
-        let listener = socket(AF_INET, SOCK_STREAM, 0)
-        let client = socket(AF_INET, SOCK_STREAM, 0)
-        #expect(listener >= 0 && client >= 0)
-        var yes: Int32 = 1
-        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-        addr.sin_port = 0
-        let bindOK = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+    // MARK: - Real kernel socket table
+
+    /// Connects a loopback TCP pair and returns (client local port, server port).
+    private func loopbackPair(ipv6: Bool) throws -> (client: Int32, listener: Int32, accepted: Int32, lport: UInt16, rport: UInt16) {
+        let family = ipv6 ? AF_INET6 : AF_INET
+        let listener = socket(family, SOCK_STREAM, 0)
+        let client = socket(family, SOCK_STREAM, 0)
+        try #require(listener >= 0 && client >= 0)
+        var storage = sockaddr_storage()
+        var length: socklen_t
+        if ipv6 {
+            var addr = sockaddr_in6()
+            addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_addr = in6addr_loopback
+            length = socklen_t(MemoryLayout<sockaddr_in6>.size)
+            withUnsafeBytes(of: addr) { raw in
+                withUnsafeMutableBytes(of: &storage) { $0.copyMemory(from: raw) }
+            }
+        } else {
+            var addr = sockaddr_in()
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+            length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            withUnsafeBytes(of: addr) { raw in
+                withUnsafeMutableBytes(of: &storage) { $0.copyMemory(from: raw) }
+            }
         }
-        #expect(bindOK == 0)
-        #expect(listen(listener, 1) == 0)
-        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-        getsockname(listener, UnsafeMutableRawPointer(&addr).assumingMemoryBound(to: sockaddr.self), &addrLen)
-        let connectOK = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(client, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        try withUnsafeMutablePointer(to: &storage) { pointer in
+            try pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                try #require(bind(listener, sa, length) == 0)
+                try #require(listen(listener, 1) == 0)
+                var bound = length
+                getsockname(listener, sa, &bound)
+                try #require(connect(client, sa, length) == 0)
+            }
         }
-        #expect(connectOK == 0)
         let accepted = accept(listener, nil, nil)
-        #expect(accepted >= 0)
-        var local = sockaddr_in()
-        var localLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-        getsockname(client, UnsafeMutableRawPointer(&local).assumingMemoryBound(to: sockaddr.self), &localLen)
-        let port = UInt16(bigEndian: local.sin_port)
-        let found = PCBListLookup.findPID(forLocalPort: port, isTCP: true)
-        // macOS 26/27 filters pcblist_n down to the caller's own sockets;
-        // `prizmx_list_pcblist_n` then reports 0 rows so callers fall back to
-        // libproc. On such systems the raw helper can still resolve *own*
-        // sockets, but when the claimed/actual gap trips the filter guard it
-        // returns nothing — both outcomes are correct.
+        try #require(accepted >= 0)
+        var local = sockaddr_storage()
+        var localLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        var server = sockaddr_storage()
+        var serverLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        withUnsafeMutablePointer(to: &local) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = getsockname(client, $0, &localLength) }
+        }
+        withUnsafeMutablePointer(to: &server) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = getsockname(listener, $0, &serverLength) }
+        }
+        func port(_ storage: sockaddr_storage) -> UInt16 {
+            withUnsafeBytes(of: storage) { UInt16($0[2]) << 8 | UInt16($0[3]) }
+        }
+        return (client, listener, accepted, port(local), port(server))
+    }
+
+    @Test(arguments: [false, true])
+    func socketTableDecodesLoopbackAddresses(ipv6: Bool) throws {
+        let pair = try loopbackPair(ipv6: ipv6)
+        defer {
+            close(pair.accepted)
+            close(pair.client)
+            close(pair.listener)
+        }
+        let owners = LibprocSocketTable().snapshot(skipPID: 0)
+        let row = owners.first {
+            $0.transport == .tcp && $0.localPort == pair.lport && $0.remotePort == pair.rport
+        }
+        let found = try #require(row, "client socket missing from the table")
+        let loopback: SocketAddress = ipv6 ? .v6(0, 1) : .v4(0x7F00_0001)
+        #expect(found.pid == getpid())
+        #expect(found.remoteAddress == loopback)
+        #expect(found.localAddress == loopback)
+
+        // The table above may come from the libproc fallback (a non-root
+        // caller only sees its own sockets in pcblist_n). The unfiltered
+        // parse still lists our own socket, so check the xinpcb_n decoder
+        // (the path the root extension uses) on it directly.
+        var rows = [prizmx_socket_row](repeating: prizmx_socket_row(), count: 8_192)
+        let count = rows.withUnsafeMutableBufferPointer {
+            Int(prizmx_list_pcblist_n_raw($0.baseAddress, Int32($0.count), 0))
+        }
+        let pcb = try #require(rows.prefix(max(0, count)).first {
+            $0.transport == 6 && $0.local_port == pair.lport && $0.remote_port == pair.rport
+        }, "pcblist_n did not list our own socket")
+        #expect(pcb.pid == getpid())
+        #expect((pcb.is_ipv6 != 0) == ipv6)
+        #expect(withUnsafeBytes(of: pcb.remote_addr) { SocketAddress(bytes: $0, isIPv6: ipv6) } == loopback)
+        #expect(withUnsafeBytes(of: pcb.local_addr) { SocketAddress(bytes: $0, isIPv6: ipv6) } == loopback)
+
+        // End to end through the attributor with the real table.
+        let exact = ProcessFlowAttributor(table: LibprocSocketTable(), ownPID: 0, now: { ContinuousClock.now })
+        #expect(exact.attribute(
+            transport: .tcp, localAddress: "", localPort: pair.lport,
+            remoteAddress: ipv6 ? "::1" : "127.0.0.1", remotePort: pair.rport
+        )?.pid == getpid())
+    }
+
+    @Test func pcblistNFindsSelfPID() throws {
+        let pair = try loopbackPair(ipv6: false)
+        defer {
+            close(pair.accepted)
+            close(pair.client)
+            close(pair.listener)
+        }
+        let found = PCBListLookup.findPID(forLocalPort: pair.lport, isTCP: true)
+        // A filtered pcblist_n (only the caller's sockets) trips the
+        // claimed/actual guard and reports nothing; otherwise it finds us.
         var rows = [prizmx_socket_row](repeating: prizmx_socket_row(), count: 4096)
         let rowCount = rows.withUnsafeMutableBufferPointer { buffer in
             prizmx_list_pcblist_n(buffer.baseAddress, Int32(buffer.count), 0)
@@ -270,9 +285,6 @@ struct ProcessFlowAttributorTests {
         if rowCount > 0 {
             #expect(found == getpid())
         }
-        close(accepted)
-        close(client)
-        close(listener)
     }
 }
 
