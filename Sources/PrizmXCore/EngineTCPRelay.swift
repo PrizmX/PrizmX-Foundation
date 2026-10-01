@@ -46,25 +46,39 @@ extension InboundStream {
 /// Packet Tunnel (SwiftTCP) and mixed-port paths.
 public enum EngineTCPRelay: Sendable {
     public static func pipe(stream: some InboundStream, engine: Engine) async {
-        let prepared = await Self.prepare(stream: stream)
-        let inbound = prepared.stream
-        let target = prepared.endpoint
+        // Before sniffing: the client socket is surely still open now, while
+        // a sniff can wait for its first bytes (or the budget) and a client
+        // that gives up meanwhile leaves no socket to match.
         // Mixed-port LAN clients are remote sockets: their ephemeral port
         // says nothing about apps on this Mac. TUN flows match the client
         // socket by its wire destination; mixed-port ones by the listener.
         let attribution: FlowAttribution?
-        if inbound.isTunnelInbound || Self.isLoopbackClient(inbound.clientAddress) {
-            let remote = inbound.socketRemote
+        let lookedUpAt = Date()
+        let isLocalClient = stream.isTunnelInbound || Self.isLoopbackClient(stream.clientAddress)
+        if isLocalClient {
+            let remote = stream.socketRemote
             attribution = engine.flowAttributor?.attributeFresh(
                 transport: .tcp,
-                localAddress: inbound.clientAddress,
-                localPort: inbound.clientPort,
+                localAddress: stream.clientAddress,
+                localPort: stream.clientPort,
                 remoteAddress: remote?.address ?? "",
-                remotePort: remote?.port ?? inbound.listenPort ?? target.port
+                remotePort: remote?.port ?? stream.listenPort ?? stream.endpoint.port
             )
         } else {
             attribution = nil
         }
+        // A mixed-port client the local table cannot see (a root / system
+        // account process, from the sandboxed app) gets a later lookup.
+        let lateQuery: (clientPort: UInt16, listenPort: UInt16)?
+        if attribution == nil, isLocalClient, !stream.isTunnelInbound,
+           stream.clientPort > 0, let listenPort = stream.listenPort {
+            lateQuery = (stream.clientPort, listenPort)
+        } else {
+            lateQuery = nil
+        }
+        let prepared = await Self.prepare(stream: stream)
+        let inbound = prepared.stream
+        let target = prepared.endpoint
         let outbound: any OutboundConnection
         let rule: String
         do {
@@ -99,9 +113,24 @@ public enum EngineTCPRelay: Sendable {
             .debug,
             "flow opened \(target) via \(via)\(attribution.map { " app=\($0.accountingKey)" } ?? "")"
         )
+        // Read per chunk, so bytes after a late attribution count for the app.
+        let app = OSAllocatedUnfairLock(initialState: attribution)
+        if let lateQuery, let attributor = engine.flowAttributor {
+            Task {
+                guard let late = await attributor.attributeLate(
+                    transport: .tcp,
+                    localPort: lateQuery.clientPort,
+                    remotePort: lateQuery.listenPort,
+                    since: lookedUpAt
+                ) else { return }
+                engine.traffic.flowDidAttribute(id: flowID, late)
+                app.withLock { $0 = late }
+                TunnelLog.write(.debug, "flow attributed late \(target) app=\(late.accountingKey)")
+            }
+        }
         let started = ContinuousClock.now
         let snapshot = await splice(inbound: inbound, outbound: outbound) { up, down in
-            engine.traffic.addBytes(up: up, down: down, via: via, app: attribution, transport: .tcp)
+            engine.traffic.addBytes(up: up, down: down, via: via, app: app.withLock { $0 }, transport: .tcp)
             engine.traffic.addFlowBytes(id: flowID, up: up, down: down)
         }
         let elapsed = started.duration(to: ContinuousClock.now)
@@ -119,7 +148,7 @@ public enum EngineTCPRelay: Sendable {
                 remoteEnd: snapshot.remote,
                 closed: true,
                 rule: rule,
-                attribution: attribution,
+                attribution: app.withLock { $0 },
                 sourceHost: sourceHost
             )
         )

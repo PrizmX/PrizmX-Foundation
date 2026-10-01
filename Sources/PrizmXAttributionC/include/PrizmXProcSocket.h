@@ -21,6 +21,10 @@ typedef struct prizmx_socket_row {
 /// 0 when none, or a negative `-errno` on failure.
 int prizmx_list_sockets(prizmx_socket_row *out, int max_count, pid_t skip_pid);
 
+/// The same libproc read for one process only (e.g. the caller itself,
+/// which is always allowed). Returns the number of rows written.
+int prizmx_list_sockets_of_pid(pid_t pid, prizmx_socket_row *out, int max_count);
+
 /// Parse `net.inet.{tcp,udp}.pcblist_n` tagged xinpcb_n + xsocket_n,
 /// including local / foreign addresses. PID comes from so_e_pid (the app a
 /// delegated socket works for), falling back to so_last_pid. Returns

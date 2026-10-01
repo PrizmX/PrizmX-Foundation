@@ -39,6 +39,11 @@ public struct AttributionCachePolicy: Sendable, Equatable {
 ///
 /// Lives in the Packet Tunnel (jetsam ~50 MB): stores PIDs and short
 /// strings only. Identity resolution runs outside the snapshot lock.
+///
+/// The table skips the caller's own sockets (the tunnel's outbound dials
+/// are never clients). The in-app mixed-port listener sets
+/// `includesOwnProcess`: there the app's own requests through the system
+/// proxy (External IP lookup, downloads) are real clients.
 public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
     private struct IdentityEntry {
         var attribution: FlowAttribution
@@ -66,14 +71,19 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
     private let identities: ProcessIdentityResolver
     private let policy: AttributionCachePolicy
     private let ownPID: Int32
+    private let includesOwnProcess: Bool
     private let now: @Sendable () -> ContinuousClock.Instant
 
-    public convenience init(policy: AttributionCachePolicy = .default) {
+    public convenience init(
+        policy: AttributionCachePolicy = .default,
+        includesOwnProcess: Bool = false
+    ) {
         self.init(
             table: LibprocSocketTable(),
             identities: ProcessIdentityResolver(),
             policy: policy,
             ownPID: getpid(),
+            includesOwnProcess: includesOwnProcess,
             now: { ContinuousClock.now }
         )
     }
@@ -83,12 +93,14 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
         identities: ProcessIdentityResolver = ProcessIdentityResolver(),
         policy: AttributionCachePolicy = .default,
         ownPID: Int32,
+        includesOwnProcess: Bool = false,
         now: @escaping @Sendable () -> ContinuousClock.Instant
     ) {
         self.table = table
         self.identities = identities
         self.policy = policy
         self.ownPID = ownPID
+        self.includesOwnProcess = includesOwnProcess
         self.now = now
     }
 
@@ -127,6 +139,24 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
         return owner.flatMap { resolvedIdentity(for: $0.pid) }
     }
 
+    /// TCP sockets connected to a loopback `listenPorts` (the app's
+    /// mixed-port listeners), with their owners. Re-reads the table. The root
+    /// tunnel publishes these for the sandboxed app (`ProxyClientStore`).
+    public func loopbackClients(listenPorts: Set<UInt16>) -> [LoopbackClient] {
+        guard !listenPorts.isEmpty else { return [] }
+        let owners = lock.withLock { state -> [SocketOwner] in
+            refresh(&state)
+            return (state.index[.tcp] ?? [:]).values.joined().filter {
+                listenPorts.contains($0.remotePort) && $0.remoteAddress?.isLoopback == true
+            }
+        }
+        return owners.compactMap { owner in
+            resolvedIdentity(for: owner.pid).map {
+                LoopbackClient(clientPort: owner.localPort, listenPort: owner.remotePort, attribution: $0)
+            }
+        }
+    }
+
     /// Re-reads the socket table. Used by the startup probe.
     public func refresh() -> Int {
         lock.withLock { state in
@@ -137,7 +167,13 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
 
     private func refresh(_ state: inout State) {
         let started = now()
-        let owners = table.snapshot(skipPID: ownPID)
+        var owners = table.snapshot(skipPID: ownPID)
+        if includesOwnProcess {
+            // Read separately: a sandboxed caller's pcblist_n holds only its
+            // own sockets, and keeping them out of the table read keeps that
+            // filtered-table check (and the libproc fallback) working.
+            owners += table.sockets(ofPID: ownPID)
+        }
         var index: [FlowTransport: [UInt16: [SocketOwner]]] = [:]
         for owner in owners {
             index[owner.transport, default: [:]][owner.localPort, default: []].append(owner)

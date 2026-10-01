@@ -48,9 +48,44 @@ public protocol FlowAttributing: Sendable {
         remoteAddress: String,
         remotePort: UInt16
     ) -> FlowAttribution?
+
+    /// Second chance for a mixed-port flow `attribute` could not place,
+    /// answered from another process's view of the socket table (the root
+    /// tunnel extension, for the sandboxed app). `since` is when the first
+    /// lookup ran; only a view taken after it surely holds the socket.
+    func attributeLate(
+        transport: FlowTransport,
+        localPort: UInt16,
+        remotePort: UInt16,
+        since: Date
+    ) async -> FlowAttribution?
+}
+
+/// A local client socket of a mixed-port listener (`listenPort`), as the
+/// root tunnel extension sees it. The sandboxed app cannot read the sockets
+/// of root / system-account processes, so it looks them up here.
+public struct LoopbackClient: Sendable, Hashable, Codable, Equatable {
+    public var clientPort: UInt16
+    public var listenPort: UInt16
+    public var attribution: FlowAttribution
+
+    public init(clientPort: UInt16, listenPort: UInt16, attribution: FlowAttribution) {
+        self.clientPort = clientPort
+        self.listenPort = listenPort
+        self.attribution = attribution
+    }
 }
 
 extension FlowAttributing {
+    public func attributeLate(
+        transport: FlowTransport,
+        localPort: UInt16,
+        remotePort: UInt16,
+        since: Date
+    ) async -> FlowAttribution? {
+        nil
+    }
+
     /// Flow-open lookup; the same as `attribute`.
     public func attributeFresh(
         transport: FlowTransport,

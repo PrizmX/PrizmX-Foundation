@@ -270,6 +270,62 @@ pid_t prizmx_find_pid_pcblist_n(uint16_t local_port_host, int is_tcp) {
     return found;
 }
 
+/// Appends `pid`'s TCP/UDP sockets to `out` from index `written`. Returns the
+/// new row count (unchanged when the process cannot be inspected).
+static int append_pid_sockets(pid_t pid, prizmx_socket_row *out, int max_count, int written) {
+    int fd_bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
+    if (fd_bytes <= 0) {
+        return written;
+    }
+    struct proc_fdinfo *fds = malloc((size_t)fd_bytes);
+    if (fds == NULL) {
+        return written;
+    }
+    int fd_got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, fd_bytes);
+    if (fd_got <= 0) {
+        free(fds);
+        return written;
+    }
+    int fd_count = fd_got / (int)sizeof(struct proc_fdinfo);
+    for (int j = 0; j < fd_count && written < max_count; j++) {
+        if (fds[j].proc_fdtype != PROX_FDTYPE_SOCKET) {
+            continue;
+        }
+        struct socket_fdinfo info;
+        memset(&info, 0, sizeof(info));
+        int n = proc_pidfdinfo(
+            pid,
+            fds[j].proc_fd,
+            PROC_PIDFDSOCKETINFO,
+            &info,
+            (int)sizeof(info)
+        );
+        if (n < (int)sizeof(info)) {
+            continue;
+        }
+        uint8_t transport = transport_of(&info.psi);
+        if (transport != IPPROTO_TCP && transport != IPPROTO_UDP) {
+            continue;
+        }
+        const struct in_sockinfo *inet = inet_info(&info.psi);
+        if (inet == NULL) {
+            continue;
+        }
+        prizmx_socket_row *row = &out[written];
+        row->pid = pid;
+        row->transport = transport;
+        row->local_port = ntohs((uint16_t)inet->insi_lport);
+        row->remote_port = ntohs((uint16_t)inet->insi_fport);
+        copy_addr(row->local_addr, &row->is_ipv6, inet, 1);
+        uint8_t remote_v6 = 0;
+        copy_addr(row->remote_addr, &remote_v6, inet, 0);
+        (void)remote_v6;
+        written += 1;
+    }
+    free(fds);
+    return written;
+}
+
 int prizmx_list_sockets(prizmx_socket_row *out, int max_count, pid_t skip_pid) {
     if (out == NULL || max_count <= 0) {
         errno = EINVAL;
@@ -291,61 +347,18 @@ int prizmx_list_sockets(prizmx_socket_row *out, int max_count, pid_t skip_pid) {
         if (pid <= 0 || pid == skip_pid) {
             continue;
         }
-
-        int fd_bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
-        if (fd_bytes <= 0) {
-            continue;
-        }
-        struct proc_fdinfo *fds = malloc((size_t)fd_bytes);
-        if (fds == NULL) {
-            continue;
-        }
-        int fd_got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, fd_bytes);
-        if (fd_got <= 0) {
-            free(fds);
-            continue;
-        }
-        int fd_count = fd_got / (int)sizeof(struct proc_fdinfo);
-        for (int j = 0; j < fd_count && written < max_count; j++) {
-            if (fds[j].proc_fdtype != PROX_FDTYPE_SOCKET) {
-                continue;
-            }
-            struct socket_fdinfo info;
-            memset(&info, 0, sizeof(info));
-            int n = proc_pidfdinfo(
-                pid,
-                fds[j].proc_fd,
-                PROC_PIDFDSOCKETINFO,
-                &info,
-                (int)sizeof(info)
-            );
-            if (n < (int)sizeof(info)) {
-                continue;
-            }
-            uint8_t transport = transport_of(&info.psi);
-            if (transport != IPPROTO_TCP && transport != IPPROTO_UDP) {
-                continue;
-            }
-            const struct in_sockinfo *inet = inet_info(&info.psi);
-            if (inet == NULL) {
-                continue;
-            }
-            prizmx_socket_row *row = &out[written];
-            row->pid = pid;
-            row->transport = transport;
-            row->local_port = ntohs((uint16_t)inet->insi_lport);
-            row->remote_port = ntohs((uint16_t)inet->insi_fport);
-            copy_addr(row->local_addr, &row->is_ipv6, inet, 1);
-            uint8_t remote_v6 = 0;
-            copy_addr(row->remote_addr, &remote_v6, inet, 0);
-            (void)remote_v6;
-            written += 1;
-        }
-        free(fds);
+        written = append_pid_sockets(pid, out, max_count, written);
     }
 
     free(pids);
     return written;
+}
+
+int prizmx_list_sockets_of_pid(pid_t pid, prizmx_socket_row *out, int max_count) {
+    if (out == NULL || max_count <= 0 || pid <= 0) {
+        return 0;
+    }
+    return append_pid_sockets(pid, out, max_count, 0);
 }
 
 int prizmx_sysctl_probe(const char *name, int *errno_out, size_t *len_out) {

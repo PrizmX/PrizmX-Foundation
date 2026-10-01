@@ -41,6 +41,14 @@ enum SocketAddress: Hashable, Sendable {
         }
     }
 
+    /// 127.0.0.0/8 or ::1.
+    var isLoopback: Bool {
+        switch self {
+        case .v4(let value): value >> 24 == 127
+        case .v6(let high, let low): high == 0 && low == 1
+        }
+    }
+
     private init?(high: UInt64, low: UInt64) {
         if high == 0, low >> 32 == 0xFFFF {
             let value = UInt32(truncatingIfNeeded: low)
@@ -65,6 +73,12 @@ struct SocketOwner: Sendable, Equatable {
 
 protocol SocketTableReading: Sendable {
     func snapshot(skipPID: Int32) -> [SocketOwner]
+    /// One process's sockets (the caller's own is always readable).
+    func sockets(ofPID pid: Int32) -> [SocketOwner]
+}
+
+extension SocketTableReading {
+    func sockets(ofPID pid: Int32) -> [SocketOwner] { [] }
 }
 
 /// `pcblist_n` first, libproc fallback (when the table comes back filtered).
@@ -95,6 +109,14 @@ final class LibprocSocketTable: SocketTableReading, @unchecked Sendable {
             )
         }
         return fromLibproc
+    }
+
+    func sockets(ofPID pid: Int32) -> [SocketOwner] {
+        lock.lock()
+        defer { lock.unlock() }
+        return decodeLocked(skipPID: 0) { rows, count, _ in
+            prizmx_list_sockets_of_pid(pid, rows, count)
+        }
     }
 
     private func decodeLocked(

@@ -1,4 +1,5 @@
 import Darwin
+import Foundation
 import Testing
 @testable import PrizmXAttribution
 import PrizmXAttributionC
@@ -27,6 +28,9 @@ private final class TestClock: @unchecked Sendable {
     var now = ContinuousClock.now
 }
 
+/// Serialized: several tests read this process's live socket table, and one
+/// spawns a child, which briefly holds copies of our descriptors.
+@Suite(.serialized)
 struct ProcessFlowAttributorTests {
     @Test func tcpMatchesTheExactRemoteNeverJustThePort() {
         let me = getpid()
@@ -268,6 +272,88 @@ struct ProcessFlowAttributorTests {
         )?.pid == getpid())
     }
 
+    @Test func ownProcessSocketsCountOnlyWhenIncluded() {
+        let me = getpid()
+        let table = FakeSocketTable(owners: [
+            owner(pid: me, .tcp, lport: 52_200, remote: "127.0.0.1", rport: 7_890),
+        ])
+        func lookup(_ attributor: ProcessFlowAttributor) -> Int32? {
+            attributor.attribute(
+                transport: .tcp, localAddress: "127.0.0.1", localPort: 52_200,
+                remoteAddress: "", remotePort: 7_890
+            )?.pid
+        }
+        // The tunnel never attributes a flow to itself.
+        #expect(lookup(ProcessFlowAttributor(table: table, ownPID: me, now: { ContinuousClock.now })) == nil)
+        // The in-app listener counts the app's own requests.
+        #expect(lookup(ProcessFlowAttributor(
+            table: table, ownPID: me, includesOwnProcess: true, now: { ContinuousClock.now }
+        )) == me)
+    }
+
+    @Test func loopbackClientsListOnlyTheListenersPeers() {
+        let me = getpid()
+        func client(_ lport: UInt16, remote: String, rport: UInt16) -> SocketOwner {
+            SocketOwner(
+                pid: me, transport: .tcp, localPort: lport, remotePort: rport,
+                localAddress: SocketAddress(remote), remoteAddress: SocketAddress(remote)
+            )
+        }
+        let table = FakeSocketTable(owners: [
+            client(52_300, remote: "127.0.0.1", rport: 7_890),
+            client(52_301, remote: "::1", rport: 7_891),
+            client(52_302, remote: "192.168.1.5", rport: 7_890),
+            client(52_303, remote: "127.0.0.1", rport: 8_080),
+        ])
+        let attributor = ProcessFlowAttributor(table: table, ownPID: 2, now: { ContinuousClock.now })
+        let clients = attributor.loopbackClients(listenPorts: [7_890, 7_891])
+        #expect(clients.map(\.clientPort).sorted() == [52_300, 52_301])
+        #expect(clients.allSatisfy { $0.attribution.pid == me })
+        #expect(attributor.loopbackClients(listenPorts: []).isEmpty)
+    }
+
+    @Test func socketTableListsOneProcess() throws {
+        let pair = try loopbackPair(ipv6: false)
+        defer {
+            close(pair.accepted)
+            close(pair.client)
+            close(pair.listener)
+        }
+        let owners = LibprocSocketTable().sockets(ofPID: getpid())
+        #expect(owners.contains {
+            $0.transport == .tcp && $0.localPort == pair.lport && $0.remotePort == pair.rport
+        })
+        #expect(owners.allSatisfy { $0.pid == getpid() })
+    }
+
+    @Test func versionNamedExecutablesUseTheirLaunchName() {
+        #expect(ProcessIdentityResolver.readableName("2.1.286", launchName: "claude") == "claude")
+        #expect(ProcessIdentityResolver.readableName("2.1.286", launchName: nil) == "2.1.286")
+        #expect(ProcessIdentityResolver.readableName("2.1.286", launchName: "2.1.286") == "2.1.286")
+        #expect(ProcessIdentityResolver.readableName("node", launchName: "claude") == "node")
+    }
+
+    @Test func resolveNamesAVersionedBinaryByItsLink() throws {
+        // Like Claude Code: `claude` links to `…/versions/2.1.286`.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let binary = dir.appendingPathComponent("9.9.9")
+        try FileManager.default.copyItem(atPath: "/bin/sleep", toPath: binary.path)
+        let link = dir.appendingPathComponent("sleeper")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: binary)
+        let process = Process()
+        process.executableURL = link
+        process.arguments = ["30"]
+        try process.run()
+        defer {
+            process.terminate()
+            process.waitUntilExit()
+        }
+        let identity = try #require(ProcessIdentityResolver().resolve(pid: process.processIdentifier))
+        #expect(identity.processName == "sleeper")
+    }
+
     @Test func pcblistNFindsSelfPID() throws {
         let pair = try loopbackPair(ipv6: false)
         defer {
@@ -293,6 +379,10 @@ private struct FakeSocketTable: SocketTableReading {
 
     func snapshot(skipPID: Int32) -> [SocketOwner] {
         owners.filter { $0.pid != skipPID }
+    }
+
+    func sockets(ofPID pid: Int32) -> [SocketOwner] {
+        owners.filter { $0.pid == pid }
     }
 }
 

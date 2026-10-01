@@ -142,6 +142,44 @@ import PrizmXProtocols
     #expect(merged.activeFlows.count == 2)
 }
 
+@Test func trafficCounterBoundsFlowWindowsPerSnapshot() {
+    let counter = TrafficCounter()
+    let base = Date()
+    let flows = (0..<300).map { index in
+        FlowRecord(
+            startedAt: base.addingTimeInterval(Double(index)),
+            endpoint: Endpoint(domain: "host-\(index).example", port: 443),
+            via: "Proxies",
+            closed: false
+        )
+    }
+    flows.forEach(counter.flowDidBegin)
+    var snapshot = counter.snapshot()
+    // Newest-started open splices; the cut shows as fewer rows than TCP.
+    #expect(snapshot.activeFlows.count == 256)
+    #expect(snapshot.tcpConnections == 300)
+    #expect(snapshot.activeFlows.first?.id == flows.last?.id)
+
+    flows.prefix(100).forEach(counter.flowDidClose)
+    snapshot = counter.snapshot()
+    #expect(snapshot.activeFlows.count == 200)
+    #expect(snapshot.tcpConnections == 200)
+    // Newest-closed first.
+    #expect(snapshot.recentFlows.count == 64)
+    #expect(snapshot.recentFlows.first?.id == flows[99].id)
+}
+
+@Test func trafficSnapshotMergeKeepsEveryFlow() {
+    func closed(_ count: Int) -> [FlowRecord] {
+        (0..<count).map { _ in
+            FlowRecord(endpoint: Endpoint(domain: "example.com", port: 443), via: "Proxies")
+        }
+    }
+    let tunnel = TrafficSnapshot(recentFlows: closed(64))
+    let mixed = TrafficSnapshot(recentFlows: closed(64))
+    #expect(tunnel.merging(mixed).recentFlows.count == 128)
+}
+
 @Test func trafficSnapshotDecodesLegacyActiveConnectionsAsTCP() throws {
     let json = Data("""
         {"uploadBytesPerSecond":0,"downloadBytesPerSecond":0,"uplinkBytes":0,"downlinkBytes":0,"activeConnections":39,"directUplinkBytes":0,"directDownlinkBytes":0}

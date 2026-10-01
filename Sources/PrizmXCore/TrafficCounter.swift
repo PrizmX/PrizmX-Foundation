@@ -39,9 +39,11 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     public var appBytes: [String: TrafficByteCount]
     /// Display name for each app key (process name).
     public var appNames: [String: String]
-    /// Open TCP splices (Inspector Active).
+    /// Open TCP splices, newest first. Bounded per engine; when there are more
+    /// open splices than this list holds, it has fewer rows than `tcpConnections`.
     public var activeFlows: [FlowRecord]
-    /// Recently closed TCP splices (Inspector Recent).
+    /// Most recently closed TCP splices. A window per poll, not the history:
+    /// the app accumulates Inspector rows itself (`FlowHistory`).
     public var recentFlows: [FlowRecord]
     /// Per-key TCP / UDP totals for ranking bars.
     public var appTCPBytes: [String: UInt64]
@@ -101,6 +103,8 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
 
     /// Combine tunnel IPC counters with the in-app mixed-port engine.
     /// The two paths are disjoint (FakeIP TUN vs HTTP/SOCKS listener).
+    /// Flow lists are concatenated, not cut: each side is already bounded by
+    /// its own counter, and a cut here would drop closes the app never sees.
     public func merging(_ other: TrafficSnapshot) -> TrafficSnapshot {
         func mergeMap(
             _ lhs: [String: TrafficByteCount],
@@ -140,16 +144,10 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
             domainBytes: mergeMap(domainBytes, other.domainBytes),
             appBytes: mergeMap(appBytes, other.appBytes),
             appNames: names,
-            activeFlows: Array(
-                (activeFlows + other.activeFlows)
-                    .sorted { $0.startedAt > $1.startedAt }
-                    .prefix(32)
-            ),
-            recentFlows: Array(
-                (recentFlows + other.recentFlows)
-                    .sorted { $0.startedAt > $1.startedAt }
-                    .prefix(32)
-            ),
+            activeFlows: (activeFlows + other.activeFlows)
+                .sorted { $0.startedAt > $1.startedAt },
+            recentFlows: (recentFlows + other.recentFlows)
+                .sorted { $0.startedAt > $1.startedAt },
             appTCPBytes: mergeCount(appTCPBytes, other.appTCPBytes),
             appUDPBytes: mergeCount(appUDPBytes, other.appUDPBytes),
             domainTCPBytes: mergeCount(domainTCPBytes, other.domainTCPBytes),
@@ -284,11 +282,15 @@ public final class TrafficCounter: Sendable {
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: State())
+    /// Closed splices per snapshot. The app keeps the Inspector history, so
+    /// this only has to cover the closes between two 1s polls.
     private let recentCap = 64
+    /// Open splices per snapshot (newest first).
+    private let activeFlowCap = 256
     /// Distinct domains kept for ranking; the map is cumulative so a hard cap
     /// keeps long sessions bounded (top entries survive — they keep growing).
     private let domainCap = 1024
-    /// IPC payload bound per snapshot.
+    /// IPC payload bound per snapshot for the ranking maps.
     private let snapshotMapCap = 32
 
     public init() {}
@@ -344,15 +346,7 @@ public final class TrafficCounter: Sendable {
                 Self.addProtocol(added, transport: transport, tcp: &state.policyTCP, udp: &state.policyUDP, key: via)
             }
             if let app {
-                let key = app.accountingKey
-                var count = state.apps[key] ?? TrafficByteCount()
-                count.up &+= up
-                count.down &+= down
-                state.apps[key] = count
-                if state.appNames[key] == nil {
-                    state.appNames[key] = app.processName
-                }
-                Self.addProtocol(added, transport: transport, tcp: &state.appTCP, udp: &state.appUDP, key: key)
+                Self.addApp(app, up: up, down: down, transport: transport, to: &state)
             }
             if let domain, !domain.isEmpty {
                 Self.addProtocol(
@@ -364,6 +358,33 @@ public final class TrafficCounter: Sendable {
                     cap: domainCap
                 )
             }
+        }
+    }
+
+    /// Late attribution (`FlowAttributing.attributeLate`) of a TCP flow that
+    /// began without one, open or already closed. The bytes it has moved so
+    /// far are credited to the app; later ones arrive with `addBytes`.
+    public func flowDidAttribute(id: UUID, _ attribution: FlowAttribution) {
+        lock.withLock { state in
+            let record: FlowRecord
+            if var open = state.open[id], open.attribution == nil {
+                open.attribution = attribution
+                state.open[id] = open
+                record = open
+            } else if let index = state.recent.lastIndex(where: { $0.id == id }),
+                      state.recent[index].attribution == nil {
+                state.recent[index].attribution = attribution
+                record = state.recent[index]
+            } else {
+                return
+            }
+            Self.addApp(
+                attribution,
+                up: record.uplinkBytes,
+                down: record.downlinkBytes,
+                transport: .tcp,
+                to: &state
+            )
         }
     }
 
@@ -386,6 +407,10 @@ public final class TrafficCounter: Sendable {
             closed.closed = true
             if closed.serial == nil {
                 closed.serial = open?.serial
+            }
+            // Keep a late attribution that landed after the relay built this record.
+            if closed.attribution == nil {
+                closed.attribution = open?.attribution
             }
             if closed.serial == nil {
                 state.nextSerial += 1
@@ -441,8 +466,8 @@ public final class TrafficCounter: Sendable {
                 domainBytes: topDomains,
                 appBytes: topApps,
                 appNames: state.appNames.filter { topApps[$0.key] != nil },
-                activeFlows: Array(state.open.values.sorted { $0.startedAt > $1.startedAt }.prefix(snapshotMapCap)),
-                recentFlows: Array(state.recent.suffix(snapshotMapCap).reversed()),
+                activeFlows: Array(state.open.values.sorted { $0.startedAt > $1.startedAt }.prefix(activeFlowCap)),
+                recentFlows: Array(state.recent.reversed()),
                 appTCPBytes: Self.slice(state.appTCP, keys: Set(topApps.keys)),
                 appUDPBytes: Self.slice(state.appUDP, keys: Set(topApps.keys)),
                 domainTCPBytes: Self.slice(state.domainTCP, keys: Set(topDomains.keys)),
@@ -451,6 +476,24 @@ public final class TrafficCounter: Sendable {
                 policyUDPBytes: Self.slice(state.policyUDP, keys: Set(topPolicies.keys))
             )
         }
+    }
+
+    private static func addApp(
+        _ app: FlowAttribution,
+        up: UInt64,
+        down: UInt64,
+        transport: FlowTransport?,
+        to state: inout State
+    ) {
+        let key = app.accountingKey
+        var count = state.apps[key] ?? TrafficByteCount()
+        count.up &+= up
+        count.down &+= down
+        state.apps[key] = count
+        if state.appNames[key] == nil {
+            state.appNames[key] = app.processName
+        }
+        addProtocol(up &+ down, transport: transport, tcp: &state.appTCP, udp: &state.appUDP, key: key)
     }
 
     private static func addProtocol(
