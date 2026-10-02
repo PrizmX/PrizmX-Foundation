@@ -151,10 +151,11 @@ public final class Engine: Sendable {
     }
 
     /// `dispatchDetailed` with lazy IP resolution: the relay entry point.
+    /// `policy` is what the rule chose (`DIRECT`, a group, or a node).
     public func resolveAndDispatch(
         target: Endpoint,
         command: VLESSCommand = .tcp
-    ) async throws -> (connection: any OutboundConnection, rule: String) {
+    ) async throws -> (connection: any OutboundConnection, rule: String, policy: String) {
         if let hosts = hostsMapping(for: target) {
             let matched = matchTarget(target, resolvedIPv4: hosts.ipv4.first, resolvedIPv6: hosts.ipv6.first)
             return try connection(for: target, command: command, matched: matched, hosts: hosts)
@@ -168,7 +169,7 @@ public final class Engine: Sendable {
         command: VLESSCommand = .tcp,
         resolvedIPv4: IPv4Address? = nil,
         resolvedIPv6: IPv6Address? = nil
-    ) throws -> (connection: any OutboundConnection, rule: String) {
+    ) throws -> (connection: any OutboundConnection, rule: String, policy: String) {
         let hosts = hostsMapping(for: target)
         let matched = matchTarget(
             target,
@@ -183,7 +184,7 @@ public final class Engine: Sendable {
         command: VLESSCommand,
         matched: (policy: Policy, rule: String),
         hosts: SystemHosts.Mapping?
-    ) throws -> (connection: any OutboundConnection, rule: String) {
+    ) throws -> (connection: any OutboundConnection, rule: String, policy: String) {
         // Hosts-file hit. IP rules already saw the mapped address, and
         // REJECT still wins. A local binding (loopback / LAN / 0.0.0.0) is
         // dialed here even when the rule would proxy: a remote node would
@@ -200,7 +201,8 @@ public final class Engine: Sendable {
                 TunnelLog.writeOnce("hosts-\(name)", .info, "hosts \(name) → \(hosts.summary) direct (local)")
                 return (
                     DirectOutboundConnection(endpoint: target, role: .direct),
-                    "HOSTS,\(name),DIRECT"
+                    "HOSTS,\(name),DIRECT",
+                    FlowRoute.direct
                 )
             }
             if case .proxy(let group) = matched.policy, let address = hosts.addresses.first {
@@ -208,7 +210,7 @@ public final class Engine: Sendable {
                 let mapped = Endpoint(host: address, port: target.port)
                 do {
                     let connection = try nodeManager.connection(forGroup: group, target: mapped, command: command)
-                    return (connection, matched.rule)
+                    return (connection, matched.rule, group)
                 } catch {
                     TunnelLog.write(.error, "dispatch \(target) group=\(group) failed: \(error.localizedDescription)")
                     throw error
@@ -217,14 +219,14 @@ public final class Engine: Sendable {
         }
         switch matched.policy {
         case .direct:
-            return (DirectOutboundConnection(endpoint: target, role: .direct), matched.rule)
+            return (DirectOutboundConnection(endpoint: target, role: .direct), matched.rule, FlowRoute.direct)
         case .reject:
             TunnelLog.write(.info, "reject \(target)")
             throw EngineError.rejected(target)
         case .proxy(let group):
             do {
                 let connection = try nodeManager.connection(forGroup: group, target: target, command: command)
-                return (connection, matched.rule)
+                return (connection, matched.rule, group)
             } catch {
                 TunnelLog.write(.error, "dispatch \(target) group=\(group) failed: \(error.localizedDescription)")
                 throw error

@@ -21,7 +21,7 @@ import PrizmXProtocols
         activeFlows: [
             FlowRecord(
                 endpoint: Endpoint(domain: "example.com", port: 443),
-                via: "Proxies",
+                route: FlowRoute(["Proxies"]),
                 uplinkBytes: 10,
                 downlinkBytes: 20,
                 attribution: FlowAttribution(

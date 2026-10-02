@@ -16,7 +16,7 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
         lifecycle.withLock { $0.state }
     }
 
-    public var routingLabel: String { "direct" }
+    public var chain: [String] { [FlowRoute.direct] }
 
     private let queue: DispatchQueue
     /// All mutable state lives behind this lock; I/O copies the connection

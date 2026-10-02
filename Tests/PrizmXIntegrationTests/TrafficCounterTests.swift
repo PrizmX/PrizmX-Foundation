@@ -5,9 +5,9 @@ import PrizmXProtocols
 
 @Test func trafficCounterSplitsDirectAndPolicy() {
     let counter = TrafficCounter()
-    counter.addBytes(up: 100, down: 900, via: "direct")
-    counter.addBytes(up: 50, down: 450, via: "Proxies")
-    counter.addBytes(up: 25, down: 75, via: "proxy")
+    counter.addBytes(up: 100, down: 900, route: FlowRoute([FlowRoute.direct]))
+    counter.addBytes(up: 50, down: 450, route: FlowRoute(["Proxies"]))
+    counter.addBytes(up: 25, down: 75, route: FlowRoute(["proxy"]))
 
     let snapshot = counter.snapshot()
     #expect(snapshot.uplinkBytes == 175)
@@ -25,7 +25,7 @@ import PrizmXProtocols
     counter.flowDidOpen()
     counter.flowDidClose(FlowRecord(
         endpoint: endpoint,
-        via: "Proxies",
+        route: FlowRoute(["Proxies"]),
         uplinkBytes: 1_000,
         downlinkBytes: 9_000,
         milliseconds: 42,
@@ -36,7 +36,7 @@ import PrizmXProtocols
     counter.flowDidOpen()
     counter.flowDidClose(FlowRecord(
         endpoint: Endpoint(host: .ipv4(IPv4Address(1, 1, 1, 1)), port: 443),
-        via: "Proxies",
+        route: FlowRoute(["Proxies"]),
         uplinkBytes: 5,
         downlinkBytes: 5,
         milliseconds: 1,
@@ -58,8 +58,8 @@ import PrizmXProtocols
         processName: "Safari",
         bundleID: "com.apple.Safari"
     )
-    counter.addBytes(up: 10, down: 90, via: "Proxies", app: safari)
-    counter.addBytes(up: 5, down: 5, via: "direct", app: safari)
+    counter.addBytes(up: 10, down: 90, route: FlowRoute(["Proxies"]), app: safari)
+    counter.addBytes(up: 5, down: 5, route: FlowRoute([FlowRoute.direct]), app: safari)
     let snapshot = counter.snapshot()
     #expect(snapshot.appBytes["com.apple.Safari"] == TrafficByteCount(up: 15, down: 95))
     #expect(snapshot.appNames["com.apple.Safari"] == "Safari")
@@ -69,7 +69,7 @@ import PrizmXProtocols
     let counter = TrafficCounter()
     let open = FlowRecord(
         endpoint: Endpoint(domain: "example.com", port: 443),
-        via: "Proxies",
+        route: FlowRoute(["Proxies"]),
         closed: false
     )
     counter.flowDidBegin(open)
@@ -87,7 +87,7 @@ import PrizmXProtocols
             id: open.id,
             startedAt: open.startedAt,
             endpoint: open.endpoint,
-            via: "Proxies",
+            route: FlowRoute(["Proxies"]),
             uplinkBytes: 10,
             downlinkBytes: 20,
             milliseconds: 5,
@@ -113,7 +113,7 @@ import PrizmXProtocols
         directUplinkBytes: 5,
         policyBytes: ["Proxies": TrafficByteCount(up: 100, down: 200)],
         activeFlows: [
-            FlowRecord(endpoint: Endpoint(domain: "a.example", port: 443), via: "Proxies")
+            FlowRecord(endpoint: Endpoint(domain: "a.example", port: 443), route: FlowRoute(["Proxies"]))
         ]
     )
     let mixed = TrafficSnapshot(
@@ -126,7 +126,7 @@ import PrizmXProtocols
         directUplinkBytes: 1,
         policyBytes: ["Proxies": TrafficByteCount(up: 10, down: 20)],
         activeFlows: [
-            FlowRecord(endpoint: Endpoint(domain: "b.example", port: 443), via: "Proxies")
+            FlowRecord(endpoint: Endpoint(domain: "b.example", port: 443), route: FlowRoute(["Proxies"]))
         ]
     )
     let merged = tunnel.merging(mixed)
@@ -149,7 +149,7 @@ import PrizmXProtocols
         FlowRecord(
             startedAt: base.addingTimeInterval(Double(index)),
             endpoint: Endpoint(domain: "host-\(index).example", port: 443),
-            via: "Proxies",
+            route: FlowRoute(["Proxies"]),
             closed: false
         )
     }
@@ -172,7 +172,7 @@ import PrizmXProtocols
 @Test func trafficSnapshotMergeKeepsEveryFlow() {
     func closed(_ count: Int) -> [FlowRecord] {
         (0..<count).map { _ in
-            FlowRecord(endpoint: Endpoint(domain: "example.com", port: 443), via: "Proxies")
+            FlowRecord(endpoint: Endpoint(domain: "example.com", port: 443), route: FlowRoute(["Proxies"]))
         }
     }
     let tunnel = TrafficSnapshot(recentFlows: closed(64))

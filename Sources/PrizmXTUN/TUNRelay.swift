@@ -140,7 +140,7 @@ private actor UDPRelayState {
             engine.traffic.addBytes(
                 up: UInt64(datagram.payload.count),
                 down: 0,
-                via: session.via,
+                route: session.route,
                 app: session.attribution,
                 transport: .udp,
                 domain: domain
@@ -202,7 +202,7 @@ private struct UDPSessionOpener: Sendable {
             await dropUDP(onceKey: "udp-reject", reason: "UDP dropped: reject")
             return nil
         case .direct:
-            return await openDirect()
+            return await openDirect(route: FlowRoute([FlowRoute.direct]))
         case .proxy(let group):
             return await openProxy(group: group)
         }
@@ -233,7 +233,7 @@ private struct UDPSessionOpener: Sendable {
         )
     }
 
-    private func openDirect() async -> (any UDPSession)? {
+    private func openDirect(route: FlowRoute) async -> (any UDPSession)? {
         let parameters = NWParameters.udp
         parameters.preferNoProxies = true
         guard let port = NWEndpoint.Port(rawValue: datagram.destination.port) else { return nil }
@@ -252,6 +252,7 @@ private struct UDPSessionOpener: Sendable {
         )
         connection.start(queue: DispatchQueue.global(qos: .userInitiated))
         return DirectUDPSession(
+            route: route,
             connection: connection,
             flow: datagram.flow,
             stack: stack,
@@ -262,9 +263,10 @@ private struct UDPSessionOpener: Sendable {
 
     private func openProxy(group: String) async -> (any UDPSession)? {
         let leaf = engine.nodeManager.selectedLeaf(inGroup: group)
+        let route = FlowRoute(engine.nodeManager.selectedChain(inGroup: group))
         switch leaf {
         case .direct:
-            return await openDirect()
+            return await openDirect(route: route)
         case .reject:
             await dropUDP(onceKey: "udp-reject-\(group)", reason: "UDP dropped: reject")
             return nil
@@ -280,7 +282,7 @@ private struct UDPSessionOpener: Sendable {
         guard case .node(let node) = leaf else { return nil }
         switch node.protocolConfig {
         case .direct:
-            return await openDirect()
+            return await openDirect(route: route)
         case .vless:
             do {
                 // Use the leaf picked above; dispatching through the group
@@ -295,7 +297,7 @@ private struct UDPSessionOpener: Sendable {
                 }
                 return StreamUDPSession(
                     outbound: outbound,
-                    via: group,
+                    route: route,
                     flow: datagram.flow,
                     stack: stack,
                     traffic: engine.traffic,
@@ -332,7 +334,7 @@ private struct UDPSessionOpener: Sendable {
                 connection: connection,
                 preSharedKey: cipher.masterKey(fromPassword: password),
                 cipher: cipher,
-                via: group,
+                route: route,
                 flow: datagram.flow,
                 stack: stack,
                 traffic: engine.traffic,
@@ -351,8 +353,8 @@ private struct UDPFlowKey: Hashable, Sendable {
 }
 
 private protocol UDPSession: AnyObject, Sendable {
-    /// Routing label for traffic accounting (`direct` / policy name).
-    var via: String { get }
+    /// Route for traffic accounting (`FlowRoute`).
+    var route: FlowRoute { get }
     var attribution: FlowAttribution? { get }
     /// Last send/receive activity; used to evict the idlest session at capacity.
     var lastActivity: ContinuousClock.Instant { get }
@@ -369,7 +371,7 @@ private final class ActivityStamp: Sendable {
 }
 
 private final class DirectUDPSession: UDPSession, @unchecked Sendable {
-    let via = "direct"
+    let route: FlowRoute
     let attribution: FlowAttribution?
     private let connection: NWConnection
     private let flow: FlowKey
@@ -380,12 +382,14 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
     var lastActivity: ContinuousClock.Instant { activity.value }
 
     init(
+        route: FlowRoute,
         connection: NWConnection,
         flow: FlowKey,
         stack: TUNStack,
         traffic: TrafficCounter,
         attribution: FlowAttribution?
     ) {
+        self.route = route
         self.connection = connection
         self.flow = flow
         self.stack = stack
@@ -404,7 +408,7 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
         while !Task.isCancelled {
             guard let data = await connection.receiveDatagram(), !data.isEmpty else { return }
             activity.touch()
-            traffic.addBytes(up: 0, down: UInt64(data.count), via: via, app: attribution, transport: .udp)
+            traffic.addBytes(up: 0, down: UInt64(data.count), route: route, app: attribution, transport: .udp)
             await stack.sendUDP(flow: flow, payload: data)
         }
     }
@@ -415,7 +419,7 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
 }
 
 private final class StreamUDPSession: UDPSession, @unchecked Sendable {
-    let via: String
+    let route: FlowRoute
     let attribution: FlowAttribution?
     private let outbound: any OutboundConnection
     private let flow: FlowKey
@@ -427,14 +431,14 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
 
     init(
         outbound: any OutboundConnection,
-        via: String,
+        route: FlowRoute,
         flow: FlowKey,
         stack: TUNStack,
         traffic: TrafficCounter,
         attribution: FlowAttribution?
     ) {
         self.outbound = outbound
-        self.via = via
+        self.route = route
         self.attribution = attribution
         self.flow = flow
         self.stack = stack
@@ -456,7 +460,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
                 if chunk.isEmpty { break }
                 activity.touch()
                 for payload in decoder.feed(chunk) {
-                    traffic.addBytes(up: 0, down: UInt64(payload.count), via: via, app: attribution, transport: .udp)
+                    traffic.addBytes(up: 0, down: UInt64(payload.count), route: route, app: attribution, transport: .udp)
                     await stack.sendUDP(flow: flow, payload: payload)
                 }
             }
@@ -472,7 +476,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
 }
 
 private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
-    let via: String
+    let route: FlowRoute
     let attribution: FlowAttribution?
     private let connection: NWConnection
     private let preSharedKey: [UInt8]
@@ -488,7 +492,7 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
         connection: NWConnection,
         preSharedKey: [UInt8],
         cipher: ShadowsocksCipher,
-        via: String,
+        route: FlowRoute,
         flow: FlowKey,
         stack: TUNStack,
         traffic: TrafficCounter,
@@ -497,7 +501,7 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
         self.connection = connection
         self.preSharedKey = preSharedKey
         self.cipher = cipher
-        self.via = via
+        self.route = route
         self.attribution = attribution
         self.flow = flow
         self.stack = stack
@@ -524,7 +528,7 @@ private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
                 packet: data
             ) else { continue }
             activity.touch()
-            traffic.addBytes(up: 0, down: UInt64(decoded.payload.count), via: via, app: attribution, transport: .udp)
+            traffic.addBytes(up: 0, down: UInt64(decoded.payload.count), route: route, app: attribution, transport: .udp)
             await stack.sendUDP(flow: flow, payload: decoded.payload)
         }
     }

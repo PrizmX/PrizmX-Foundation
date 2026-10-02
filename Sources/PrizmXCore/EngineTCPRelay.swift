@@ -81,10 +81,12 @@ public enum EngineTCPRelay: Sendable {
         let target = prepared.endpoint
         let outbound: any OutboundConnection
         let rule: String
+        let policy: String
         do {
             let dispatched = try await engine.resolveAndDispatch(target: target)
             outbound = dispatched.connection
             rule = dispatched.rule
+            policy = dispatched.policy
             try await DNSClient.$current.withValue(engine.dns) {
                 try await outbound.open()
             }
@@ -93,7 +95,9 @@ public enum EngineTCPRelay: Sendable {
             await inbound.close()
             return
         }
-        let via = outbound.routingLabel
+        // A rule naming a node directly opens a bare node connection, which
+        // does not know its name: the rule's policy is it.
+        let route = FlowRoute(outbound.chain.isEmpty ? [policy] : outbound.chain)
         let flowID = UUID()
         let startedAt = Date()
         let sourceHost = inbound.clientAddress.isEmpty ? nil : inbound.clientAddress
@@ -102,7 +106,7 @@ public enum EngineTCPRelay: Sendable {
                 id: flowID,
                 startedAt: startedAt,
                 endpoint: target,
-                via: via,
+                route: route,
                 closed: false,
                 rule: rule,
                 attribution: attribution,
@@ -111,7 +115,7 @@ public enum EngineTCPRelay: Sendable {
         )
         TunnelLog.write(
             .debug,
-            "flow opened \(target) via \(via)\(attribution.map { " app=\($0.accountingKey)" } ?? "")"
+            "flow opened \(target) via \(route)\(attribution.map { " app=\($0.accountingKey)" } ?? "")"
         )
         // Read per chunk, so bytes after a late attribution count for the app.
         let app = OSAllocatedUnfairLock(initialState: attribution)
@@ -130,7 +134,7 @@ public enum EngineTCPRelay: Sendable {
         }
         let started = ContinuousClock.now
         let snapshot = await splice(inbound: inbound, outbound: outbound) { up, down in
-            engine.traffic.addBytes(up: up, down: down, via: via, app: app.withLock { $0 }, transport: .tcp)
+            engine.traffic.addBytes(up: up, down: down, route: route, app: app.withLock { $0 }, transport: .tcp)
             engine.traffic.addFlowBytes(id: flowID, up: up, down: down)
         }
         let elapsed = started.duration(to: ContinuousClock.now)
@@ -140,7 +144,7 @@ public enum EngineTCPRelay: Sendable {
                 id: flowID,
                 startedAt: startedAt,
                 endpoint: target,
-                via: via,
+                route: route,
                 uplinkBytes: UInt64(snapshot.up),
                 downlinkBytes: UInt64(snapshot.down),
                 milliseconds: ms,
@@ -154,7 +158,7 @@ public enum EngineTCPRelay: Sendable {
         )
         TunnelLog.write(
             .debug,
-            "flow closed \(target) via \(via) up=\(snapshot.up) down=\(snapshot.down) client=\(snapshot.client) remote=\(snapshot.remote) ms=\(ms)"
+            "flow closed \(target) via \(route) up=\(snapshot.up) down=\(snapshot.down) client=\(snapshot.client) remote=\(snapshot.remote) ms=\(ms)"
         )
     }
 

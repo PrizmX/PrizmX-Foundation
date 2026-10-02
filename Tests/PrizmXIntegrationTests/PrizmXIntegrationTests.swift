@@ -394,11 +394,11 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
     counter.flowDidOpen()
     counter.flowDidOpen()
     #expect(counter.snapshot().activeConnections == 2)
-    counter.addBytes(up: 100, down: 50, via: "Proxies")
+    counter.addBytes(up: 100, down: 50, route: FlowRoute(["Proxies"]))
     counter.flowDidClose(
         FlowRecord(
             endpoint: Endpoint(domain: "api.x.ai", port: 443),
-            via: "Proxies",
+            route: FlowRoute(["Proxies"]),
             uplinkBytes: 100,
             downlinkBytes: 50,
             milliseconds: 20,
@@ -411,6 +411,6 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
     #expect(snap.uplinkBytes == 100)
     #expect(snap.downlinkBytes == 50)
     #expect(counter.recentFlows().count == 1)
-    counter.addBytes(up: 10, down: 5, via: "Proxies")
+    counter.addBytes(up: 10, down: 5, route: FlowRoute(["Proxies"]))
     #expect(counter.snapshot().uplinkBytes == 110)
 }

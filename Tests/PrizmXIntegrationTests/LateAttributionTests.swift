@@ -13,11 +13,11 @@ private let cloudd = FlowAttribution(pid: 745, processName: "cloudd")
     let counter = TrafficCounter()
     let open = FlowRecord(
         endpoint: Endpoint(domain: "api.apple-cloudkit.com", port: 443),
-        via: "Proxies",
+        route: FlowRoute(["Proxies"]),
         closed: false
     )
     counter.flowDidBegin(open)
-    counter.addBytes(up: 100, down: 900, via: "Proxies", transport: .tcp)
+    counter.addBytes(up: 100, down: 900, route: FlowRoute(["Proxies"]), transport: .tcp)
     counter.addFlowBytes(id: open.id, up: 100, down: 900)
 
     counter.flowDidAttribute(id: open.id, cloudd)
@@ -31,7 +31,7 @@ private let cloudd = FlowAttribution(pid: 745, processName: "cloudd")
         id: open.id,
         startedAt: open.startedAt,
         endpoint: open.endpoint,
-        via: "Proxies",
+        route: FlowRoute(["Proxies"]),
         uplinkBytes: 100,
         downlinkBytes: 900,
         milliseconds: 5,
@@ -49,7 +49,7 @@ private let cloudd = FlowAttribution(pid: 745, processName: "cloudd")
     let counter = TrafficCounter()
     let record = FlowRecord(
         endpoint: Endpoint(domain: "ocsp2.apple.com", port: 443),
-        via: "Proxies",
+        route: FlowRoute(["Proxies"]),
         uplinkBytes: 10,
         downlinkBytes: 20,
         milliseconds: 5
@@ -136,7 +136,7 @@ private final class LoopbackClientStream: InboundStream, @unchecked Sendable {
 
 /// Loopback TCP listener that accepts and closes at once: the relay's
 /// direct dial succeeds and its splice ends right away.
-private final class ClosingServer: @unchecked Sendable {
+final class ClosingServer: @unchecked Sendable {
     let port: UInt16
     private let fd: Int32
 

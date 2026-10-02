@@ -8,8 +8,7 @@ import PrizmXProtocols
 /// list when `open()` fails. Once a member is open, all I/O binds to it.
 public final class FailoverGroupConnection: OutboundConnection, @unchecked Sendable {
     public let endpoint: Endpoint
-    /// Group this connection was dispatched through — used as the routing
-    /// label for per-policy traffic ranking.
+    /// Group this connection was dispatched through.
     public let groupName: String
     /// Group member names in failover order (selected / first member first).
     public let candidateNames: [String]
@@ -18,7 +17,9 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
 
     private struct State {
         var active: (any OutboundConnection)?
-        var openTask: Task<any OutboundConnection, Error>?
+        var openTask: Task<(chain: [String], connection: any OutboundConnection), Error>?
+        /// The opened member's route plus this group; empty until then.
+        var chain: [String] = []
     }
 
     init(target: Endpoint, groupName: String, makers: [(String, () throws -> any OutboundConnection)]) {
@@ -32,12 +33,18 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
         lifecycle.withLock { $0.active?.state ?? .idle }
     }
 
-    public var routingLabel: String { groupName }
+    /// The opened member's route plus this group: `["DIRECT", "🎯Direct"]`,
+    /// `["JP 03", "Proxies", "AI"]` for nested groups. Just the group name
+    /// before `open()`.
+    public var chain: [String] {
+        lifecycle.withLock { $0.chain.isEmpty ? [groupName] : $0.chain }
+    }
 
     public func open() async throws {
-        let task: Task<any OutboundConnection, Error> = lifecycle.withLock { life in
+        let task: Task<(chain: [String], connection: any OutboundConnection), Error> = lifecycle.withLock { life in
             if let active = life.active {
-                return Task { active }
+                let chain = life.chain
+                return Task { (chain, active) }
             }
             if let openTask = life.openTask {
                 return openTask
@@ -49,7 +56,8 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
         do {
             let opened = try await task.value
             lifecycle.withLock { life in
-                life.active = opened
+                life.active = opened.connection
+                life.chain = opened.chain
                 life.openTask = nil
             }
         } catch {
@@ -58,7 +66,7 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
         }
     }
 
-    private func openSequenced() async throws -> any OutboundConnection {
+    private func openSequenced() async throws -> (chain: [String], connection: any OutboundConnection) {
         var lastError: Error = OutboundError.unreachable(endpoint)
         for (index, maker) in makers.enumerated() {
             do {
@@ -67,7 +75,9 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
                 if index > 0 {
                     TunnelLog.write(.debug, "failover \(endpoint) → \(maker.name)")
                 }
-                return candidate
+                // A node does not name itself; its member name does.
+                let member = candidate.chain.isEmpty ? [maker.name] : candidate.chain
+                return (member + [groupName], candidate)
             } catch {
                 TunnelLog.write(.debug, "failover member \(maker.name) for \(endpoint) failed: \(error.localizedDescription)")
                 lastError = error

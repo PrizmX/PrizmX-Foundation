@@ -31,8 +31,9 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     /// Bytes that went DIRECT (proxy = uplink/downlink minus these).
     public var directUplinkBytes: UInt64
     public var directDownlinkBytes: UInt64
-    /// Cumulative bytes per policy / domain, capped to the top entries so the
-    /// 1s IPC poll stays small.
+    /// Cumulative bytes per rule policy (`FlowRoute.policy`, proxied traffic
+    /// only: direct is in the direct counters) / domain, capped to the top
+    /// entries so the 1s IPC poll stays small.
     public var policyBytes: [String: TrafficByteCount]
     public var domainBytes: [String: TrafficByteCount]
     /// Cumulative bytes per app accounting key (bundle ID or process name).
@@ -52,6 +53,11 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     public var domainUDPBytes: [String: UInt64]
     public var policyTCPBytes: [String: UInt64]
     public var policyUDPBytes: [String: UInt64]
+    /// Cumulative bytes per exit (`FlowRoute.exit`: `DIRECT` or a node),
+    /// direct included.
+    public var exitBytes: [String: TrafficByteCount]
+    public var exitTCPBytes: [String: UInt64]
+    public var exitUDPBytes: [String: UInt64]
 
     public init(
         uploadBytesPerSecond: Double = 0,
@@ -74,7 +80,10 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         domainTCPBytes: [String: UInt64] = [:],
         domainUDPBytes: [String: UInt64] = [:],
         policyTCPBytes: [String: UInt64] = [:],
-        policyUDPBytes: [String: UInt64] = [:]
+        policyUDPBytes: [String: UInt64] = [:],
+        exitBytes: [String: TrafficByteCount] = [:],
+        exitTCPBytes: [String: UInt64] = [:],
+        exitUDPBytes: [String: UInt64] = [:]
     ) {
         self.uploadBytesPerSecond = uploadBytesPerSecond
         self.downloadBytesPerSecond = downloadBytesPerSecond
@@ -97,6 +106,9 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         self.domainUDPBytes = domainUDPBytes
         self.policyTCPBytes = policyTCPBytes
         self.policyUDPBytes = policyUDPBytes
+        self.exitBytes = exitBytes
+        self.exitTCPBytes = exitTCPBytes
+        self.exitUDPBytes = exitUDPBytes
     }
 
     public static let zero = TrafficSnapshot()
@@ -153,7 +165,10 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
             domainTCPBytes: mergeCount(domainTCPBytes, other.domainTCPBytes),
             domainUDPBytes: mergeCount(domainUDPBytes, other.domainUDPBytes),
             policyTCPBytes: mergeCount(policyTCPBytes, other.policyTCPBytes),
-            policyUDPBytes: mergeCount(policyUDPBytes, other.policyUDPBytes)
+            policyUDPBytes: mergeCount(policyUDPBytes, other.policyUDPBytes),
+            exitBytes: mergeMap(exitBytes, other.exitBytes),
+            exitTCPBytes: mergeCount(exitTCPBytes, other.exitTCPBytes),
+            exitUDPBytes: mergeCount(exitUDPBytes, other.exitUDPBytes)
         )
     }
 
@@ -166,6 +181,7 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         case activeFlows, recentFlows
         case appTCPBytes, appUDPBytes, domainTCPBytes, domainUDPBytes
         case policyTCPBytes, policyUDPBytes
+        case exitBytes, exitTCPBytes, exitUDPBytes
     }
 
     public init(from decoder: Decoder) throws {
@@ -197,6 +213,9 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         domainUDPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .domainUDPBytes) ?? [:]
         policyTCPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .policyTCPBytes) ?? [:]
         policyUDPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .policyUDPBytes) ?? [:]
+        exitBytes = try container.decodeIfPresent([String: TrafficByteCount].self, forKey: .exitBytes) ?? [:]
+        exitTCPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .exitTCPBytes) ?? [:]
+        exitUDPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .exitUDPBytes) ?? [:]
     }
 }
 
@@ -205,7 +224,7 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
     public var id: UUID
     public var startedAt: Date
     public var endpoint: Endpoint
-    public var via: String
+    public var route: FlowRoute
     public var uplinkBytes: UInt64
     public var downlinkBytes: UInt64
     public var milliseconds: Int
@@ -224,7 +243,7 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
         id: UUID = UUID(),
         startedAt: Date = Date(),
         endpoint: Endpoint,
-        via: String,
+        route: FlowRoute,
         uplinkBytes: UInt64 = 0,
         downlinkBytes: UInt64 = 0,
         milliseconds: Int = 0,
@@ -239,7 +258,7 @@ public struct FlowRecord: Sendable, Hashable, Codable, Equatable, Identifiable {
         self.id = id
         self.startedAt = startedAt
         self.endpoint = endpoint
-        self.via = via
+        self.route = route
         self.uplinkBytes = uplinkBytes
         self.downlinkBytes = downlinkBytes
         self.milliseconds = milliseconds
@@ -278,6 +297,9 @@ public final class TrafficCounter: Sendable {
         var domainUDP: [String: UInt64] = [:]
         var policyTCP: [String: UInt64] = [:]
         var policyUDP: [String: UInt64] = [:]
+        var exits: [String: TrafficByteCount] = [:]
+        var exitTCP: [String: UInt64] = [:]
+        var exitUDP: [String: UInt64] = [:]
         var nextSerial: UInt64 = 0
     }
 
@@ -320,13 +342,14 @@ public final class TrafficCounter: Sendable {
         }
     }
 
-    /// Datagram / splice bytes with the routing label of the pipe they
-    /// crossed. `direct` feeds the Direct bucket; every other label (policy
-    /// group, bare proxy) is proxied traffic ranked per policy.
+    /// Datagram / splice bytes with the route of the pipe they crossed. The
+    /// exit decides direct or proxied (a rule on a group that selects DIRECT
+    /// is direct); proxied bytes rank under the rule's policy, and every
+    /// byte ranks under its exit.
     public func addBytes(
         up: UInt64,
         down: UInt64,
-        via: String,
+        route: FlowRoute,
         app: FlowAttribution? = nil,
         transport: FlowTransport? = nil,
         domain: String? = nil
@@ -335,16 +358,21 @@ public final class TrafficCounter: Sendable {
         lock.withLock { state in
             state.uplinkBytes &+= up
             state.downlinkBytes &+= down
-            if via == "direct" {
+            if route.isDirect {
                 state.directUp &+= up
                 state.directDown &+= down
             } else {
-                var count = state.policy[via] ?? TrafficByteCount()
+                var count = state.policy[route.policy] ?? TrafficByteCount()
                 count.up &+= up
                 count.down &+= down
-                state.policy[via] = count
-                Self.addProtocol(added, transport: transport, tcp: &state.policyTCP, udp: &state.policyUDP, key: via)
+                state.policy[route.policy] = count
+                Self.addProtocol(added, transport: transport, tcp: &state.policyTCP, udp: &state.policyUDP, key: route.policy)
             }
+            var exit = state.exits[route.exit] ?? TrafficByteCount()
+            exit.up &+= up
+            exit.down &+= down
+            state.exits[route.exit] = exit
+            Self.addProtocol(added, transport: transport, tcp: &state.exitTCP, udp: &state.exitUDP, key: route.exit)
             if let app {
                 Self.addApp(app, up: up, down: down, transport: transport, to: &state)
             }
@@ -452,6 +480,7 @@ public final class TrafficCounter: Sendable {
             let topApps = Self.top(state.apps, cap: snapshotMapCap)
             let topDomains = Self.top(state.domains, cap: snapshotMapCap)
             let topPolicies = Self.top(state.policy, cap: snapshotMapCap)
+            let topExits = Self.top(state.exits, cap: snapshotMapCap)
             return TrafficSnapshot(
                 uploadBytesPerSecond: upRate,
                 downloadBytesPerSecond: downRate,
@@ -473,7 +502,10 @@ public final class TrafficCounter: Sendable {
                 domainTCPBytes: Self.slice(state.domainTCP, keys: Set(topDomains.keys)),
                 domainUDPBytes: Self.slice(state.domainUDP, keys: Set(topDomains.keys)),
                 policyTCPBytes: Self.slice(state.policyTCP, keys: Set(topPolicies.keys)),
-                policyUDPBytes: Self.slice(state.policyUDP, keys: Set(topPolicies.keys))
+                policyUDPBytes: Self.slice(state.policyUDP, keys: Set(topPolicies.keys)),
+                exitBytes: topExits,
+                exitTCPBytes: Self.slice(state.exitTCP, keys: Set(topExits.keys)),
+                exitUDPBytes: Self.slice(state.exitUDP, keys: Set(topExits.keys))
             )
         }
     }

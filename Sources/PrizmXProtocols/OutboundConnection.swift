@@ -58,8 +58,11 @@ public protocol OutboundConnection: Sendable {
     /// The current connection state (must be safe to read from any thread).
     var state: OutboundConnectionState { get }
 
-    /// Short routing tag for logs / traffic stats (`direct`, group member, …).
-    var routingLabel: String { get }
+    /// The route this connection took, exit first (`FlowRoute.chain`). Read
+    /// once open: a group only knows its member then. Empty for a node
+    /// connection, which does not know its own name; the group or rule that
+    /// picked it supplies it.
+    var chain: [String] { get }
 
     /// Establishes the connection. Idempotent: returns immediately if already
     /// established.
@@ -100,7 +103,7 @@ public protocol OutboundConnection: Sendable {
 //          versions on hot paths)
 
 extension OutboundConnection {
-    public var routingLabel: String { "proxy" }
+    public var chain: [String] { [] }
 
     public func closeWrite() async {}
 

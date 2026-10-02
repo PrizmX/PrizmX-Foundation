@@ -268,6 +268,31 @@ public final class NodeManager: Sendable {
         return resolveLeaf(name: next, visited: &visited)
     }
 
+    /// The route `selectedLeaf` follows, exit first (`FlowRoute.chain`):
+    /// `["DIRECT", "🎯Direct"]`, `["JP 03", "Proxies", "AI"]`.
+    public func selectedChain(inGroup groupName: String) -> [String] {
+        var visited = Set<String>()
+        return resolveChain(name: groupName, visited: &visited)
+    }
+
+    private func resolveChain(name: String, visited: inout Set<String>) -> [String] {
+        switch name.uppercased() {
+        case "DIRECT":
+            return [FlowRoute.direct]
+        case "REJECT", "REJECT-DROP":
+            return [name.uppercased()]
+        default:
+            break
+        }
+        // Same lookup order as `resolveLeaf`: a node name ends the chain.
+        guard nodesByID[name] == nil,
+              let group = groupsByName[name],
+              visited.insert(name).inserted,
+              let next = pickNodeID(in: group, target: Endpoint(domain: group.name, port: 0), advance: false)
+        else { return [name] }
+        return resolveChain(name: next, visited: &visited) + [name]
+    }
+
     public func select(nodeID: String, inGroup groupName: String) throws {
         guard let group = groupsByName[groupName] else {
             throw NodeError.unknownGroup(groupName)
