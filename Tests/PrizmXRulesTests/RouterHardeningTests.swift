@@ -57,6 +57,25 @@ private final class ResolveCounter: @unchecked Sendable {
     #expect(counter.count == 0)
 }
 
+@Test func nonResolvingMatchStopsAtFirstRuleNeedingAnIP() {
+    let router = Router(
+        rules: [
+            RouteRule(.domainSuffix("ads.example"), policy: .reject),
+            RouteRule(.geoIP(code: "cn"), policy: .direct),
+            RouteRule(.domainKeyword("tracker"), policy: .reject),
+            RouteRule(.matchAll, policy: .proxy(targetGroup: "P")),
+        ],
+        default: .direct
+    )
+    // A domain rule before the GEOIP rule still decides.
+    #expect(router.matchWithoutResolving(endpoint: Endpoint(domain: "x.ads.example", port: 443))?.policy == .reject)
+    // Past GEOIP the answer depends on the lookup: undecided, not the later REJECT.
+    #expect(router.matchWithoutResolving(endpoint: Endpoint(domain: "tracker.example", port: 443)) == nil)
+    // IP destinations need no lookup.
+    let ip = Endpoint(host: .ipv4(IPv4Address(1, 2, 3, 4)), port: 443)
+    #expect(router.matchWithoutResolving(endpoint: ip)?.policy == .proxy(targetGroup: "P"))
+}
+
 @Test func directlyBuiltMatchersAreNormalized() {
     let router = Router(
         rules: [

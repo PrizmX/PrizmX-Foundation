@@ -141,8 +141,9 @@ public actor TUNStack {
     private let mailbox: TUNMailbox
     private let fakeIPFilter: [String]
     private let dns: DNSClient?
-    /// FakeDNS: filter → real; REJECT → NODATA; PROXY and DIRECT → FakeIP.
-    private let dnsPolicy: (@Sendable (String) async -> Policy)?
+    /// FakeDNS: filter → real; REJECT → NODATA; anything else (nil:
+    /// undecided without a lookup) → FakeIP.
+    private let dnsPolicy: (@Sendable (String) async -> Policy?)?
     /// Clash `dns.ipv6`: FakeIPv6 pool + pass IPv6 into SwiftTCP.
     private let ipv6Enabled: Bool
     /// TCP SYN/FIN hooks; nil on iOS.
@@ -155,7 +156,7 @@ public actor TUNStack {
         fakeIP: FakeIPAllocator?,
         fakeIPFilter: [String] = [],
         dns: DNSClient? = nil,
-        dnsPolicy: (@Sendable (String) async -> Policy)? = nil,
+        dnsPolicy: (@Sendable (String) async -> Policy?)? = nil,
         ipv6: Bool = false,
         onOutput: @escaping @Sendable ([Data]) -> Void
     ) {

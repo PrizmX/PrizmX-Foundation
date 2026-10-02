@@ -243,9 +243,21 @@ public final class Engine: Sendable {
 
     /// FakeDNS-time policy. REJECT → NODATA. DIRECT (including nested
     /// `select` → DIRECT) still receives FakeIP so the flow enters TUN.
-    public func dnsPolicy(host: String) async -> Policy {
+    ///
+    /// Never resolves: FakeDNS answers on the packet path, and a lookup here
+    /// would stall it behind the upstream. `nil` means the name reached a
+    /// GEOIP / IP-CIDR rule first; it gets a FakeIP and the dial decides.
+    public func dnsPolicy(host: String) async -> Policy? {
         let endpoint = Endpoint(domain: host, port: 443)
-        switch await resolvePolicy(for: endpoint) {
+        let policy: Policy
+        if hostsMapping(for: endpoint) != nil || outboundMode != .rule {
+            // Hosts hits and MODE,DIRECT / GLOBAL match without a lookup.
+            policy = await resolvePolicy(for: endpoint)
+        } else {
+            guard let matched = router.matchWithoutResolving(endpoint: endpoint) else { return nil }
+            policy = matched.policy
+        }
+        switch policy {
         case .direct:
             return .direct
         case .reject:

@@ -318,6 +318,22 @@ public final class Router: Sendable {
         return (defaultPolicy, nil, resolved)
     }
 
+    /// Non-resolving variant: rules run in order, but a domain destination
+    /// that reaches a rule needing a real IP returns `nil`, since the outcome
+    /// depends on a lookup the caller chose not to make.
+    public func matchWithoutResolving(endpoint: Endpoint) -> (policy: Policy, rule: RouteRule?)? {
+        let isDomain: Bool
+        if case .domain = endpoint.host { isDomain = true } else { isDomain = false }
+        for entry in compiled {
+            if let port = entry.rule.port, port != endpoint.port { continue }
+            if isDomain, entry.needsResolution { return nil }
+            if matches(entry, endpoint: endpoint, resolvedIPv4: nil, resolvedIPv6: nil) {
+                return (entry.rule.policy, entry.rule)
+            }
+        }
+        return (defaultPolicy, nil)
+    }
+
     /// Queries a policy given a host name (domain or IP literal) and a port.
     public func match(host: some StringProtocol, port: UInt16) -> Policy {
         if let address = IPv4Address(parsing: host) {

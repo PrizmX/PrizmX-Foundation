@@ -389,6 +389,23 @@ private final class MockInboundStream: InboundStream, @unchecked Sendable {
     #expect(await engine.dnsPolicy(host: "www.google.com") == .proxy(targetGroup: "Google"))
 }
 
+@Test func dnsPolicyNeverResolvesOnThePacketPath() async {
+    let engine = Engine(
+        router: Router(
+            rules: [
+                RouteRule(.domainSuffix("ads.example"), policy: .reject),
+                RouteRule(.ipv4CIDR(IPv4Address(10, 0, 0, 0), prefixLength: 8), policy: .direct),
+                RouteRule(.matchAll, policy: .reject),
+            ],
+            default: .direct
+        ),
+        nodeManager: NodeManager(nodes: [], groups: [])
+    )
+    #expect(await engine.dnsPolicy(host: "x.ads.example") == .reject)
+    // Reaching the IP-CIDR rule would need a direct lookup: left to the dial.
+    #expect(await engine.dnsPolicy(host: "unresolvable.invalid") == nil)
+}
+
 @Test func trafficCounterTracksFlowsAndSnapshot() {
     let counter = TrafficCounter()
     counter.flowDidOpen()
