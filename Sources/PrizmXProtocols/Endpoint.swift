@@ -95,3 +95,21 @@ public struct Endpoint: Hashable, Sendable, CustomStringConvertible, Codable {
         }
     }
 }
+
+extension Endpoint.Host {
+    /// This machine itself: 127/8, 0.0.0.0, ::1, :: and their IPv4-mapped
+    /// forms. Remote (Allow LAN) clients must not reach services bound here.
+    public var isThisHost: Bool {
+        switch self {
+        case .ipv4(let address):
+            return address.rawValue >> 24 == 127 || address.rawValue == 0
+        case .ipv6(let address):
+            guard address.high == 0 else { return false }
+            if address.low <= 1 { return true }
+            guard address.low >> 32 == 0xFFFF else { return false }
+            return Endpoint.Host.ipv4(IPv4Address(rawValue: UInt32(truncatingIfNeeded: address.low))).isThisHost
+        case .domain:
+            return false
+        }
+    }
+}

@@ -83,7 +83,7 @@ public enum EngineTCPRelay: Sendable {
         let rule: String
         let policy: String
         do {
-            let dispatched = try await engine.resolveAndDispatch(target: target)
+            let dispatched = try await engine.resolveAndDispatch(target: target, remoteClient: !isLocalClient)
             outbound = dispatched.connection
             rule = dispatched.rule
             policy = dispatched.policy

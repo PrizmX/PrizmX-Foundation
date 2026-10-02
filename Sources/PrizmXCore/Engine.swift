@@ -152,16 +152,19 @@ public final class Engine: Sendable {
 
     /// `dispatchDetailed` with lazy IP resolution: the relay entry point.
     /// `policy` is what the rule chose (`DIRECT`, a group, or a node).
+    /// `remoteClient`: the flow came from another machine (Allow LAN), so a
+    /// DIRECT dial must not land on this host however the name resolves.
     public func resolveAndDispatch(
         target: Endpoint,
-        command: VLESSCommand = .tcp
+        command: VLESSCommand = .tcp,
+        remoteClient: Bool = false
     ) async throws -> (connection: any OutboundConnection, rule: String, policy: String) {
         if let hosts = hostsMapping(for: target) {
             let matched = matchTarget(target, resolvedIPv4: hosts.ipv4.first, resolvedIPv6: hosts.ipv6.first)
-            return try connection(for: target, command: command, matched: matched, hosts: hosts)
+            return try connection(for: target, command: command, matched: matched, hosts: hosts, remoteClient: remoteClient)
         }
         let matched = await resolveAndMatch(target)
-        return try connection(for: target, command: command, matched: matched, hosts: nil)
+        return try connection(for: target, command: command, matched: matched, hosts: nil, remoteClient: remoteClient)
     }
 
     public func dispatchDetailed(
@@ -183,7 +186,8 @@ public final class Engine: Sendable {
         for target: Endpoint,
         command: VLESSCommand,
         matched: (policy: Policy, rule: String),
-        hosts: SystemHosts.Mapping?
+        hosts: SystemHosts.Mapping?,
+        remoteClient: Bool = false
     ) throws -> (connection: any OutboundConnection, rule: String, policy: String) {
         // Hosts-file hit. IP rules already saw the mapped address, and
         // REJECT still wins. A local binding (loopback / LAN / 0.0.0.0) is
@@ -200,7 +204,7 @@ public final class Engine: Sendable {
             if hosts.isLocalBinding {
                 TunnelLog.writeOnce("hosts-\(name)", .info, "hosts \(name) → \(hosts.summary) direct (local)")
                 return (
-                    DirectOutboundConnection(endpoint: target, role: .direct),
+                    DirectOutboundConnection(endpoint: target, role: .direct, refusesThisHost: remoteClient),
                     "HOSTS,\(name),DIRECT",
                     FlowRoute.direct
                 )
@@ -219,7 +223,11 @@ public final class Engine: Sendable {
         }
         switch matched.policy {
         case .direct:
-            return (DirectOutboundConnection(endpoint: target, role: .direct), matched.rule, FlowRoute.direct)
+            return (
+                DirectOutboundConnection(endpoint: target, role: .direct, refusesThisHost: remoteClient),
+                matched.rule,
+                FlowRoute.direct
+            )
         case .reject:
             TunnelLog.write(.info, "reject \(target)")
             throw EngineError.rejected(target)

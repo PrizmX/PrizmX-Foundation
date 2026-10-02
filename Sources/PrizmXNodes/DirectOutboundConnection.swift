@@ -11,6 +11,9 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
 
     public let endpoint: Endpoint
     public let role: DNSRole
+    /// Set for remote (Allow LAN) clients: candidates on this machine
+    /// (`Endpoint.Host.isThisHost`) are dropped, however the name resolved.
+    public let refusesThisHost: Bool
 
     public var state: OutboundConnectionState {
         lifecycle.withLock { $0.state }
@@ -37,9 +40,10 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
         lifecycle.withLock { $0.connection }
     }
 
-    public init(endpoint: Endpoint, role: DNSRole = .direct) {
+    public init(endpoint: Endpoint, role: DNSRole = .direct, refusesThisHost: Bool = false) {
         self.endpoint = endpoint
         self.role = role
+        self.refusesThisHost = refusesThisHost
         self.queue = DispatchQueue(label: "prizmx.direct.outbound", qos: .userInitiated)
     }
 
@@ -148,13 +152,14 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
         // dialed as written and does not fall through to upstream DNS.
         var candidates: [(host: NWEndpoint.Host, address: PrizmXProtocols.IPv4Address?)]
         if case .domain(let domain) = endpoint.host, let mapped = SystemHosts.lookup(domain) {
-            candidates = mapped.addresses.prefix(8).map { (NWEndpoint.Host($0.description), nil) }
+            candidates = mapped.addresses.filter(permits).prefix(8).map { (NWEndpoint.Host($0.description), nil) }
         } else if case .domain = endpoint.host {
             guard DNSClient.current != nil else { throw DNSError.notConfigured }
             let addresses = try await DNSClient.resolveAll(endpoint.host, role: role)
+                .filter { permits(.ipv4($0)) }
             candidates = addresses.prefix(3).map { (NWEndpoint.Host($0.description), $0) }
         } else {
-            candidates = [(NWEndpoint.Host(endpoint.host.description), nil)]
+            candidates = permits(endpoint.host) ? [(NWEndpoint.Host(endpoint.host.description), nil)] : []
         }
 
         var lastError: Error = OutboundError.unreachable(endpoint)
@@ -186,6 +191,12 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
             }
         }
         throw lastError
+    }
+
+    private func permits(_ host: Endpoint.Host) -> Bool {
+        guard refusesThisHost, host.isThisHost else { return true }
+        TunnelLog.writeOnce("direct-this-host-\(endpoint.host)", .warn, "refused remote client → \(endpoint) (\(host) is this host)")
+        return false
     }
 
     private func waitReady(_ nw: NWConnection) async throws {

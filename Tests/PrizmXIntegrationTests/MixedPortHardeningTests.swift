@@ -1,7 +1,9 @@
 import Foundation
 import Testing
 @testable import PrizmXCore
-import PrizmXProtocols
+import PrizmXNodes
+@testable import PrizmXProtocols
+import PrizmXRules
 
 @Test func forwardRewriteKeepsPercentEncodingAndDropsProxyHeaders() throws {
     let request = Data((
@@ -117,4 +119,41 @@ import PrizmXProtocols
     #expect(MixedPortParser.headerEnd(in: data, from: 0) != nil)
     #expect(MixedPortParser.headerEnd(in: data, from: data.count - 4) != nil)
     #expect(MixedPortParser.headerEnd(in: data.prefix(data.count - 1), from: -3) == nil)
+}
+
+@Test func thisHostCoversLoopbackUnspecifiedAndMappedForms() throws {
+    #expect(Endpoint.Host.ipv4(IPv4Address(127, 9, 9, 9)).isThisHost)
+    #expect(Endpoint.Host.ipv4(IPv4Address(0, 0, 0, 0)).isThisHost)
+    #expect(Endpoint.Host.ipv6(.loopback).isThisHost)
+    #expect(Endpoint.Host.ipv6(try #require(IPv6Address(parsing: "::ffff:127.0.0.1"))).isThisHost)
+    #expect(!Endpoint.Host.ipv4(IPv4Address(192, 168, 1, 1)).isThisHost)
+    #expect(!Endpoint.Host.domain("localhost").isThisHost)
+}
+
+/// Allow LAN: a name that lands on this host (sniffed `Host: localhost`, a
+/// hosts entry, or DNS answering 127.0.0.1) must not be dialed for a LAN
+/// client, while a local client keeps reaching it.
+@Test func remoteClientDirectDialNeverReachesThisHost() async throws {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("prizmx-hosts-\(UUID().uuidString)")
+    try "127.0.0.1 lan-target.test\n".write(to: url, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let engine = Engine(router: Router(default: .direct), nodeManager: NodeManager(nodes: [], groups: []))
+
+    try await SystemHosts.$pathOverride.withValue(url.path) {
+        for target in [Endpoint(domain: "lan-target.test", port: 9), Endpoint(host: .ipv4(.loopback), port: 9)] {
+            let remote = try await engine.resolveAndDispatch(target: target, remoteClient: true)
+            let direct = try #require(remote.connection as? DirectOutboundConnection)
+            #expect(direct.refusesThisHost)
+            do {
+                try await direct.open()
+                Issue.record("dialed \(target) for a remote client")
+            } catch OutboundError.unreachable {
+            } catch {
+                Issue.record("expected unreachable, got \(error)")
+            }
+        }
+        let local = try await engine.resolveAndDispatch(target: Endpoint(domain: "lan-target.test", port: 9))
+        #expect((local.connection as? DirectOutboundConnection)?.refusesThisHost == false)
+    }
 }
