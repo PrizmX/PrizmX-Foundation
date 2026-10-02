@@ -288,4 +288,29 @@ struct TLS13RecordLayerTests {
         #expect(records[0].0 == TLS13.contentAlert)
         #expect(records[0].1 == Data([1, 0]))
     }
+
+    @Test func peerCloseNotifyEndsCleanlyAfterBufferedData() throws {
+        let (pair, suite) = try makePair()
+        let layer = TLS13RecordLayer(application: pair, suite: suite)
+        var server = pair.server
+        // Last data record and close_notify in one TCP chunk, then stray bytes.
+        var wire = try TLS13AEAD.seal(plaintext: Data("tail".utf8), keys: &server, contentType: TLS13.contentApplicationData)
+        wire.append(try TLS13AEAD.seal(plaintext: Data([1, 0]), keys: &server, contentType: TLS13.contentAlert))
+        wire.append(try TLS13AEAD.seal(plaintext: Data("late".utf8), keys: &server, contentType: TLS13.contentApplicationData))
+
+        try layer.feedWire(wire)
+        #expect(layer.receivedCloseNotify)
+        #expect(layer.drainPlaintext() == Data("tail".utf8))
+        try layer.feedWire(Data([0x17, 0x03, 0x03, 0x00, 0x01, 0x00]))
+        #expect(layer.drainPlaintext().isEmpty)
+    }
+
+    @Test func fatalAlertStillFails() throws {
+        let (pair, suite) = try makePair()
+        let layer = TLS13RecordLayer(application: pair, suite: suite)
+        var server = pair.server
+        let wire = try TLS13AEAD.seal(plaintext: Data([2, 40]), keys: &server, contentType: TLS13.contentAlert)
+        #expect(throws: REALITYError.self) { try layer.feedWire(wire) }
+        #expect(!layer.receivedCloseNotify)
+    }
 }

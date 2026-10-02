@@ -28,6 +28,7 @@ enum TLS13 {
     static let defaultALPN = ["h2", "http/1.1"]
     static let contentChangeCipherSpec: UInt8 = 20
     static let contentAlert: UInt8 = 21
+    static let alertCloseNotify: UInt8 = 0
     static let contentHandshake: UInt8 = 22
     static let contentApplicationData: UInt8 = 23
     static let versionTLS10: UInt16 = 0x0301
@@ -822,6 +823,9 @@ final class TLS13RecordLayer: @unchecked Sendable {
     /// XTLS Vision direct-copy: after a downlink `command=direct` frame the
     /// peer writes inner TLS records unencrypted, so decryption must stop.
     private(set) var isRawMode = false
+    /// Peer sent `close_notify`: a clean end of stream. Plaintext decrypted
+    /// before it is still delivered; later records are ignored.
+    private(set) var receivedCloseNotify = false
 
     private struct WriteState: Sendable {
         var keys: TLS13TrafficKeys
@@ -903,8 +907,10 @@ final class TLS13RecordLayer: @unchecked Sendable {
 
     /// Decrypts exactly one buffered record. Returns application-data
     /// plaintext, an empty `Data` for consumed non-application records (CCS /
-    /// post-handshake), and `nil` only when no complete record is buffered.
+    /// post-handshake), and `nil` when no complete record is buffered or the
+    /// peer has sent `close_notify`.
     func decryptNextRecord() throws -> Data? {
+        guard !receivedCloseNotify else { return nil }
         guard incoming.readableByteCount >= TLS13.recordHeaderByteCount else { return nil }
         let headerView = incoming.readableBytes
         let length = (Int(headerView[3]) << 8) | Int(headerView[4])
@@ -941,6 +947,10 @@ final class TLS13RecordLayer: @unchecked Sendable {
             return Data()
         case TLS13.contentAlert:
             let bytes = Array(plaintext)
+            if bytes.count >= 2, bytes[1] == TLS13.alertCloseNotify {
+                receivedCloseNotify = true
+                return nil
+            }
             if bytes.count >= 2 {
                 throw REALITYError.alert(bytes[0], bytes[1])
             }

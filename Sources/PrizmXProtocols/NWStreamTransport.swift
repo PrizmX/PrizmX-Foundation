@@ -184,6 +184,12 @@ final class NWStreamTransport: @unchecked Sendable {
         }
     }
 
+    /// The framing above ended the stream cleanly (TLS `close_notify`) while
+    /// the socket may still be open; readers then stop at buffered data.
+    func markReceiveEOF() {
+        receiveEOF = true
+    }
+
     /// One raw chunk from the wire; `nil` at EOF (also flips `receiveEOF`).
     func receiveRaw() async throws -> Data? {
         guard let connection else { throw OutboundError.alreadyClosed(endpoint) }

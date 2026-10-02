@@ -291,6 +291,7 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
                 break
             }
         }
+        if tlsLayer.receivedCloseNotify { transport.markReceiveEOF() }
         return produced > 0 ? .bytes(produced) : .needMore
     }
 
@@ -526,6 +527,7 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         if let userspaceTLS {
             try userspaceTLS.feedWire(chunk)
             let plain = userspaceTLS.drainPlaintext()
+            if userspaceTLS.receivedCloseNotify { transport.markReceiveEOF() }
             if plain.isEmpty { return .needMore }
             transport.inbox.append(plain)
             return .bytes(plain.count)

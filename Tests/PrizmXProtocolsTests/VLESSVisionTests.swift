@@ -283,4 +283,32 @@ struct VLESSVisionPlainTLSTests {
         #expect(try connection.ingestVisionWire(later, reader: reader) == .bytes(later.count))
         #expect(connection.takeVisionAppForTesting() == later)
     }
+
+    @Test func closeNotifyAfterLastRecordKeepsTheTail() throws {
+        let connection = try VLESSOutboundConnection(
+            server: server, uuid: testUUIDString, target: target, tls: true, flow: "xtls-rprx-vision"
+        )
+        let suite = try TLS13CipherSuite.parse(TLS13.aes128GCMSha256)
+        let pair = TLS13KeySchedule.applicationSecrets(
+            suite: suite,
+            master: Data(repeating: 9, count: 32),
+            transcript: Data("hs".utf8)
+        )
+        connection.installUserspaceTLSForTesting(TLS13RecordLayer(application: pair, suite: suite))
+
+        var body = Data([0x00, 0x00]) // VLESS response header, no addons
+        body.append(VLESSVision.frame(
+            command: VLESSVision.commandEnd,
+            content: Data("TAIL".utf8),
+            padding: Data(),
+            uuid: testUUIDBytes
+        ))
+        var server = pair.server
+        var wire = try TLS13AEAD.seal(plaintext: body, keys: &server, contentType: TLS13.contentApplicationData)
+        wire.append(try TLS13AEAD.seal(plaintext: Data([1, 0]), keys: &server, contentType: TLS13.contentAlert))
+
+        let reader = VLESSVisionReader(userID: testUUID)
+        _ = try connection.ingestVisionWire(wire, reader: reader)
+        #expect(connection.takeVisionAppForTesting() == Data("TAIL".utf8))
+    }
 }
