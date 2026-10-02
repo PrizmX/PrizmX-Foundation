@@ -76,6 +76,13 @@ enum URLTestProber: Sendable {
         return (endpoint, Data(header.utf8), false)
     }
 
+    /// First bytes of an HTTP/1.x status line (a read may return just a few).
+    static func isHTTPResponseStart(_ data: Data) -> Bool {
+        let prefix = Data("HTTP/".utf8)
+        guard !data.isEmpty else { return false }
+        return data.prefix(prefix.count).elementsEqual(prefix.prefix(data.count))
+    }
+
     private static func run(connection: any OutboundConnection, url: URL) async -> Duration? {
         guard let request = request(for: url) else { return nil }
         let start = ContinuousClock.now
@@ -93,7 +100,13 @@ enum URLTestProber: Sendable {
                 }
             } else if let payload = request.payload {
                 try await connection.writeAll(payload)
-                _ = try await connection.readData(upTo: 256)
+                // EOF proves nothing: Shadowsocks, for one, accepts the stream
+                // before reaching the target and just closes when it cannot.
+                let response = try await connection.readData(upTo: 256)
+                guard isHTTPResponseStart(response) else {
+                    await connection.close()
+                    return nil
+                }
             }
             await connection.close()
             return ContinuousClock.now - start

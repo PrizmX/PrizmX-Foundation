@@ -145,3 +145,19 @@ private func anytlsNode(id: String, host: String, port: UInt16) -> OutboundNode 
     )
     #expect(result != nil)
 }
+
+@Test func urlTestProbeTreatsEOFAndGarbageAsDead() async {
+    for reply in [Data(), Data("\u{0}\u{1}garbage".utf8)] {
+        let peer = ScriptedOutbound(halfClose: false)
+        peer.feed(reply)
+        let result = await URLTestProber.probe(
+            connection: peer,
+            url: URL(string: "http://probe.example/generate_204")!,
+            timeout: .seconds(5)
+        )
+        #expect(result == nil, "reply \(Array(reply))")
+    }
+    #expect(URLTestProber.isHTTPResponseStart(Data("HT".utf8)))
+    #expect(URLTestProber.isHTTPResponseStart(Data("HTTP/1.1 204".utf8)))
+    #expect(!URLTestProber.isHTTPResponseStart(Data("HTTX".utf8)))
+}
