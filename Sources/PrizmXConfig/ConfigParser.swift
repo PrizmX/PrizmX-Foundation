@@ -237,6 +237,60 @@ enum ConfigMapping {
         "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
     ]
 
+    /// Drops group members the config does not define: proxies skipped as
+    /// unsupported or invalid, typos, provider-only names. Kept, such a name
+    /// fails the group whenever it is picked; a `select` group starting on
+    /// one fails every flow until the user switches. A group left empty is
+    /// dropped as well, and the pass repeats since other groups may list it.
+    static func pruningUndefinedMembers(
+        _ groups: [PolicyGroup],
+        nodes: [OutboundNode],
+        warnings: inout [ConfigWarning]
+    ) -> [PolicyGroup] {
+        let nodeIDs = Set(nodes.map(\.id))
+        var groups = groups
+        while true {
+            let groupNames = Set(groups.map(\.name))
+            var changed = false
+            let isDefined = { (member: String) in
+                nodeIDs.contains(member) || groupNames.contains(member) || NodeManager.isBuiltinMember(member)
+            }
+            groups = groups.compactMap { group in
+                let dropped = group.nodeIDs.filter { !isDefined($0) }
+                guard !dropped.isEmpty else { return group }
+                changed = true
+                let kept = group.nodeIDs.filter(isDefined)
+                let listed = dropped.prefix(3).joined(separator: ", ") + (dropped.count > 3 ? ", …" : "")
+                warnings.append(ConfigWarning(
+                    kind: .group,
+                    text: group.name,
+                    reason: "dropped \(dropped.count) undefined member(s): \(listed)"
+                ))
+                guard !kept.isEmpty else {
+                    warnings.append(ConfigWarning(
+                        kind: .group,
+                        text: group.name,
+                        reason: "no usable members; rules targeting it will fail closed"
+                    ))
+                    return nil
+                }
+                let selected = group.selectedNodeID.flatMap { kept.contains($0) ? $0 : nil } ?? kept.first
+                return PolicyGroup(
+                    name: group.name,
+                    mode: group.mode,
+                    nodeIDs: kept,
+                    selectedNodeID: selected,
+                    iconURL: group.iconURL,
+                    testURL: group.testURL,
+                    interval: group.interval,
+                    tolerance: group.tolerance,
+                    loadBalanceStrategy: group.loadBalanceStrategy
+                )
+            }
+            if !changed { return groups }
+        }
+    }
+
     /// Rules whose proxy target is neither a node nor a group fail closed at
     /// connect time; report each such target once.
     static func missingTargetWarnings(rules: [RouteRule], manager: NodeManager) -> [ConfigWarning] {

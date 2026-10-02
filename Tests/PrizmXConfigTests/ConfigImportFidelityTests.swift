@@ -132,6 +132,49 @@ import PrizmXProtocols
     #expect(result.warnings.contains { $0.kind == .group && $0.text == "Remote" && $0.reason.contains("not defined") })
 }
 
+@Test func clashGroupMembersNamingSkippedProxiesAreDropped() throws {
+    let yaml = """
+    proxies:
+      - {name: VM1, type: vmess, server: 3.3.3.3, port: 443, uuid: u}
+      - {name: HK1, type: ss, server: 1.1.1.1, port: 8388, cipher: aes-256-gcm, password: x}
+    proxy-groups:
+      - {name: Proxy, type: select, proxies: [VM1, HK1, DIRECT]}
+      - {name: OnlyVM, type: select, proxies: [VM1]}
+      - {name: Nested, type: select, proxies: [OnlyVM, Proxy]}
+    rules:
+      - MATCH,Proxy
+    """
+    let result = try ConfigAdapter.parseWithWarnings(rawString: yaml)
+    let manager = result.nodeManager
+    #expect(manager.groupsByName["Proxy"]?.nodeIDs == ["HK1", "DIRECT"])
+    #expect(manager.groupsByName["Proxy"]?.selectedNodeID == "HK1")
+    // The select group starts on a real node instead of failing every flow.
+    #expect(manager.selectedChain(inGroup: "Proxy") == ["HK1", "Proxy"])
+    // Emptied groups go, and so do references to them.
+    #expect(manager.groupsByName["OnlyVM"] == nil)
+    #expect(manager.groupsByName["Nested"]?.nodeIDs == ["Proxy"])
+    #expect(result.warnings.contains { $0.kind == .group && $0.text == "Proxy" && $0.reason.contains("VM1") })
+    #expect(result.warnings.contains { $0.kind == .group && $0.text == "OnlyVM" && $0.reason.contains("no usable members") })
+}
+
+@Test func singboxGroupMembersKeepBuiltinOutboundTags() throws {
+    let json = """
+    {
+      "outbounds": [
+        {"type": "selector", "tag": "Proxy", "outbounds": ["direct-out", "vm", "ss"]},
+        {"type": "vmess", "tag": "vm", "server": "3.3.3.3", "server_port": 443},
+        {"type": "shadowsocks", "tag": "ss", "server": "1.1.1.1", "server_port": 8388, "method": "aes-256-gcm", "password": "x"},
+        {"type": "direct", "tag": "direct-out"}
+      ],
+      "route": {"final": "Proxy"}
+    }
+    """
+    let result = try ConfigAdapter.parseWithWarnings(rawString: json)
+    let proxy = try #require(result.nodeManager.groupsByName["Proxy"])
+    #expect(proxy.nodeIDs == ["DIRECT", "ss"])
+    #expect(result.nodeManager.selectedLeaf(inGroup: "Proxy") == .direct)
+}
+
 @Test func clashIntervalZeroUsesDefault() throws {
     #expect(ConfigMapping.interval("0") == .seconds(300))
     #expect(ConfigMapping.interval("-5") == .seconds(300))

@@ -28,8 +28,17 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
         var nodes: [OutboundNode] = []
         var groups: [PolicyGroup] = []
         var warnings: [ConfigWarning] = []
-        // Tags of built-in outbounds map to DIRECT / REJECT.
+        // Tags of built-in outbounds map to DIRECT / REJECT, in rules and as
+        // group members (which may list them before they are declared).
         var builtins: [String: Policy] = [:]
+        for outbound in file.outbounds ?? [] {
+            guard let tag = outbound.tag else { continue }
+            switch outbound.type.lowercased() {
+            case "direct": builtins[tag] = .direct
+            case "block": builtins[tag] = .reject
+            default: break
+            }
+        }
 
         for outbound in file.outbounds ?? [] {
             do {
@@ -43,16 +52,12 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
                 case "anytls":
                     nodes.append(try makeAnyTLS(outbound))
                 case "selector":
-                    groups.append(makeGroup(outbound, mode: .select))
+                    groups.append(makeGroup(outbound, mode: .select, builtins: builtins))
                 case "urltest":
-                    groups.append(makeGroup(outbound, mode: .urlTest))
+                    groups.append(makeGroup(outbound, mode: .urlTest, builtins: builtins))
                 case "loadbalance", "load-balance":
-                    groups.append(makeGroup(outbound, mode: .loadBalance))
-                case "direct":
-                    if let tag = outbound.tag { builtins[tag] = .direct }
-                case "block":
-                    if let tag = outbound.tag { builtins[tag] = .reject }
-                case "dns":
+                    groups.append(makeGroup(outbound, mode: .loadBalance, builtins: builtins))
+                case "direct", "block", "dns":
                     continue
                 default:
                     warnings.append(ConfigWarning(
@@ -75,6 +80,7 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
             allGroups.removeAll { $0.name == group.name }
             allGroups.append(group)
         }
+        allGroups = ConfigMapping.pruningUndefinedMembers(allGroups, nodes: nodes, warnings: &warnings)
 
         func policy(_ tag: String) -> Policy {
             builtins[tag] ?? ConfigMapping.policy(named: tag)
@@ -188,9 +194,19 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
         )
     }
 
-    private func makeGroup(_ outbound: SingboxOutbound, mode: PolicyGroup.Mode) -> PolicyGroup {
+    private func makeGroup(
+        _ outbound: SingboxOutbound,
+        mode: PolicyGroup.Mode,
+        builtins: [String: Policy]
+    ) -> PolicyGroup {
         let name = outbound.tag ?? "proxy"
-        let members = outbound.outbounds ?? []
+        let members = (outbound.outbounds ?? []).map { tag in
+            switch builtins[tag] {
+            case .direct: "DIRECT"
+            case .reject: "REJECT"
+            default: tag
+            }
+        }
         return PolicyGroup(
             name: name,
             mode: mode,

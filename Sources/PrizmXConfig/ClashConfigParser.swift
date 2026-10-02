@@ -75,6 +75,7 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             }
         }
 
+        groups = ConfigMapping.pruningUndefinedMembers(groups, nodes: nodes, warnings: &warnings)
         let manager = NodeManager(nodes: nodes, groups: groups)
         warnings += ConfigMapping.missingTargetWarnings(rules: rules, manager: manager)
         return ConfigParseResult(
@@ -359,11 +360,15 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             }
         }
 
+        var warnings: [ConfigWarning] = []
+        groups = ConfigMapping.pruningUndefinedMembers(groups, nodes: nodes, warnings: &warnings)
+
         // Surge import stays strict: any unsupported rule fails the import.
         let rules = try ruleLines.flatMap { try parseRuleLine($0) }
         return ConfigParseResult(
             router: Router(rules: rules, default: .direct),
-            nodeManager: NodeManager(nodes: nodes, groups: groups)
+            nodeManager: NodeManager(nodes: nodes, groups: groups),
+            warnings: warnings
         )
     }
 

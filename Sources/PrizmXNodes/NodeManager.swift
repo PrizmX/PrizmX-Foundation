@@ -246,6 +246,15 @@ public final class NodeManager: Sendable {
         return nil
     }
 
+    /// Group members that resolve without a node or group: DIRECT and the
+    /// REJECT variants (`resolveLeaf` / `resolveChain`).
+    public static func isBuiltinMember(_ name: String) -> Bool {
+        switch name.uppercased() {
+        case "DIRECT", "REJECT", "REJECT-DROP": true
+        default: false
+        }
+    }
+
     /// Like `selectedNode`, but preserves built-in DIRECT / REJECT leaves.
     public func selectedLeaf(inGroup groupName: String) -> LeafPolicy? {
         var visited = Set<String>()
