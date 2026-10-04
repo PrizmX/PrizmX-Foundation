@@ -307,6 +307,82 @@
           "password": "MjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFE="
         }
       ]
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-grpc-tls",
+      "listen": "::",
+      "listen_port": 10070,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "alterId": 0
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-grpc-tls",
+      "listen": "::",
+      "listen_port": 10071,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-grpc-tls",
+      "listen": "::",
+      "listen_port": 10072,
+      "users": [
+        {
+          "password": "interop"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-grpc",
+      "listen": "::",
+      "listen_port": 10073,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+        }
+      ],
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
     }
   ],
   "outbounds": [

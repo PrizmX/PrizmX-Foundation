@@ -26,24 +26,24 @@ Platforms: macOS 14+, iOS 17+, tvOS 17+. Swift 6.
 
 ## Outbound protocols
 
-A protocol frames the proxied stream; a **transport** carries those bytes (TCP, TLS, REALITY, WebSocket, HTTP upgrade); a **plugin** wraps a Shadowsocks stream. Vision is a VLESS **flow** (how the body is padded, and whether REALITY can be spliced off after the handshake). They combine independently.
+A protocol frames the proxied stream; a **transport** carries those bytes (TCP, TLS, REALITY, WebSocket, HTTP upgrade, gRPC); a **plugin** wraps a Shadowsocks stream. Vision is a VLESS **flow** (how the body is padded, and whether REALITY can be spliced off after the handshake). They combine independently.
 
 | Protocol | Transports | Plugins / extras | TCP | UDP |
 | --- | --- | --- | --- | --- |
 | Direct | — | — | yes | yes |
 | Shadowsocks | native TCP / UDP | AEAD: `aes-128-gcm`, `aes-192-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`; 2022: `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm` (also multi-user identity keys), `2022-blake3-chacha20-poly1305`; plugins: simple-obfs (`http` / `tls`), v2ray-plugin (websocket, TLS, mux) | yes | yes (native, also with plugins) |
-| VMess | TCP, TLS, WebSocket, HTTP upgrade | AEAD header (`alterId: 0`); `cipher`: `auto`, `aes-128-gcm`, `chacha20-poly1305`, `none`, `zero` | yes | yes (not `zero`) |
-| VLESS | TCP, TLS, REALITY, WebSocket, HTTP upgrade | `flow`: none or `xtls-rprx-vision` (TCP / TLS / REALITY only); REALITY `public-key` / `short-id` / SNI | yes | UDP-over-stream (`udp` command); XUDP (mux.cool) for Vision users |
-| Trojan | TLS, TLS + WebSocket / HTTP upgrade | SNI | yes | yes |
+| VMess | TCP, TLS, WebSocket, HTTP upgrade, gRPC | AEAD header (`alterId: 0`); `cipher`: `auto`, `aes-128-gcm`, `chacha20-poly1305`, `none`, `zero` | yes | yes (not `zero`) |
+| VLESS | TCP, TLS, REALITY, WebSocket, HTTP upgrade, gRPC | `flow`: none or `xtls-rprx-vision` (TCP / TLS / REALITY only); REALITY `public-key` / `short-id` / SNI | yes | UDP-over-stream (`udp` command); XUDP (mux.cool) for Vision users |
+| Trojan | TLS, TLS + WebSocket / HTTP upgrade / gRPC | SNI | yes | yes |
 | AnyTLS | TLS 1.3 | SNI, `skip-cert-verify`, idle session pool | yes | no |
 | HTTP | TCP, TLS (`https`) | Basic auth, extra headers (`CONNECT`) | yes | no |
 | SOCKS5 | TCP, TLS | username / password | yes | yes (UDP ASSOCIATE, when `udp`) |
 
-WebSocket supports early data (`max-early-data` / Xray `?ed=`). Clash YAML, Surge INI and sing-box JSON import the rows above; a node whose transport, cipher or plugin is not supported is skipped with a warning instead of being imported half-configured.
+WebSocket supports early data (`max-early-data` / Xray `?ed=`). gRPC is Xray's "gun" (`/<service>/Tun` or a custom `/a/b/Tun` path) over HTTP/2: h2 with TLS, h2c without; multi mode (`TunMulti`) is not used. Clash YAML, Surge INI and sing-box JSON import the rows above; a node whose transport, cipher or plugin is not supported is skipped with a warning instead of being imported half-configured.
 
-Half-close reaches the server where the path can carry it (TCP FIN, VMess's end chunk). Network.framework TLS, WebSocket, mux.cool, simple-obfs and AnyTLS cannot; there the uplink just stops and the relay's linger bound ends the flow.
+Half-close reaches the server where the path can carry it (TCP FIN, VMess's end chunk, gRPC END_STREAM). Network.framework TLS, WebSocket, mux.cool, simple-obfs and AnyTLS cannot; there the uplink just stops and the relay's linger bound ends the flow.
 
-**Not implemented**: Hysteria, TUIC, WireGuard, ShadowsocksR, gRPC / HTTP2 transport, VMess legacy `alterId > 0` auth, `client-fingerprint`, Mux (multiplexing several flows per connection). `packet-encoding` is ignored: Vision users always get XUDP, others the plain `udp` command.
+**Not implemented**: Hysteria, TUIC, WireGuard, ShadowsocksR, HTTP/2 (`h2`) transport, VMess legacy `alterId > 0` auth, `client-fingerprint`, Mux (multiplexing several flows per connection). `packet-encoding` is ignored: Vision users always get XUDP, others the plain `udp` command.
 
 `Interop/` runs every protocol against real servers (sing-box, Xray, shadowsocks-libev) in Docker, with mihomo as the reference client; see [Interop/README.md](Interop/README.md).
 

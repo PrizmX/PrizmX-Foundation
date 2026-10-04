@@ -276,4 +276,21 @@ struct ProtocolImportTests {
         #expect(result.nodeManager.nodesByID.isEmpty)
         #expect(result.warnings.first?.reason.contains("2022-blake3-aes-256-gcm") == true)
     }
+
+    // MARK: gRPC
+
+    @Test func clashAndSingboxGRPC() throws {
+        let clash = try clashNode(
+            "{name: v, type: vless, server: v.example, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: grpc, grpc-opts: {grpc-service-name: GunService}}"
+        )
+        guard case .vless(_, _, _, _, _, _, _, _, let network) = clash.protocolConfig else { Issue.record("\(clash)"); return }
+        #expect(network == .grpc(GRPCSettings(serviceName: "GunService")))
+
+        let singbox = try singboxNode(#"""
+        {"type": "trojan", "tag": "t", "server": "t.example", "server_port": 443, "password": "p",
+         "tls": {"enabled": true}, "transport": {"type": "grpc", "service_name": "/a/b/Tun"}}
+        """#)
+        guard case .trojan(_, _, _, _, let network) = singbox.protocolConfig else { Issue.record("\(singbox)"); return }
+        #expect(network == .grpc(GRPCSettings(serviceName: "/a/b/Tun")))
+    }
 }

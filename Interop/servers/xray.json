@@ -166,6 +166,79 @@
         "password": "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc=",
         "network": "tcp,udp"
       }
+    },
+    {
+      "tag": "vless-grpc-tls",
+      "port": 10130,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/certs/server.crt",
+              "keyFile": "/certs/server.key"
+            }
+          ]
+        },
+        "grpcSettings": {
+          "serviceName": "GunService"
+        }
+      }
+    },
+    {
+      "tag": "vmess-grpc",
+      "port": 10131,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "grpcSettings": {
+          "serviceName": "GunService"
+        }
+      }
+    },
+    {
+      "tag": "trojan-grpc-tls",
+      "port": 10132,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {
+            "password": "interop"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/certs/server.crt",
+              "keyFile": "/certs/server.key"
+            }
+          ]
+        },
+        "grpcSettings": {
+          "serviceName": "/custom/path/Tun1|TunMulti1"
+        }
+      }
     }
   ],
   "outbounds": [

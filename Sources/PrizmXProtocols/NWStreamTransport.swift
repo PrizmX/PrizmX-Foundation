@@ -368,22 +368,30 @@ final class NWStreamTransport: @unchecked Sendable {
 }
 
 /// The transport's socket as the bottom `ByteStream` of a framing layer.
+///
+/// Weak: a layer's background work (gRPC's frame reader, a WebSocket pong)
+/// can outlive the connection object; once it is gone the socket reads as
+/// closed.
 private final class SocketStream: ByteStream, @unchecked Sendable {
-    private unowned let transport: NWStreamTransport
+    private weak var transport: NWStreamTransport?
+    private let endpoint: Endpoint
 
     init(transport: NWStreamTransport) {
         self.transport = transport
+        self.endpoint = transport.endpoint
     }
 
     func send(_ data: Data) async throws {
+        guard let transport else { throw OutboundError.alreadyClosed(endpoint) }
         try await transport.sendSocket(data)
     }
 
     func receive() async throws -> Data? {
-        try await transport.receiveSocket()
+        guard let transport else { return nil }
+        return try await transport.receiveSocket()
     }
 
     func finishWriting() async {
-        await transport.finishSocket()
+        await transport?.finishSocket()
     }
 }

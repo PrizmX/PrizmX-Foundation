@@ -44,6 +44,10 @@ proxies:
   - {name: ss2022-aes256@sing-box, type: ss, server: 127.0.0.1, port: 10061, cipher: 2022-blake3-aes-256-gcm, password: "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc=", udp: true, interop: {udp: true, half-close: true}}
   - {name: ss2022-chacha@sing-box, type: ss, server: 127.0.0.1, port: 10062, cipher: 2022-blake3-chacha20-poly1305, password: "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc=", udp: true, interop: {udp: true, half-close: true}}
   - {name: ss2022-eih@sing-box, type: ss, server: 127.0.0.1, port: 10063, cipher: 2022-blake3-aes-256-gcm, password: "CgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCk=:MjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFE=", udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-grpc-tls@sing-box, type: vmess, server: 127.0.0.1, port: 10070, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: GunService}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vless-grpc-tls@sing-box, type: vless, server: 127.0.0.1, port: 10071, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: GunService}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: trojan-grpc-tls@sing-box, type: trojan, server: 127.0.0.1, port: 10072, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: GunService}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vless-grpc@sing-box, type: vless, server: 127.0.0.1, port: 10073, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: false, network: grpc, grpc-opts: {grpc-service-name: GunService}, udp: true, interop: {udp: true, half-close: true}}
 
   # Xray ----------------------------------------------------------------------
   - {name: vmess-tcp@xray, type: vmess, server: 127.0.0.1, port: 10100, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, udp: true, interop: {udp: true, half-close: true}}
@@ -59,6 +63,9 @@ proxies:
   # Xray's Shadowsocks 2022 inbound does not pass the client's FIN on.
   - {name: ss2022-aes128@xray, type: ss, server: 127.0.0.1, port: 10112, cipher: 2022-blake3-aes-128-gcm, password: "ZGVmZ2hpamtsbW5vcHFycw==", udp: true, interop: {udp: true}}
   - {name: ss2022-chacha@xray, type: ss, server: 127.0.0.1, port: 10113, cipher: 2022-blake3-chacha20-poly1305, password: "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc=", udp: true, interop: {udp: true}}
+  - {name: vless-grpc-tls@xray, type: vless, server: 127.0.0.1, port: 10130, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: GunService}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-grpc@xray, type: vmess, server: 127.0.0.1, port: 10131, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, network: grpc, grpc-opts: {grpc-service-name: GunService}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: trojan-grpc-tls@xray, type: trojan, server: 127.0.0.1, port: 10132, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: /custom/path/Tun1}, udp: true, interop: {udp: true, half-close: true}}
 
   # shadowsocks-libev + SIP003 plugins -----------------------------------------
   - {name: ss-obfs-http@ss-libev, type: ss, server: 127.0.0.1, port: 10200, cipher: aes-128-gcm, password: interop, plugin: obfs, plugin-opts: {mode: http, host: cdn.prizmx.test}, udp: true, interop: {udp: true}}

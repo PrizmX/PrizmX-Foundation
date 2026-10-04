@@ -26,6 +26,8 @@ public enum StreamTransport: Sendable, Hashable {
     case webSocket(WebSocketSettings)
     /// HTTP upgrade handshake, then the raw stream.
     case httpUpgrade(HTTPUpgradeSettings)
+    /// gRPC "gun" stream over HTTP/2 (h2 over TLS, h2c without).
+    case grpc(GRPCSettings)
 
     /// Short name for logs and labels (`ws`, `httpupgrade`, …).
     public var name: String {
@@ -33,6 +35,7 @@ public enum StreamTransport: Sendable, Hashable {
         case .tcp: "tcp"
         case .webSocket: "ws"
         case .httpUpgrade: "httpupgrade"
+        case .grpc: "grpc"
         }
     }
 }
@@ -58,6 +61,8 @@ public struct StreamSettings: Sendable, Hashable {
             // The upgrade is HTTP/1.1; negotiating h2 would break it.
             let usable = configured.filter { $0 != "h2" }
             return usable.isEmpty ? ["http/1.1"] : usable
+        case .grpc:
+            return ["h2"]
         }
     }
 
@@ -139,6 +144,14 @@ extension NWStreamTransport {
                 try await layer.connect(
                     settings: options,
                     host: settings.httpHost(explicit: options.host, server: server)
+                )
+                install(layer)
+            case .grpc(let options):
+                let layer = GRPCStream(lower: socketStream)
+                try await layer.connect(
+                    settings: options,
+                    authority: settings.httpHost(explicit: nil, server: server),
+                    tls: settings.tls != nil
                 )
                 install(layer)
             }

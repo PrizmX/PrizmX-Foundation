@@ -412,6 +412,8 @@ struct SingboxOutbound: Codable, Sendable {
                 host: transport.host?.values.first,
                 headers: headers
             ))
+        case "grpc":
+            return .grpc(GRPCSettings(serviceName: transport.serviceName ?? ""))
         default:
             throw ConfigError.unsupportedValue("transport \(transport.type)")
         }

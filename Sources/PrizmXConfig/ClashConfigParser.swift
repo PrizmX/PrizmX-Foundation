@@ -257,6 +257,9 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                 maxEarlyData: opts?.int(for: "max-early-data", default: 0) ?? 0,
                 earlyDataHeaderName: opts?.string(for: "early-data-header-name") ?? ""
             ))
+        case "grpc":
+            let opts = node.mapping?["grpc-opts"]
+            return .grpc(GRPCSettings(serviceName: opts?.string(for: "grpc-service-name") ?? ""))
         default:
             throw ConfigError.unsupportedValue("network \(network)")
         }

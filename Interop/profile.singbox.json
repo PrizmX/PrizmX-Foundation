@@ -276,6 +276,67 @@
     },
     {
       "type": "vmess",
+      "tag": "vmess-grpc-tls@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10070,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "alter_id": 0,
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-grpc-tls@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10071,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-grpc-tls@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10072,
+      "password": "interop",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-grpc@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10073,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "vmess",
       "tag": "vmess-tcp@xray",
       "server": "127.0.0.1",
       "server_port": 10100,
@@ -412,6 +473,51 @@
       "password": "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc="
     },
     {
+      "type": "vless",
+      "tag": "vless-grpc-tls@xray",
+      "server": "127.0.0.1",
+      "server_port": 10130,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-grpc@xray",
+      "server": "127.0.0.1",
+      "server_port": 10131,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "alter_id": 0,
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-grpc-tls@xray",
+      "server": "127.0.0.1",
+      "server_port": 10132,
+      "password": "interop",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "/custom/path/Tun1"
+      }
+    },
+    {
       "type": "shadowsocks",
       "tag": "ss-obfs-http@ss-libev",
       "server": "127.0.0.1",
@@ -481,6 +587,10 @@
         "ss2022-aes256@sing-box",
         "ss2022-chacha@sing-box",
         "ss2022-eih@sing-box",
+        "vmess-grpc-tls@sing-box",
+        "vless-grpc-tls@sing-box",
+        "trojan-grpc-tls@sing-box",
+        "vless-grpc@sing-box",
         "vmess-tcp@xray",
         "vmess-tcp-chacha@xray",
         "vmess-tcp-none@xray",
@@ -493,6 +603,9 @@
         "vless-tls-vision@xray",
         "ss2022-aes128@xray",
         "ss2022-chacha@xray",
+        "vless-grpc-tls@xray",
+        "vmess-grpc@xray",
+        "trojan-grpc-tls@xray",
         "ss-obfs-http@ss-libev",
         "ss-obfs-tls@ss-libev",
         "ss-v2ray-ws@ss-libev",
