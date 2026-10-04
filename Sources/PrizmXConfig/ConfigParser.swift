@@ -153,6 +153,20 @@ enum ConfigMapping {
         return Endpoint(domain: host, port: value)
     }
 
+    /// Method plus password: Shadowsocks 2022 passwords must be base64 keys
+    /// of the method's length, checked here rather than at connect time.
+    static func cipher(_ raw: String, password: String) throws -> ShadowsocksCipher {
+        let cipher = try cipher(raw)
+        if cipher.is2022 {
+            do {
+                _ = try Shadowsocks2022Keys(cipher: cipher, password: password)
+            } catch {
+                throw ConfigError.unsupportedValue("\(raw) password must be base64 key(s) of the method's length")
+            }
+        }
+        return cipher
+    }
+
     static func cipher(_ raw: String) throws -> ShadowsocksCipher {
         let key = raw.lowercased()
         if let cipher = ShadowsocksCipher(rawValue: key) {

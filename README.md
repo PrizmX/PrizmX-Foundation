@@ -31,7 +31,7 @@ A protocol frames the proxied stream; a **transport** carries those bytes (TCP, 
 | Protocol | Transports | Plugins / extras | TCP | UDP |
 | --- | --- | --- | --- | --- |
 | Direct | — | — | yes | yes |
-| Shadowsocks | native TCP / UDP | AEAD: `aes-128-gcm`, `aes-192-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`; plugins: simple-obfs (`http` / `tls`), v2ray-plugin (websocket, TLS, mux) | yes | yes (native, also with plugins) |
+| Shadowsocks | native TCP / UDP | AEAD: `aes-128-gcm`, `aes-192-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`; 2022: `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm` (also multi-user identity keys), `2022-blake3-chacha20-poly1305`; plugins: simple-obfs (`http` / `tls`), v2ray-plugin (websocket, TLS, mux) | yes | yes (native, also with plugins) |
 | VMess | TCP, TLS, WebSocket, HTTP upgrade | AEAD header (`alterId: 0`); `cipher`: `auto`, `aes-128-gcm`, `chacha20-poly1305`, `none`, `zero` | yes | yes (not `zero`) |
 | VLESS | TCP, TLS, REALITY, WebSocket, HTTP upgrade | `flow`: none or `xtls-rprx-vision` (TCP / TLS / REALITY only); REALITY `public-key` / `short-id` / SNI | yes | UDP-over-stream (`udp` command); XUDP (mux.cool) for Vision users |
 | Trojan | TLS, TLS + WebSocket / HTTP upgrade | SNI | yes | yes |
@@ -43,7 +43,7 @@ WebSocket supports early data (`max-early-data` / Xray `?ed=`). Clash YAML, Surg
 
 Half-close reaches the server where the path can carry it (TCP FIN, VMess's end chunk). Network.framework TLS, WebSocket, mux.cool, simple-obfs and AnyTLS cannot; there the uplink just stops and the relay's linger bound ends the flow.
 
-**Not implemented**: Hysteria, TUIC, WireGuard, Shadowsocks 2022, ShadowsocksR, gRPC / HTTP2 transport, VMess legacy `alterId > 0` auth, `client-fingerprint`, Mux (multiplexing several flows per connection). `packet-encoding` is ignored: Vision users always get XUDP, others the plain `udp` command.
+**Not implemented**: Hysteria, TUIC, WireGuard, ShadowsocksR, gRPC / HTTP2 transport, VMess legacy `alterId > 0` auth, `client-fingerprint`, Mux (multiplexing several flows per connection). `packet-encoding` is ignored: Vision users always get XUDP, others the plain `udp` command.
 
 `Interop/` runs every protocol against real servers (sing-box, Xray, shadowsocks-libev) in Docker, with mihomo as the reference client; see [Interop/README.md](Interop/README.md).
 

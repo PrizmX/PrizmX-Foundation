@@ -31,6 +31,24 @@ struct CryptoPrimitiveTests {
         #expect(FNV1a32.hash(Array("a".utf8)) == 0xE40C_292C)
     }
 
+    /// Reference digests from lukechampine.com/blake3 v1.4.1.
+    @Test func blake3MatchesReference() {
+        #expect(hex(BLAKE3.hash([UInt8]())) == "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+        #expect(hex(BLAKE3.hash(Array("abc".utf8))) == "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85")
+        // Three chunks: exercises the chaining-value tree.
+        let long = (0..<3000).map { UInt8($0 % 251) }
+        #expect(hex(BLAKE3.hash(long)) == "5fade288bf27444bee55ba2babb98c3c922c1e84c2e445e7d1f6da24756f5060")
+        let material = (0..<64).map { UInt8($0) }
+        #expect(
+            hex(BLAKE3.deriveKey(context: "shadowsocks 2022 session subkey", material: material))
+                == "374fca03e4dae7f998fd7e59c1edfcc8e3197f4db1c19ca1671be3b66a92ddda"
+        )
+        #expect(
+            hex(BLAKE3.deriveKey(context: "shadowsocks 2022 session subkey", material: material.prefix(32), count: 16))
+                == "bc32fb8d5205f7b84f9691dfb9f04ff3"
+        )
+    }
+
     @Test func aesBlockRoundTrip() {
         // FIPS-197 C.1 (AES-128).
         let key = (0..<16).map { UInt8($0) }

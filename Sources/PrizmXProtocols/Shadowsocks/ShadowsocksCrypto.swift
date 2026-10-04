@@ -35,22 +35,50 @@ public enum ShadowsocksAEAD {
 
 // MARK: - Cipher
 
-/// SIP008 `method` identifiers for the AEAD ciphers implemented here.
+/// SIP008 `method` identifiers: the SIP004 AEAD ciphers and the
+/// Shadowsocks 2022 (SIP022) methods.
 @frozen
 public enum ShadowsocksCipher: String, Hashable, Sendable, Codable, CaseIterable {
     case aes128GCM = "aes-128-gcm"
     case aes192GCM = "aes-192-gcm"
     case aes256GCM = "aes-256-gcm"
     case chacha20IETFPoly1305 = "chacha20-ietf-poly1305"
+    case blake3AES128GCM = "2022-blake3-aes-128-gcm"
+    case blake3AES256GCM = "2022-blake3-aes-256-gcm"
+    case blake3ChaCha20Poly1305 = "2022-blake3-chacha20-poly1305"
 
     /// Master-key / subkey size in bytes. Equal to the salt size for these ciphers.
     public var keyByteCount: Int {
         switch self {
-        case .aes128GCM: return 16
+        case .aes128GCM, .blake3AES128GCM: return 16
         case .aes192GCM: return 24
-        case .aes256GCM, .chacha20IETFPoly1305: return 32
+        case .aes256GCM, .chacha20IETFPoly1305, .blake3AES256GCM, .blake3ChaCha20Poly1305: return 32
         }
     }
+
+    /// Shadowsocks 2022: base64 PSKs, BLAKE3 subkeys, its own framing.
+    public var is2022: Bool {
+        switch self {
+        case .blake3AES128GCM, .blake3AES256GCM, .blake3ChaCha20Poly1305: true
+        default: false
+        }
+    }
+
+    /// AES-GCM (else ChaCha20-Poly1305) protects the stream.
+    var usesAES: Bool {
+        switch self {
+        case .aes128GCM, .aes192GCM, .aes256GCM, .blake3AES128GCM, .blake3AES256GCM: true
+        case .chacha20IETFPoly1305, .blake3ChaCha20Poly1305: false
+        }
+    }
+
+    /// Largest chunk payload: 0x3FFF for SIP004, 0xFFFF for 2022.
+    public var maxChunkPayload: Int {
+        is2022 ? 0xFFFF : ShadowsocksAEAD.maxPayloadLength
+    }
+
+    /// The pre-2022 ciphers (password → key via EVP_BytesToKey).
+    public static let sip004: [ShadowsocksCipher] = allCases.filter { !$0.is2022 }
 
     /// Per-session salt size in bytes (SIP004: same as the key size).
     public var saltByteCount: Int { keyByteCount }
@@ -74,7 +102,7 @@ public enum ShadowsocksCipher: String, Hashable, Sendable, Codable, CaseIterable
 public enum ShadowsocksError: Error, Equatable, Sendable {
     /// AEAD tag verification failed (wrong key, nonce desync, or tampered bytes).
     case authenticationFailed
-    /// Plaintext or decoded length exceeds `ShadowsocksAEAD.maxPayloadLength`.
+    /// Plaintext or decoded length exceeds the cipher's `maxChunkPayload`.
     case payloadTooLarge(Int)
     /// A record or output buffer was shorter than the AEAD layer requires.
     case truncated(expected: Int, actual: Int)
@@ -318,7 +346,7 @@ public struct ShadowsocksAEADContext: Sendable {
         into output: UnsafeMutableRawBufferPointer
     ) throws -> Int {
         let payloadCount = plaintext.count
-        guard payloadCount <= ShadowsocksAEAD.maxPayloadLength else {
+        guard payloadCount <= cipher.maxChunkPayload else {
             throw ShadowsocksError.payloadTooLarge(payloadCount)
         }
         let sealedCount = ShadowsocksAEAD.sealedChunkByteCount(plaintextCount: payloadCount)
@@ -377,7 +405,7 @@ public struct ShadowsocksAEADContext: Sendable {
             try open(ciphertextAndTag: record, into: raw)
         }
         let length = Int(lengthField.0) << 8 | Int(lengthField.1)
-        guard length <= ShadowsocksAEAD.maxPayloadLength else {
+        guard length <= cipher.maxChunkPayload else {
             throw ShadowsocksError.payloadTooLarge(length)
         }
         return length
@@ -475,12 +503,11 @@ public struct ShadowsocksAEADContext: Sendable {
         let input = plaintext.isEmpty ? Data() : unownedData(plaintext)
         let ciphertext: Data
         let tag: Data
-        switch cipher {
-        case .aes128GCM, .aes192GCM, .aes256GCM:
+        if cipher.usesAES {
             let box = try AES.GCM.seal(input, using: subkey, nonce: try nonce.makeGCMNonce())
             ciphertext = box.ciphertext
             tag = box.tag
-        case .chacha20IETFPoly1305:
+        } else {
             let box = try ChaChaPoly.seal(input, using: subkey, nonce: try nonce.makeChaChaNonce())
             ciphertext = box.ciphertext
             tag = box.tag
@@ -525,15 +552,14 @@ public struct ShadowsocksAEADContext: Sendable {
 
         let plaintext: Data
         do {
-            switch cipher {
-            case .aes128GCM, .aes192GCM, .aes256GCM:
+            if cipher.usesAES {
                 let box = try AES.GCM.SealedBox(
                     nonce: try nonce.makeGCMNonce(),
                     ciphertext: ciphertextData,
                     tag: unownedData(tag)
                 )
                 plaintext = try AES.GCM.open(box, using: subkey)
-            case .chacha20IETFPoly1305:
+            } else {
                 let box = try ChaChaPoly.SealedBox(
                     nonce: try nonce.makeChaChaNonce(),
                     ciphertext: ciphertextData,

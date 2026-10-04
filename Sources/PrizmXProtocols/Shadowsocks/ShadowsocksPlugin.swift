@@ -29,6 +29,30 @@ public struct SimpleObfsSettings: Sendable, Hashable {
     }
 }
 
+extension NWStreamTransport {
+    /// Dials a Shadowsocks server (classic or 2022) through its plugin, if
+    /// any; the AEAD stream then rides the installed layer.
+    func dialShadowsocks(_ server: Endpoint, plugin: ShadowsocksPlugin?) async throws {
+        switch plugin {
+        case nil:
+            try await dial(server, settings: StreamSettings())
+        case .obfs(let options):
+            try await dial(server, settings: StreamSettings())
+            switch options.mode {
+            case .http:
+                install(SimpleObfsHTTPStream(lower: socketStream, settings: options, port: server.port))
+            case .tls:
+                install(SimpleObfsTLSStream(lower: socketStream, host: options.host))
+            }
+        case .v2ray(let webSocket, let tls, let mux):
+            try await dial(server, settings: StreamSettings(tls: tls, transport: .webSocket(webSocket)))
+            if mux {
+                install(MuxCoolStream(lower: currentStream))
+            }
+        }
+    }
+}
+
 // MARK: - HTTP mode
 
 /// simple-obfs `http`: the first uplink write rides as the body of a

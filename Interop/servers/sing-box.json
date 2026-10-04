@@ -269,6 +269,44 @@
           "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
         }
       ]
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-aes128",
+      "listen": "::",
+      "listen_port": 10060,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "ZGVmZ2hpamtsbW5vcHFycw=="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-aes256",
+      "listen": "::",
+      "listen_port": 10061,
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-chacha",
+      "listen": "::",
+      "listen_port": 10062,
+      "method": "2022-blake3-chacha20-poly1305",
+      "password": "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-eih",
+      "listen": "::",
+      "listen_port": 10063,
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "CgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCk=",
+      "users": [
+        {
+          "name": "u",
+          "password": "MjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFE="
+        }
+      ]
     }
   ],
   "outbounds": [

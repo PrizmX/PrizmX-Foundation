@@ -128,7 +128,7 @@ struct ShadowsocksNonceTests {
 @Suite("Shadowsocks AEAD chunks")
 struct ShadowsocksChunkTests {
 
-    @Test(arguments: ShadowsocksCipher.allCases)
+    @Test(arguments: ShadowsocksCipher.sip004)
     func roundTripSingleChunk(cipher: ShadowsocksCipher) throws {
         let psk = cipher.masterKey(fromPassword: "correct horse")
         let salt = [UInt8](repeating: 0xAB, count: cipher.saltByteCount)
@@ -306,7 +306,7 @@ struct ShadowsocksAddressTests {
 @Suite("Shadowsocks UDP AEAD")
 struct ShadowsocksUDPTests {
 
-    @Test(arguments: ShadowsocksCipher.allCases)
+    @Test(arguments: ShadowsocksCipher.sip004)
     func datagramRoundTrip(cipher: ShadowsocksCipher) throws {
         let key = cipher.masterKey(fromPassword: "udp-secret")
         let destination = Endpoint(domain: "example.com", port: 443)

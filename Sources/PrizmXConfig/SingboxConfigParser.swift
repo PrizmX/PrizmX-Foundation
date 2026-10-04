@@ -128,7 +128,7 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
             protocolConfig: .shadowsocks(
                 server: try ConfigMapping.endpoint(host: server, port: port, field: "server_port"),
                 password: password,
-                cipher: try ConfigMapping.cipher(method),
+                cipher: try ConfigMapping.cipher(method, password: password),
                 plugin: plugin
             )
         )

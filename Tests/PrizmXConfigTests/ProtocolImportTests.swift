@@ -256,4 +256,24 @@ struct ProtocolImportTests {
         let labels = ["s", "v", "h"].compactMap { result.nodeManager.node(id: $0)?.protocolConfig.displayName }
         #expect(labels == ["SS", "VMess", "HTTPS"])
     }
+
+    // MARK: Shadowsocks 2022
+
+    @Test func clashShadowsocks2022() throws {
+        let key = Data(repeating: 1, count: 32).base64EncodedString()
+        let node = try clashNode("{name: s, type: ss, server: 1.1.1.1, port: 8388, cipher: 2022-blake3-aes-256-gcm, password: \"\(key):\(key)\"}")
+        guard case .shadowsocks(_, let password, let cipher, _) = node.protocolConfig else { Issue.record("\(node)"); return }
+        #expect(cipher == .blake3AES256GCM)
+        #expect(password == "\(key):\(key)")
+    }
+
+    @Test func shadowsocks2022WithWrongKeyIsReported() throws {
+        let short = Data(repeating: 1, count: 16).base64EncodedString()
+        let result = try ClashConfigParser().parseWithWarnings(rawString: """
+        proxies:
+          - {name: s, type: ss, server: 1.1.1.1, port: 8388, cipher: 2022-blake3-aes-256-gcm, password: "\(short)"}
+        """)
+        #expect(result.nodeManager.nodesByID.isEmpty)
+        #expect(result.warnings.first?.reason.contains("2022-blake3-aes-256-gcm") == true)
+    }
 }

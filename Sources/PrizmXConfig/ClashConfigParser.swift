@@ -94,8 +94,8 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         case "ss", "shadowsocks":
             let server = try node.requiredString("server")
             let port = try node.int(for: "port")
-            let cipher = try ConfigMapping.cipher(try node.requiredString("cipher"))
             let password = try node.requiredString("password")
+            let cipher = try ConfigMapping.cipher(try node.requiredString("cipher"), password: password)
             let endpoint = try ConfigMapping.endpoint(host: server, port: port, field: "port")
             let opts = node.mapping?["plugin-opts"]
             let plugin = try ConfigMapping.shadowsocksPlugin(
@@ -507,7 +507,7 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                 protocolConfig: .shadowsocks(
                     server: endpoint,
                     password: password,
-                    cipher: try ConfigMapping.cipher(method),
+                    cipher: try ConfigMapping.cipher(method, password: password),
                     plugin: plugin
                 )
             )

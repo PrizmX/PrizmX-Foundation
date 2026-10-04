@@ -146,6 +146,26 @@
           ]
         }
       }
+    },
+    {
+      "tag": "ss2022-aes128",
+      "port": 10112,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "2022-blake3-aes-128-gcm",
+        "password": "ZGVmZ2hpamtsbW5vcHFycw==",
+        "network": "tcp,udp"
+      }
+    },
+    {
+      "tag": "ss2022-chacha",
+      "port": 10113,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "2022-blake3-chacha20-poly1305",
+        "password": "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc=",
+        "network": "tcp,udp"
+      }
     }
   ],
   "outbounds": [

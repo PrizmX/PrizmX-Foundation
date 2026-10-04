@@ -228,23 +228,7 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
     // MARK: TCP
 
     private func connectTCP() async throws {
-        switch plugin {
-        case nil:
-            try await transport.dial(server, settings: StreamSettings())
-        case .obfs(let options):
-            try await transport.dial(server, settings: StreamSettings())
-            switch options.mode {
-            case .http:
-                transport.install(SimpleObfsHTTPStream(lower: transport.socketStream, settings: options, port: server.port))
-            case .tls:
-                transport.install(SimpleObfsTLSStream(lower: transport.socketStream, host: options.host))
-            }
-        case .v2ray(let webSocket, let tls, let mux):
-            try await transport.dial(server, settings: StreamSettings(tls: tls, transport: .webSocket(webSocket)))
-            if mux {
-                transport.install(MuxCoolStream(lower: transport.currentStream))
-            }
-        }
+        try await transport.dialShadowsocks(server, plugin: plugin)
         transport.markEstablished()
     }
 

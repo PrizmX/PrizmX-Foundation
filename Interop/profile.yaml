@@ -40,6 +40,10 @@ proxies:
   - {name: vless-ws-ed@sing-box, type: vless, server: 127.0.0.1, port: 10043, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: false, network: ws, ws-opts: {path: /ed, max-early-data: 2048, early-data-header-name: Sec-WebSocket-Protocol}, udp: true, interop: {udp: true}}
   - {name: vless-tls-vision@sing-box, type: vless, server: 127.0.0.1, port: 10051, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, flow: xtls-rprx-vision, udp: true, interop: {udp: true, half-close: true}}
   - {name: anytls@sing-box, type: anytls, server: 127.0.0.1, port: 10050, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, interop: {}}
+  - {name: ss2022-aes128@sing-box, type: ss, server: 127.0.0.1, port: 10060, cipher: 2022-blake3-aes-128-gcm, password: "ZGVmZ2hpamtsbW5vcHFycw==", udp: true, interop: {udp: true, half-close: true}}
+  - {name: ss2022-aes256@sing-box, type: ss, server: 127.0.0.1, port: 10061, cipher: 2022-blake3-aes-256-gcm, password: "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc=", udp: true, interop: {udp: true, half-close: true}}
+  - {name: ss2022-chacha@sing-box, type: ss, server: 127.0.0.1, port: 10062, cipher: 2022-blake3-chacha20-poly1305, password: "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc=", udp: true, interop: {udp: true, half-close: true}}
+  - {name: ss2022-eih@sing-box, type: ss, server: 127.0.0.1, port: 10063, cipher: 2022-blake3-aes-256-gcm, password: "CgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCk=:MjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFE=", udp: true, interop: {udp: true, half-close: true}}
 
   # Xray ----------------------------------------------------------------------
   - {name: vmess-tcp@xray, type: vmess, server: 127.0.0.1, port: 10100, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, udp: true, interop: {udp: true, half-close: true}}
@@ -52,6 +56,9 @@ proxies:
   - {name: trojan-tls@xray, type: trojan, server: 127.0.0.1, port: 10111, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, udp: true, interop: {udp: true}}
   - {name: vless-reality-vision@xray, type: vless, server: 127.0.0.1, port: 10120, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: web.test, flow: xtls-rprx-vision, client-fingerprint: chrome, reality-opts: {public-key: Ewd11OB6lhe3-lyTgKFPcTzMbLXIeYpdaUihxjyiRR0, short-id: 0123456789abcdef}, udp: true, interop: {udp: true, half-close: true}}
   - {name: vless-tls-vision@xray, type: vless, server: 127.0.0.1, port: 10121, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, flow: xtls-rprx-vision, udp: true, interop: {udp: true, half-close: true}}
+  # Xray's Shadowsocks 2022 inbound does not pass the client's FIN on.
+  - {name: ss2022-aes128@xray, type: ss, server: 127.0.0.1, port: 10112, cipher: 2022-blake3-aes-128-gcm, password: "ZGVmZ2hpamtsbW5vcHFycw==", udp: true, interop: {udp: true}}
+  - {name: ss2022-chacha@xray, type: ss, server: 127.0.0.1, port: 10113, cipher: 2022-blake3-chacha20-poly1305, password: "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc=", udp: true, interop: {udp: true}}
 
   # shadowsocks-libev + SIP003 plugins -----------------------------------------
   - {name: ss-obfs-http@ss-libev, type: ss, server: 127.0.0.1, port: 10200, cipher: aes-128-gcm, password: interop, plugin: obfs, plugin-opts: {mode: http, host: cdn.prizmx.test}, udp: true, interop: {udp: true}}

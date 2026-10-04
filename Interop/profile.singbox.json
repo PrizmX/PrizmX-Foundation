@@ -243,6 +243,38 @@
       }
     },
     {
+      "type": "shadowsocks",
+      "tag": "ss2022-aes128@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10060,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "ZGVmZ2hpamtsbW5vcHFycw=="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-aes256@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10061,
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-chacha@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10062,
+      "method": "2022-blake3-chacha20-poly1305",
+      "password": "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-eih@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10063,
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "CgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCk=:MjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFE="
+    },
+    {
       "type": "vmess",
       "tag": "vmess-tcp@xray",
       "server": "127.0.0.1",
@@ -365,6 +397,22 @@
     },
     {
       "type": "shadowsocks",
+      "tag": "ss2022-aes128@xray",
+      "server": "127.0.0.1",
+      "server_port": 10112,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "ZGVmZ2hpamtsbW5vcHFycw=="
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-chacha@xray",
+      "server": "127.0.0.1",
+      "server_port": 10113,
+      "method": "2022-blake3-chacha20-poly1305",
+      "password": "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5uc="
+    },
+    {
+      "type": "shadowsocks",
       "tag": "ss-obfs-http@ss-libev",
       "server": "127.0.0.1",
       "server_port": 10200,
@@ -429,6 +477,10 @@
         "vless-ws-ed@sing-box",
         "vless-tls-vision@sing-box",
         "anytls@sing-box",
+        "ss2022-aes128@sing-box",
+        "ss2022-aes256@sing-box",
+        "ss2022-chacha@sing-box",
+        "ss2022-eih@sing-box",
         "vmess-tcp@xray",
         "vmess-tcp-chacha@xray",
         "vmess-tcp-none@xray",
@@ -439,6 +491,8 @@
         "trojan-tls@xray",
         "vless-reality-vision@xray",
         "vless-tls-vision@xray",
+        "ss2022-aes128@xray",
+        "ss2022-chacha@xray",
         "ss-obfs-http@ss-libev",
         "ss-obfs-tls@ss-libev",
         "ss-v2ray-ws@ss-libev",

@@ -197,6 +197,13 @@ public enum NodeFactory: Sendable {
         command: VLESSCommand = .tcp
     ) throws -> any OutboundConnection {
         switch node.protocolConfig {
+        case .shadowsocks(let server, let password, let cipher, let plugin) where cipher.is2022:
+            return try Shadowsocks2022OutboundConnection(
+                server: server,
+                keys: try Shadowsocks2022Keys(cipher: cipher, password: password),
+                target: target,
+                plugin: plugin
+            )
         case .shadowsocks(let server, let password, let cipher, let plugin):
             return ShadowsocksOutboundConnection(
                 server: server,
@@ -277,6 +284,8 @@ extension NodeFactory {
         to target: Endpoint
     ) throws -> (any DatagramOutbound)? {
         switch node.protocolConfig {
+        case .shadowsocks(let server, let password, let cipher, _) where cipher.is2022:
+            return Shadowsocks2022DatagramOutbound(server: server, keys: try Shadowsocks2022Keys(cipher: cipher, password: password))
         case .shadowsocks(let server, let password, let cipher, _):
             // Plugins carry TCP only; UDP goes to the server port natively.
             return ShadowsocksDatagramOutbound(server: server, password: password, cipher: cipher)
