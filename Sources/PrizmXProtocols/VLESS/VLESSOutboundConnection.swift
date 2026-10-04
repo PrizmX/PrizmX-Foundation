@@ -179,7 +179,8 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
             endpoint: target,
             errorPeer: server
         )
-        if command == .tcp, VLESSVision.isEnabled(self.flow) {
+        // Vision pads TCP streams and mux sessions (XUDP); plain UDP has none.
+        if command != .udp, VLESSVision.isEnabled(self.flow) {
             self.visionWriter = VLESSVisionWriter(userID: self.userID)
             self.visionReader = VLESSVisionReader(userID: self.userID)
         }

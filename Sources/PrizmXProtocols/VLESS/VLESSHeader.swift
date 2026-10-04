@@ -50,6 +50,9 @@ public enum VLESSCommand: UInt8, Hashable, Sendable, Codable {
     case tcp = 0x01
     /// UDP datagrams. Body is `[2-byte BE length][payload]` records.
     case udp = 0x02
+    /// mux.cool session (XUDP for Vision users). The header carries no
+    /// address; the body is mux frames.
+    case mux = 0x03
 }
 
 @frozen
@@ -154,8 +157,12 @@ public struct VLESSHeader: Sendable, Equatable {
 
     /// Packed size of the request header, including a 1-byte addon length.
     public var encodedByteCount: Int {
-        1 + VLESS.userIDByteCount + 1 + addons.count + 1 + Self.addressPortByteCount(of: destination)
+        let address = command == .mux ? 0 : Self.addressPortByteCount(of: destination)
+        return 1 + VLESS.userIDByteCount + 1 + addons.count + 1 + address
     }
+
+    /// The fixed destination Xray reports for mux sessions.
+    public static let muxDestination = Endpoint(domain: "v1.mux.cool", port: 666)
 
     /// Encodes the header into a single contiguous `Data` (one allocation).
     public func encode() throws -> Data {
@@ -206,7 +213,9 @@ public struct VLESSHeader: Sendable, Equatable {
         output[offset] = command.rawValue
         offset += 1
 
-        offset += try Self.encodeAddressPort(destination, into: UnsafeMutableRawBufferPointer(rebasing: output[offset...]))
+        if command != .mux {
+            offset += try Self.encodeAddressPort(destination, into: UnsafeMutableRawBufferPointer(rebasing: output[offset...]))
+        }
         return offset
     }
 
@@ -250,9 +259,13 @@ public struct VLESSHeader: Sendable, Equatable {
         }
         offset += 1
 
-        let rest = UnsafeRawBufferPointer(rebasing: buffer[offset...])
-        let (destination, consumed) = try decodeAddressPort(rest)
-        _ = consumed
+        let destination: Endpoint
+        if command == .mux {
+            destination = muxDestination
+        } else {
+            let rest = UnsafeRawBufferPointer(rebasing: buffer[offset...])
+            destination = try decodeAddressPort(rest).0
+        }
 
         return VLESSHeader(
             userID: userID,

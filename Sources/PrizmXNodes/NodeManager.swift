@@ -280,9 +280,26 @@ extension NodeFactory {
         case .shadowsocks(let server, let password, let cipher, _):
             // Plugins carry TCP only; UDP goes to the server port natively.
             return ShadowsocksDatagramOutbound(server: server, password: password, cipher: cipher)
-        case .vless:
-            let stream = try makeConnection(from: node, to: target, command: .udp)
-            return StreamDatagramOutbound(connection: stream, framing: LengthPrefixedDatagramFraming())
+        case .vless(let server, let uuid, let sni, let tls, let reality, let flow, let skipCertVerify, let alpn, let network):
+            guard VLESSVision.isEnabled(flow) else {
+                let stream = try makeConnection(from: node, to: target, command: .udp)
+                return StreamDatagramOutbound(connection: stream, framing: LengthPrefixedDatagramFraming())
+            }
+            // Vision users carry UDP as XUDP inside a mux session.
+            let stream = try VLESSOutboundConnection(
+                server: server,
+                uuid: uuid,
+                target: VLESSHeader.muxDestination,
+                sni: sni,
+                tls: tls,
+                reality: reality,
+                flow: flow,
+                command: .mux,
+                skipCertVerify: skipCertVerify,
+                alpn: alpn,
+                network: network
+            )
+            return StreamDatagramOutbound(connection: stream, framing: XUDPFraming())
         case .trojan:
             let stream = try makeConnection(from: node, to: target, command: .udp)
             return StreamDatagramOutbound(connection: stream, framing: TrojanUDPFraming())

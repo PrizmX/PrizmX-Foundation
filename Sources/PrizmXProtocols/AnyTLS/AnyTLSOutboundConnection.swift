@@ -200,6 +200,14 @@ public final class AnyTLSOutboundConnection: OutboundConnection, @unchecked Send
         await current?.close()
     }
 
+    /// AnyTLS has no half-close: its stream FIN closes both directions
+    /// (sing-anytls drops the stream). Ending the uplink therefore sends
+    /// nothing and keeps the downlink, which the relay's linger bounds;
+    /// reporting no half-close would make the relay drop the response.
+    public func closeWrite() async {}
+
+    public var supportsHalfClose: Bool { true }
+
     // MARK: Helpers
 
     private func ensureOpen() async throws {

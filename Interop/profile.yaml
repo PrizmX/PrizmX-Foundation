@@ -38,7 +38,7 @@ proxies:
   - {name: vless-ws-tls@sing-box, type: vless, server: 127.0.0.1, port: 10041, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, network: ws, ws-opts: {path: /vless}, udp: true, interop: {udp: true}}
   - {name: vless-httpupgrade@sing-box, type: vless, server: 127.0.0.1, port: 10042, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: false, network: ws, ws-opts: {path: /up, v2ray-http-upgrade: true}, udp: true, interop: {udp: true, half-close: true}}
   - {name: vless-ws-ed@sing-box, type: vless, server: 127.0.0.1, port: 10043, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: false, network: ws, ws-opts: {path: /ed, max-early-data: 2048, early-data-header-name: Sec-WebSocket-Protocol}, udp: true, interop: {udp: true}}
-  - {name: vless-tls-vision@sing-box, type: vless, server: 127.0.0.1, port: 10051, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, flow: xtls-rprx-vision, udp: true, interop: {udp: true, half-close: true, known-issue: {udp: "Vision users need UDP as XUDP over mux.cool; sing-box rejects plain VLESS UDP"}}}
+  - {name: vless-tls-vision@sing-box, type: vless, server: 127.0.0.1, port: 10051, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, flow: xtls-rprx-vision, udp: true, interop: {udp: true, half-close: true}}
   - {name: anytls@sing-box, type: anytls, server: 127.0.0.1, port: 10050, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, interop: {}}
 
   # Xray ----------------------------------------------------------------------

@@ -22,8 +22,8 @@ public protocol DatagramOutbound: Sendable {
 
 /// How datagrams are framed on a stream outbound (VLESS / Trojan / VMess).
 public protocol DatagramStreamFraming: Sendable {
-    /// Wire bytes for one uplink datagram.
-    func encode(_ payload: Data, to destination: Endpoint) throws -> Data
+    /// Wire bytes for one uplink datagram (in send order).
+    mutating func encode(_ payload: Data, to destination: Endpoint) throws -> Data
     /// Appends stream bytes and returns every datagram now complete.
     mutating func decode(_ chunk: Data) throws -> [Data]
 }
@@ -46,10 +46,11 @@ public struct LengthPrefixedDatagramFraming: DatagramStreamFraming {
 /// Runs datagrams over a stream `OutboundConnection` with a framing.
 ///
 /// `send` and `receive` are called from different tasks (uplink worker and
-/// downlink pump); the decoder state is touched only by `receive`.
+/// downlink pump); the encoder state is touched only by `send` and the
+/// decoder state only by `receive`, each from one task at a time.
 public final class StreamDatagramOutbound<Framing: DatagramStreamFraming>: DatagramOutbound, @unchecked Sendable {
     private let connection: any OutboundConnection
-    private let encoder: Framing
+    private var encoder: Framing
     private var decoder: Framing
     private var pending: [Data] = []
 
