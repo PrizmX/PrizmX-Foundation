@@ -10,11 +10,13 @@ public struct ShadowsocksOutboundFactory: OutboundConnectionFactory, Sendable {
     public let server: Endpoint
     public let password: String
     public let cipher: ShadowsocksCipher
+    public let plugin: ShadowsocksPlugin?
 
-    public init(server: Endpoint, password: String, cipher: ShadowsocksCipher) {
+    public init(server: Endpoint, password: String, cipher: ShadowsocksCipher, plugin: ShadowsocksPlugin? = nil) {
         self.server = server
         self.password = password
         self.cipher = cipher
+        self.plugin = plugin
     }
 
     public func connect(to endpoint: Endpoint) async throws -> any OutboundConnection {
@@ -22,7 +24,8 @@ public struct ShadowsocksOutboundFactory: OutboundConnectionFactory, Sendable {
             server: server,
             password: password,
             cipher: cipher,
-            target: endpoint
+            target: endpoint,
+            plugin: plugin
         )
         return connection
     }
@@ -30,7 +33,7 @@ public struct ShadowsocksOutboundFactory: OutboundConnectionFactory, Sendable {
 
 // MARK: - Outbound connection
 
-/// TCP Shadowsocks-AEAD client (`aes-128-gcm` / `aes-256-gcm`).
+/// TCP Shadowsocks-AEAD client (`aes-{128,192,256}-gcm`, `chacha20-ietf-poly1305`).
 ///
 /// `open()` establishes the underlying `NWConnection`. The first application
 /// packet is:
@@ -45,6 +48,8 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
     /// Shadowsocks server this connection dials.
     public let server: Endpoint
     public let cipher: ShadowsocksCipher
+    /// SIP003 plugin between the AEAD stream and the server (TCP only).
+    public let plugin: ShadowsocksPlugin?
 
     public var state: OutboundConnectionState {
         transport.state
@@ -69,17 +74,20 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
     /// - Parameters:
     ///   - server: Shadowsocks server host and port.
     ///   - password: SIP008 password; converted to a master key via EVP_BytesToKey.
-    ///   - cipher: `aes-128-gcm` or `aes-256-gcm`.
+    ///   - cipher: One of the SIP004 AEAD ciphers in `ShadowsocksCipher`.
     ///   - target: Destination the server should connect to (SOCKS address header).
+    ///   - plugin: Optional simple-obfs / v2ray-plugin transport.
     public init(
         server: Endpoint,
         password: String,
         cipher: ShadowsocksCipher,
-        target: Endpoint
+        target: Endpoint,
+        plugin: ShadowsocksPlugin? = nil
     ) {
         self.server = server
         self.endpoint = target
         self.cipher = cipher
+        self.plugin = plugin
         self.preSharedKey = cipher.masterKey(fromPassword: password)
         self.clientSalt = cipher.randomSalt()
         self.transport = NWStreamTransport(
@@ -100,6 +108,7 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
         self.server = server
         self.endpoint = target
         self.cipher = cipher
+        self.plugin = nil
         self.preSharedKey = preSharedKey
         self.clientSalt = clientSalt ?? cipher.randomSalt()
         self.transport = NWStreamTransport(
@@ -141,7 +150,7 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
 
         await transport.readMutex.acquire()
         defer { transport.readMutex.release() }
-        try transport.ensureNotClosed()
+        try transport.ensureReadable()
 
         while true {
             if recvPlaintext.readableByteCount > 0 {
@@ -208,28 +217,23 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
     // MARK: TCP
 
     private func connectTCP() async throws {
-        guard server.port > 0 else {
-            throw OutboundError.invalidEndpoint(server)
+        switch plugin {
+        case nil:
+            try await transport.dial(server, settings: StreamSettings())
+        case .obfs(let options):
+            try await transport.dial(server, settings: StreamSettings())
+            switch options.mode {
+            case .http:
+                transport.install(SimpleObfsHTTPStream(lower: transport.socketStream, settings: options, port: server.port))
+            case .tls:
+                transport.install(SimpleObfsTLSStream(lower: transport.socketStream, host: options.host))
+            }
+        case .v2ray(let webSocket, let tls, let mux):
+            try await transport.dial(server, settings: StreamSettings(tls: tls, transport: .webSocket(webSocket)))
+            if mux {
+                transport.install(MuxCoolStream(lower: transport.currentStream))
+            }
         }
-        guard let nwPort = NWEndpoint.Port(rawValue: server.port) else {
-            throw OutboundError.invalidEndpoint(server)
-        }
-
-        let tcp = NWProtocolTCP.Options()
-        tcp.noDelay = true
-        let parameters = NWParameters(tls: nil, tcp: tcp)
-        parameters.preferNoProxies = true
-        let host = try await DNSClient.resolve(server.host, role: .proxyServer)
-        let nw = NWConnection(host: host, port: nwPort, using: parameters)
-        transport.attach(nw)
-
-        do {
-            try await transport.waitUntilReady(nw)
-        } catch {
-            transport.failOpen(nw)
-            throw error
-        }
-
         transport.markEstablished()
     }
 

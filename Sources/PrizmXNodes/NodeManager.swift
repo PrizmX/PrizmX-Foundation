@@ -7,7 +7,7 @@ import PrizmXProtocols
 /// Concrete outbound protocol parameters bound to a node (not to a destination).
 @frozen
 public enum ProtocolConfig: Sendable, Hashable {
-    case shadowsocks(server: Endpoint, password: String, cipher: ShadowsocksCipher)
+    case shadowsocks(server: Endpoint, password: String, cipher: ShadowsocksCipher, plugin: ShadowsocksPlugin? = nil)
     case vless(
         server: Endpoint,
         uuid: String,
@@ -16,9 +16,16 @@ public enum ProtocolConfig: Sendable, Hashable {
         reality: REALITYConfig?,
         flow: String? = nil,
         skipCertVerify: Bool = false,
-        alpn: [String]? = nil
+        alpn: [String]? = nil,
+        network: StreamTransport = .tcp
     )
-    case trojan(server: Endpoint, password: String, sni: String?, skipCertVerify: Bool = false)
+    case trojan(
+        server: Endpoint,
+        password: String,
+        sni: String?,
+        skipCertVerify: Bool = false,
+        network: StreamTransport = .tcp
+    )
     case anytls(
         server: Endpoint,
         password: String,
@@ -26,6 +33,23 @@ public enum ProtocolConfig: Sendable, Hashable {
         skipCertVerify: Bool,
         session: AnyTLSSessionConfig
     )
+    /// VMess AEAD (`alterId: 0`) over TCP / TLS / WebSocket-style transports.
+    case vmess(
+        server: Endpoint,
+        uuid: String,
+        security: VMessSecurity,
+        tls: TLSSettings?,
+        network: StreamTransport = .tcp
+    )
+    /// Upstream HTTP proxy (`CONNECT`); `tls` makes it an `https` proxy.
+    case http(
+        server: Endpoint,
+        credentials: ProxyCredentials?,
+        tls: TLSSettings?,
+        headers: [String: String] = [:]
+    )
+    /// Upstream SOCKS5 proxy; `udp` enables UDP ASSOCIATE relay.
+    case socks5(server: Endpoint, credentials: ProxyCredentials?, tls: TLSSettings?, udp: Bool = true)
     /// Unproxied TCP; `NodeFactory` ignores the node server and dials the target.
     case direct
 }
@@ -140,14 +164,15 @@ public enum NodeFactory: Sendable {
         command: VLESSCommand = .tcp
     ) throws -> any OutboundConnection {
         switch node.protocolConfig {
-        case .shadowsocks(let server, let password, let cipher):
+        case .shadowsocks(let server, let password, let cipher, let plugin):
             return ShadowsocksOutboundConnection(
                 server: server,
                 password: password,
                 cipher: cipher,
-                target: target
+                target: target,
+                plugin: plugin
             )
-        case .vless(let server, let uuid, let sni, let tls, let reality, let flow, let skipCertVerify, let alpn):
+        case .vless(let server, let uuid, let sni, let tls, let reality, let flow, let skipCertVerify, let alpn, let network):
             return try VLESSOutboundConnection(
                 server: server,
                 uuid: uuid,
@@ -158,16 +183,18 @@ public enum NodeFactory: Sendable {
                 flow: flow,
                 command: command,
                 skipCertVerify: skipCertVerify,
-                alpn: alpn
+                alpn: alpn,
+                network: network
             )
-        case .trojan(let server, let password, let sni, let skipCertVerify):
+        case .trojan(let server, let password, let sni, let skipCertVerify, let network):
             return TrojanOutboundConnection(
                 server: server,
                 password: password,
                 target: target,
                 sni: sni,
                 command: command == .udp ? .udpAssociate : .connect,
-                skipCertVerify: skipCertVerify
+                skipCertVerify: skipCertVerify,
+                network: network
             )
         case .anytls(let server, let password, let sni, let skipCertVerify, let session):
             return AnyTLSOutboundConnection(
@@ -178,8 +205,70 @@ public enum NodeFactory: Sendable {
                 skipCertVerify: skipCertVerify,
                 sessionConfig: session
             )
+        case .vmess(let server, let uuid, let security, let tls, let network):
+            return try VMessOutboundConnection(
+                server: server,
+                uuid: uuid,
+                security: security,
+                target: target,
+                command: command == .udp ? .udp : .tcp,
+                settings: StreamSettings(tls: tls, transport: network)
+            )
+        case .http(let server, let credentials, let tls, let headers):
+            return HTTPConnectOutboundConnection(
+                server: server,
+                target: target,
+                credentials: credentials,
+                headers: headers,
+                settings: StreamSettings(tls: tls)
+            )
+        case .socks5(let server, let credentials, let tls, _):
+            return SOCKS5OutboundConnection(
+                server: server,
+                target: target,
+                credentials: credentials,
+                settings: StreamSettings(tls: tls)
+            )
         case .direct:
             return DirectOutboundConnection(endpoint: target)
+        }
+    }
+}
+
+extension NodeFactory {
+    /// Builds an unopened UDP relay through `node` for a flow whose first
+    /// datagram goes to `target`. `nil` when the protocol carries no UDP
+    /// (AnyTLS) or the node is `direct` (the TUN relay dials it natively).
+    public static func makeDatagramOutbound(
+        from node: OutboundNode,
+        to target: Endpoint
+    ) throws -> (any DatagramOutbound)? {
+        switch node.protocolConfig {
+        case .shadowsocks(let server, let password, let cipher, _):
+            // Plugins carry TCP only; UDP goes to the server port natively.
+            return ShadowsocksDatagramOutbound(server: server, password: password, cipher: cipher)
+        case .vless:
+            let stream = try makeConnection(from: node, to: target, command: .udp)
+            return StreamDatagramOutbound(connection: stream, framing: LengthPrefixedDatagramFraming())
+        case .trojan:
+            let stream = try makeConnection(from: node, to: target, command: .udp)
+            return StreamDatagramOutbound(connection: stream, framing: TrojanUDPFraming())
+        case .vmess(let server, let uuid, let security, let tls, let network):
+            // `zero` has no chunk boundaries to carry datagrams.
+            guard security != .zero else { return nil }
+            return VMessDatagramOutbound(connection: try VMessOutboundConnection(
+                server: server,
+                uuid: uuid,
+                security: security,
+                target: target,
+                command: .udp,
+                settings: StreamSettings(tls: tls, transport: network)
+            ))
+        case .socks5(let server, let credentials, let tls, let udp):
+            guard udp else { return nil }
+            return SOCKS5DatagramOutbound(server: server, credentials: credentials, settings: StreamSettings(tls: tls))
+        case .anytls, .http, .direct:
+            return nil
         }
     }
 }
@@ -568,13 +657,15 @@ extension OutboundNode {
     /// Server used for url-test TCP probes. `direct` nodes are skipped.
     public var probeEndpoint: Endpoint? {
         switch protocolConfig {
-        case .shadowsocks(let server, _, _):
+        case .shadowsocks(let server, _, _, _):
             return server
-        case .vless(let server, _, _, _, _, _, _, _):
+        case .vless(let server, _, _, _, _, _, _, _, _):
             return server
-        case .trojan(let server, _, _, _):
+        case .trojan(let server, _, _, _, _):
             return server
         case .anytls(let server, _, _, _, _):
+            return server
+        case .vmess(let server, _, _, _, _), .http(let server, _, _, _), .socks5(let server, _, _, _):
             return server
         case .direct:
             return nil

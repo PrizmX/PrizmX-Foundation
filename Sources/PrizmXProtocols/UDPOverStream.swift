@@ -38,7 +38,7 @@ public enum UDPOverStreamFrame {
     }
 
     /// Incremental decoder: feed stream bytes, drain complete datagrams.
-    public struct Decoder {
+    public struct Decoder: Sendable {
         private var leftover = Data()
 
         public init() {}

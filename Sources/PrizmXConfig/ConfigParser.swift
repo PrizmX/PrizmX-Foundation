@@ -14,6 +14,8 @@ public enum ConfigError: Error, Equatable, Sendable {
     case invalidPort(String)
     case unsupportedCipher(String)
     case malformedRule(String)
+    /// A protocol option the importer cannot honor (plugin, transport, …).
+    case unsupportedValue(String)
 }
 
 /// Imports a textual config into the in-memory `Router` + `NodeManager` model.
@@ -156,7 +158,88 @@ enum ConfigMapping {
         if let cipher = ShadowsocksCipher(rawValue: key) {
             return cipher
         }
+        // mihomo / shadowsocks-rust aliases for the IETF ChaCha20-Poly1305 AEAD.
+        if key == "chacha20-poly1305" || key == "aead_chacha20_poly1305" {
+            return .chacha20IETFPoly1305
+        }
         throw ConfigError.unsupportedCipher(raw)
+    }
+
+    /// VMess `cipher` / `security`. Legacy CFB / `aes-128-cfb` bodies (the
+    /// `alterId > 0` era) are not supported.
+    static func vmessSecurity(_ raw: String?) throws -> VMessSecurity {
+        let key = (raw ?? "auto").lowercased()
+        if key.isEmpty { return .auto }
+        if let security = VMessSecurity(rawValue: key) { return security }
+        if key == "chacha20-ietf-poly1305" { return .chacha20Poly1305 }
+        throw ConfigError.unsupportedValue("vmess cipher \(key)")
+    }
+
+    /// A user id that parses as a UUID (fails the proxy at import, not at
+    /// the first connection).
+    static func uuid(_ raw: String?) throws -> String {
+        guard let raw, !raw.isEmpty else { throw ConfigError.missingField("uuid") }
+        guard UUID(uuidString: raw) != nil else { throw ConfigError.unsupportedValue("uuid \(raw)") }
+        return raw
+    }
+
+    /// SIP003 plugin by name with flat string options (Clash `plugin-opts`,
+    /// or SIP003 `plugin_opts` split by `sip003Options`). `nil` name means
+    /// no plugin; anything but simple-obfs / v2ray-plugin websocket fails.
+    static func shadowsocksPlugin(
+        name: String?,
+        options: [String: String],
+        headers: [String: String] = [:],
+        server: String
+    ) throws -> ShadowsocksPlugin? {
+        guard let name = name?.lowercased(), !name.isEmpty else { return nil }
+        func flag(_ key: String) -> Bool {
+            guard let value = options[key]?.lowercased() else { return false }
+            return value.isEmpty || value == "true" || value == "1"
+        }
+        switch name {
+        case "obfs", "obfs-local", "simple-obfs":
+            let raw = (options["mode"] ?? options["obfs"] ?? "http").lowercased()
+            guard let mode = SimpleObfsSettings.Mode(rawValue: raw) else {
+                throw ConfigError.unsupportedValue("obfs mode \(raw)")
+            }
+            return .obfs(SimpleObfsSettings(
+                mode: mode,
+                host: options["host"] ?? options["obfs-host"] ?? "bing.com",
+                path: options["obfs-uri"] ?? options["path"] ?? "/"
+            ))
+        case "v2ray-plugin":
+            let mode = (options["mode"] ?? "websocket").lowercased()
+            guard mode == "websocket" else {
+                throw ConfigError.unsupportedValue("v2ray-plugin mode \(mode)")
+            }
+            let host = options["host"].flatMap { $0.isEmpty ? nil : $0 } ?? server
+            let tls: TLSSettings? = flag("tls")
+                ? TLSSettings(serverName: host, skipCertVerify: flag("skip-cert-verify"))
+                : nil
+            // `mux` defaults on, as in v2ray-plugin and Clash.
+            let mux = options["mux"].map { !["false", "0"].contains($0.lowercased()) } ?? true
+            return .v2ray(
+                webSocket: WebSocketSettings(path: options["path"] ?? "/", host: host, headers: headers),
+                tls: tls,
+                mux: mux
+            )
+        default:
+            throw ConfigError.unsupportedValue("plugin \(name)")
+        }
+    }
+
+    /// SIP003 `key=value;flag;…` plugin options.
+    static func sip003Options(_ raw: String?) -> [String: String] {
+        var options: [String: String] = [:]
+        for item in (raw ?? "").split(separator: ";") {
+            let pair = item.split(separator: "=", maxSplits: 1).map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }
+            guard let key = pair.first, !key.isEmpty else { continue }
+            options[key.lowercased()] = pair.count == 2 ? pair[1] : ""
+        }
+        return options
     }
 
     static func policy(named target: String) -> Policy {

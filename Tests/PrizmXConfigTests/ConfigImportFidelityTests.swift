@@ -110,7 +110,7 @@ import PrizmXProtocols
     proxies:
       - {name: HK1, type: ss, server: 1.1.1.1, port: 8388, cipher: aes-256-gcm, password: x}
       - {name: JP1, type: ss, server: 2.2.2.2, port: 8388, cipher: aes-256-gcm, password: x}
-      - {name: HK2, type: vmess, server: 3.3.3.3, port: 443, uuid: u}
+      - {name: HK2, type: hysteria2, server: 3.3.3.3, port: 443, password: u}
     proxy-groups:
       - {name: All, type: select, include-all: true}
       - {name: HK, type: url-test, include-all: true, filter: "HK"}
@@ -135,7 +135,7 @@ import PrizmXProtocols
 @Test func clashGroupMembersNamingSkippedProxiesAreDropped() throws {
     let yaml = """
     proxies:
-      - {name: VM1, type: vmess, server: 3.3.3.3, port: 443, uuid: u}
+      - {name: VM1, type: hysteria2, server: 3.3.3.3, port: 443, password: u}
       - {name: HK1, type: ss, server: 1.1.1.1, port: 8388, cipher: aes-256-gcm, password: x}
     proxy-groups:
       - {name: Proxy, type: select, proxies: [VM1, HK1, DIRECT]}
@@ -231,8 +231,8 @@ import PrizmXProtocols
       - {name: t, type: trojan, server: t.example, port: 443, password: p, sni: t.example, skip-cert-verify: true}
     """
     let (_, clash) = try ClashConfigParser().parse(rawString: yaml)
-    guard case .vless(_, _, _, _, _, _, let skipV, let alpn) = clash.nodesByID["v"]?.protocolConfig,
-          case .trojan(_, _, _, let skipT) = clash.nodesByID["t"]?.protocolConfig
+    guard case .vless(_, _, _, _, _, _, let skipV, let alpn, _) = clash.nodesByID["v"]?.protocolConfig,
+          case .trojan(_, _, _, let skipT, _) = clash.nodesByID["t"]?.protocolConfig
     else {
         Issue.record("unexpected node shapes")
         return
@@ -249,8 +249,8 @@ import PrizmXProtocols
     ]}
     """
     let (_, singbox) = try SingboxConfigParser().parse(rawString: json)
-    guard case .vless(_, _, _, _, _, _, let sbSkipV, let sbALPN) = singbox.nodesByID["v"]?.protocolConfig,
-          case .trojan(_, _, _, let sbSkipT) = singbox.nodesByID["t"]?.protocolConfig
+    guard case .vless(_, _, _, _, _, _, let sbSkipV, let sbALPN, _) = singbox.nodesByID["v"]?.protocolConfig,
+          case .trojan(_, _, _, let sbSkipT, _) = singbox.nodesByID["t"]?.protocolConfig
     else {
         Issue.record("unexpected node shapes")
         return

@@ -9,14 +9,15 @@ import Foundation
 /// `[encrypted 2-byte BE length][16-byte tag][encrypted payload][16-byte tag]`
 ///
 /// Each of the two AEAD operations consumes a distinct nonce. The nonce is a
-/// 12-byte little-endian counter starting at 0.
+/// 12-byte little-endian counter starting at 0. AES-GCM and
+/// ChaCha20-Poly1305 share the same 12-byte nonce and 16-byte tag.
 public enum ShadowsocksAEAD {
     /// Maximum plaintext bytes in a single TCP chunk (`0x3FFF`).
     /// The high two bits of the length field are reserved and must be zero.
     public static let maxPayloadLength = 0x3FFF
-    /// AES-GCM authentication tag size (bytes).
+    /// AEAD authentication tag size (bytes).
     public static let tagByteCount = 16
-    /// Counting nonce size for AES-GCM (bytes).
+    /// Counting nonce size (bytes).
     public static let nonceByteCount = 12
     /// Plaintext length field size (bytes).
     public static let lengthFieldByteCount = 2
@@ -38,13 +39,16 @@ public enum ShadowsocksAEAD {
 @frozen
 public enum ShadowsocksCipher: String, Hashable, Sendable, Codable, CaseIterable {
     case aes128GCM = "aes-128-gcm"
+    case aes192GCM = "aes-192-gcm"
     case aes256GCM = "aes-256-gcm"
+    case chacha20IETFPoly1305 = "chacha20-ietf-poly1305"
 
     /// Master-key / subkey size in bytes. Equal to the salt size for these ciphers.
     public var keyByteCount: Int {
         switch self {
         case .aes128GCM: return 16
-        case .aes256GCM: return 32
+        case .aes192GCM: return 24
+        case .aes256GCM, .chacha20IETFPoly1305: return 32
         }
     }
 
@@ -140,6 +144,12 @@ public struct ShadowsocksNonce: Sendable, Equatable {
     func makeGCMNonce() throws -> AES.GCM.Nonce {
         try withUnsafeBytes { raw in
             try AES.GCM.Nonce(data: Data(raw))
+        }
+    }
+
+    func makeChaChaNonce() throws -> ChaChaPoly.Nonce {
+        try withUnsafeBytes { raw in
+            try ChaChaPoly.Nonce(data: Data(raw))
         }
     }
 }
@@ -462,28 +472,32 @@ public struct ShadowsocksAEADContext: Sendable {
         plaintext: UnsafeRawBufferPointer,
         into output: UnsafeMutableRawBufferPointer
     ) throws -> Int {
-        let gcmNonce = try nonce.makeGCMNonce()
-        let box: AES.GCM.SealedBox
-        if plaintext.isEmpty {
-            box = try AES.GCM.seal(Data(), using: subkey, nonce: gcmNonce)
-        } else {
-            box = try withUnownedData(plaintext) { data in
-                try AES.GCM.seal(data, using: subkey, nonce: gcmNonce)
-            }
+        let input = plaintext.isEmpty ? Data() : unownedData(plaintext)
+        let ciphertext: Data
+        let tag: Data
+        switch cipher {
+        case .aes128GCM, .aes192GCM, .aes256GCM:
+            let box = try AES.GCM.seal(input, using: subkey, nonce: try nonce.makeGCMNonce())
+            ciphertext = box.ciphertext
+            tag = box.tag
+        case .chacha20IETFPoly1305:
+            let box = try ChaChaPoly.seal(input, using: subkey, nonce: try nonce.makeChaChaNonce())
+            ciphertext = box.ciphertext
+            tag = box.tag
         }
 
-        let combinedCount = box.ciphertext.count + box.tag.count
+        let combinedCount = ciphertext.count + tag.count
         guard output.count >= combinedCount else {
             throw ShadowsocksError.truncated(expected: combinedCount, actual: output.count)
         }
-        if box.ciphertext.count > 0 {
-            box.ciphertext.copyBytes(
-                to: UnsafeMutableRawBufferPointer(rebasing: output.prefix(box.ciphertext.count))
+        if ciphertext.count > 0 {
+            ciphertext.copyBytes(
+                to: UnsafeMutableRawBufferPointer(rebasing: output.prefix(ciphertext.count))
             )
         }
-        box.tag.copyBytes(
+        tag.copyBytes(
             to: UnsafeMutableRawBufferPointer(
-                rebasing: output[box.ciphertext.count..<combinedCount]
+                rebasing: output[ciphertext.count..<combinedCount]
             )
         )
         nonce.increment()
@@ -505,18 +519,28 @@ public struct ShadowsocksAEADContext: Sendable {
             throw ShadowsocksError.truncated(expected: ciphertextCount, actual: output.count)
         }
 
-        let gcmNonce = try nonce.makeGCMNonce()
         let ciphertext = UnsafeRawBufferPointer(rebasing: record.prefix(ciphertextCount))
         let tag = UnsafeRawBufferPointer(rebasing: record.suffix(tagByteCount))
+        let ciphertextData = ciphertextCount == 0 ? Data() : unownedData(ciphertext)
 
         let plaintext: Data
         do {
-            let box = try AES.GCM.SealedBox(
-                nonce: gcmNonce,
-                ciphertext: ciphertextCount == 0 ? Data() : unownedData(ciphertext),
-                tag: unownedData(tag)
-            )
-            plaintext = try AES.GCM.open(box, using: subkey)
+            switch cipher {
+            case .aes128GCM, .aes192GCM, .aes256GCM:
+                let box = try AES.GCM.SealedBox(
+                    nonce: try nonce.makeGCMNonce(),
+                    ciphertext: ciphertextData,
+                    tag: unownedData(tag)
+                )
+                plaintext = try AES.GCM.open(box, using: subkey)
+            case .chacha20IETFPoly1305:
+                let box = try ChaChaPoly.SealedBox(
+                    nonce: try nonce.makeChaChaNonce(),
+                    ciphertext: ciphertextData,
+                    tag: unownedData(tag)
+                )
+                plaintext = try ChaChaPoly.open(box, using: subkey)
+            }
         } catch {
             throw ShadowsocksError.authenticationFailed
         }
@@ -723,9 +747,3 @@ private func unownedData(_ buffer: UnsafeRawBufferPointer) -> Data {
     )
 }
 
-private func withUnownedData<R>(
-    _ buffer: UnsafeRawBufferPointer,
-    _ body: (Data) throws -> R
-) rethrows -> R {
-    try body(unownedData(buffer))
-}

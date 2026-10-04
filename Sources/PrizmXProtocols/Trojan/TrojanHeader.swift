@@ -17,6 +17,8 @@ public enum TrojanError: Error, Equatable, Sendable {
     case truncated(expected: Int, actual: Int)
     /// Command byte is not CONNECT / UDP ASSOCIATE.
     case invalidCommand(UInt8)
+    /// A UDP packet lacks its CRLF separator or carries a bad address.
+    case malformedUDPPacket
 }
 
 /// Trojan request header (after the TLS handshake, before payload).

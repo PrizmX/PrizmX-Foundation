@@ -97,13 +97,73 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             let cipher = try ConfigMapping.cipher(try node.requiredString("cipher"))
             let password = try node.requiredString("password")
             let endpoint = try ConfigMapping.endpoint(host: server, port: port, field: "port")
+            let opts = node.mapping?["plugin-opts"]
+            let plugin = try ConfigMapping.shadowsocksPlugin(
+                name: node.string(for: "plugin"),
+                options: opts?.mapping?.compactMapValues(\.string) ?? [:],
+                headers: opts?.mapping?["headers"]?.mapping?.compactMapValues(\.string) ?? [:],
+                server: server
+            )
             return OutboundNode(
                 id: name,
                 name: name,
-                protocolConfig: .shadowsocks(server: endpoint, password: password, cipher: cipher)
+                protocolConfig: .shadowsocks(server: endpoint, password: password, cipher: cipher, plugin: plugin)
             )
         case "vless":
             return try makeClashVLESS(node, name: name)
+        case "vmess":
+            let endpoint = try ConfigMapping.endpoint(
+                host: try node.requiredString("server"),
+                port: try node.int(for: "port"),
+                field: "port"
+            )
+            var tls = Self.tls(node)
+            if tls != nil, tls?.serverName == nil {
+                tls?.serverName = node.string(for: "servername")
+            }
+            return OutboundNode(
+                id: name,
+                name: name,
+                protocolConfig: .vmess(
+                    server: endpoint,
+                    uuid: try ConfigMapping.uuid(node.string(for: "uuid")),
+                    security: try ConfigMapping.vmessSecurity(node.string(for: "cipher")),
+                    tls: tls,
+                    network: try Self.transport(node)
+                )
+            )
+        case "http":
+            let endpoint = try ConfigMapping.endpoint(
+                host: try node.requiredString("server"),
+                port: try node.int(for: "port"),
+                field: "port"
+            )
+            return OutboundNode(
+                id: name,
+                name: name,
+                protocolConfig: .http(
+                    server: endpoint,
+                    credentials: Self.credentials(node),
+                    tls: Self.tls(node),
+                    headers: node.mapping?["headers"]?.mapping?.compactMapValues(\.string) ?? [:]
+                )
+            )
+        case "socks5":
+            let endpoint = try ConfigMapping.endpoint(
+                host: try node.requiredString("server"),
+                port: try node.int(for: "port"),
+                field: "port"
+            )
+            return OutboundNode(
+                id: name,
+                name: name,
+                protocolConfig: .socks5(
+                    server: endpoint,
+                    credentials: Self.credentials(node),
+                    tls: Self.tls(node),
+                    udp: node.bool(for: "udp", default: false)
+                )
+            )
         case "trojan":
             let server = try node.requiredString("server")
             let port = try node.int(for: "port")
@@ -117,7 +177,8 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                     server: endpoint,
                     password: password,
                     sni: sni,
-                    skipCertVerify: node.bool(for: "skip-cert-verify", default: false)
+                    skipCertVerify: node.bool(for: "skip-cert-verify", default: false),
+                    network: try Self.transport(node)
                 )
             )
         case "anytls":
@@ -168,8 +229,54 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                 reality: reality,
                 flow: flow,
                 skipCertVerify: node.bool(for: "skip-cert-verify", default: false),
-                alpn: Self.alpn(node.mapping?["alpn"])
+                alpn: Self.alpn(node.mapping?["alpn"]),
+                network: try Self.transport(node)
             )
+        )
+    }
+
+    /// Clash `network` + `ws-opts` / legacy `ws-path` / `ws-headers`.
+    /// Unsupported transports fail the proxy so it is reported, not
+    /// imported as a plain TCP node that cannot connect.
+    static func transport(_ node: YAMLNode) throws -> StreamTransport {
+        let network = (node.string(for: "network") ?? "tcp").lowercased()
+        switch network {
+        case "", "tcp":
+            return .tcp
+        case "ws":
+            let opts = node.mapping?["ws-opts"]
+            let path = opts?.string(for: "path") ?? node.string(for: "ws-path") ?? "/"
+            let headers = (opts?.mapping?["headers"] ?? node.mapping?["ws-headers"])?
+                .mapping?.compactMapValues(\.string) ?? [:]
+            if opts?.bool(for: "v2ray-http-upgrade", default: false) == true {
+                return .httpUpgrade(HTTPUpgradeSettings(path: path, headers: headers))
+            }
+            return .webSocket(WebSocketSettings.parsing(
+                path: path,
+                headers: headers,
+                maxEarlyData: opts?.int(for: "max-early-data", default: 0) ?? 0,
+                earlyDataHeaderName: opts?.string(for: "early-data-header-name") ?? ""
+            ))
+        default:
+            throw ConfigError.unsupportedValue("network \(network)")
+        }
+    }
+
+    /// Clash `username` / `password` (HTTP / SOCKS5); `nil` when both are empty.
+    static func credentials(_ node: YAMLNode) -> ProxyCredentials? {
+        let username = node.string(for: "username") ?? ""
+        let password = node.string(for: "password") ?? ""
+        guard !username.isEmpty || !password.isEmpty else { return nil }
+        return ProxyCredentials(username: username, password: password)
+    }
+
+    /// Clash `tls: true` with `sni` / `servername`, `skip-cert-verify`, `alpn`.
+    static func tls(_ node: YAMLNode) -> TLSSettings? {
+        guard node.bool(for: "tls", default: false) else { return nil }
+        return TLSSettings(
+            serverName: node.string(for: "sni") ?? node.string(for: "servername"),
+            skipCertVerify: node.bool(for: "skip-cert-verify", default: false),
+            alpn: alpn(node.mapping?["alpn"])
         )
     }
 
@@ -318,6 +425,9 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         case .vless: "vless"
         case .trojan: "trojan"
         case .anytls: "anytls"
+        case .vmess: "vmess"
+        case .http: "http"
+        case .socks5: "socks5"
         case .direct: "direct"
         }
     }
@@ -394,13 +504,24 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             let method = named("encrypt-method") ?? named("method") ?? ""
             let password = named("password") ?? ""
             let endpoint = try ConfigMapping.endpoint(host: host, port: port, field: "port")
+            // Surge `obfs=http|tls, obfs-host=…, obfs-uri=…`.
+            let plugin = try ConfigMapping.shadowsocksPlugin(
+                name: named("obfs") == nil ? nil : "obfs",
+                options: [
+                    "mode": named("obfs") ?? "",
+                    "host": named("obfs-host") ?? "bing.com",
+                    "path": named("obfs-uri") ?? "/",
+                ],
+                server: host
+            )
             return OutboundNode(
                 id: String(name),
                 name: String(name),
                 protocolConfig: .shadowsocks(
                     server: endpoint,
                     password: password,
-                    cipher: try ConfigMapping.cipher(method)
+                    cipher: try ConfigMapping.cipher(method),
+                    plugin: plugin
                 )
             )
         case "vless":
@@ -424,7 +545,8 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                     reality: reality,
                     flow: flow,
                     skipCertVerify: named("skip-cert-verify")?.lowercased() == "true",
-                    alpn: named("alpn").flatMap { Self.alpn(.scalar($0)) }
+                    alpn: named("alpn").flatMap { Self.alpn(.scalar($0)) },
+                    network: Self.surgeTransport(named: named)
                 )
             )
         case "trojan":
@@ -441,9 +563,59 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                     server: endpoint,
                     password: password,
                     sni: sni,
-                    skipCertVerify: named("skip-cert-verify")?.lowercased() == "true"
+                    skipCertVerify: named("skip-cert-verify")?.lowercased() == "true",
+                    network: Self.surgeTransport(named: named)
                 )
             )
+        case "vmess":
+            // `name = vmess, host, port, username=<uuid>[, tls=true, sni=…, ws=true, …]`
+            guard parts.count >= 3 else { throw ConfigError.malformedRule(line) }
+            guard let port = Int(parts[2]) else { throw ConfigError.invalidPort(parts[2]) }
+            let endpoint = try ConfigMapping.endpoint(host: parts[1], port: port, field: "port")
+            let tls: TLSSettings? = named("tls")?.lowercased() == "true"
+                ? TLSSettings(
+                    serverName: named("sni"),
+                    skipCertVerify: named("skip-cert-verify")?.lowercased() == "true"
+                )
+                : nil
+            return OutboundNode(
+                id: String(name),
+                name: String(name),
+                protocolConfig: .vmess(
+                    server: endpoint,
+                    uuid: try ConfigMapping.uuid(named("username")),
+                    security: try ConfigMapping.vmessSecurity(named("encrypt-method")),
+                    tls: tls,
+                    network: Self.surgeTransport(named: named)
+                )
+            )
+        case "http", "https", "socks5", "socks5-tls":
+            // `name = http, host, port[, user, pass][, key=value…]`
+            guard parts.count >= 3 else { throw ConfigError.malformedRule(line) }
+            let host = parts[1]
+            guard let port = Int(parts[2]) else { throw ConfigError.invalidPort(parts[2]) }
+            let positional = parts.dropFirst(3).filter { !$0.contains("=") }
+            let username = named("username") ?? positional.first
+            let password = named("password") ?? positional.dropFirst().first
+            let credentials = (username ?? "").isEmpty && (password ?? "").isEmpty
+                ? nil
+                : ProxyCredentials(username: username ?? "", password: password ?? "")
+            let tls: TLSSettings? = type.hasSuffix("s") || type.hasSuffix("-tls")
+                ? TLSSettings(
+                    serverName: named("sni"),
+                    skipCertVerify: named("skip-cert-verify")?.lowercased() == "true"
+                )
+                : nil
+            let endpoint = try ConfigMapping.endpoint(host: host, port: port, field: "port")
+            let config: ProtocolConfig = type.hasPrefix("http")
+                ? .http(server: endpoint, credentials: credentials, tls: tls)
+                : .socks5(
+                    server: endpoint,
+                    credentials: credentials,
+                    tls: tls,
+                    udp: named("udp-relay")?.lowercased() == "true"
+                )
+            return OutboundNode(id: String(name), name: String(name), protocolConfig: config)
         case "anytls":
             guard parts.count >= 3 else { throw ConfigError.malformedRule(line) }
             let host = parts[1]
@@ -466,6 +638,18 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         default:
             return nil
         }
+    }
+
+    /// Surge `ws=true, ws-path=/p, ws-headers=Host:a.com|X-Key:v`.
+    static func surgeTransport(named: (String) -> String?) -> StreamTransport {
+        guard named("ws")?.lowercased() == "true" else { return .tcp }
+        var headers: [String: String] = [:]
+        for pair in (named("ws-headers") ?? "").split(separator: "|") {
+            let parts = pair.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            headers[parts[0].trimmingCharacters(in: .whitespaces)] = parts[1].trimmingCharacters(in: .whitespaces)
+        }
+        return .webSocket(WebSocketSettings.parsing(path: named("ws-path") ?? "/", headers: headers))
     }
 
     private func parseSurgeGroup(_ line: String) -> PolicyGroup? {

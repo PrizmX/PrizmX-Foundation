@@ -30,6 +30,9 @@ final class NWStreamTransport: @unchecked Sendable {
     private let handshakeFlag = OSAllocatedUnfairLock(initialState: false)
     /// Set once the wire returns a clean EOF (read path only).
     private(set) var receiveEOF = false
+    /// Framing between the protocol and the socket (WebSocket, gRPC, obfs).
+    /// Installed during open, before `markEstablished`.
+    private let layerBox = OSAllocatedUnfairLock<(any ByteStream)?>(initialState: nil)
 
     private struct Lifecycle {
         var state: OutboundConnectionState = .idle
@@ -83,13 +86,26 @@ final class NWStreamTransport: @unchecked Sendable {
     func ensureOpen(running body: @escaping @Sendable () async throws -> Void) async throws {
         switch state {
         case .established: return
-        case .closed: throw OutboundError.alreadyClosed(endpoint)
+        case .closed:
+            // Peer failure keeps the socket for draining reads (see
+            // `ensureReadable`); writes still fail in `ensureWritable`.
+            if connection != nil { return }
+            throw OutboundError.alreadyClosed(endpoint)
         case .idle, .connecting: try await open(running: body)
         }
     }
 
     func ensureNotClosed() throws {
         if state == .closed || connection == nil {
+            throw OutboundError.alreadyClosed(endpoint)
+        }
+    }
+
+    /// Read-side check: only an explicit `close()` stops reads. After the
+    /// peer fails or resets the socket (state `.closed`), reads still drain
+    /// what Network.framework has buffered and then surface its error.
+    func ensureReadable() throws {
+        if connection == nil {
             throw OutboundError.alreadyClosed(endpoint)
         }
     }
@@ -159,6 +175,36 @@ final class NWStreamTransport: @unchecked Sendable {
         connectionBox.withLock { $0 = nil }
     }
 
+    /// `failOpen` for the connection `attach` registered (protocol handshake
+    /// failed after `dial`).
+    func failOpen() {
+        lifecycle.withLock { $0.state = .closed }
+        connectionBox.withLock { box -> NWConnection? in
+            defer { box = nil }
+            return box
+        }?.cancel()
+    }
+
+    // MARK: Framing layer
+
+    /// The socket itself as a `ByteStream`, for a layer to stack on.
+    var socketStream: any ByteStream { SocketStream(transport: self) }
+
+    /// Routes `send` / `receiveRaw` / `finishWriting` through `layer`.
+    func install(_ layer: any ByteStream) {
+        layerBox.withLock { $0 = layer }
+    }
+
+    private var layer: (any ByteStream)? {
+        layerBox.withLock { $0 }
+    }
+
+    /// The topmost stream so far (installed layer, else the socket), for a
+    /// further layer to stack on.
+    var currentStream: any ByteStream {
+        layer ?? socketStream
+    }
+
     func markEstablished() {
         lifecycle.withLock { $0.state = .established }
     }
@@ -167,8 +213,17 @@ final class NWStreamTransport: @unchecked Sendable {
         lifecycle.withLock { $0.state = .closed }
     }
 
-    /// Raw send on the wire with mapped errors.
+    /// Protocol bytes out: through the framing layer when one is installed.
     func send(_ data: Data) async throws {
+        if let layer {
+            try await layer.send(data)
+        } else {
+            try await sendSocket(data)
+        }
+    }
+
+    /// Raw send on the socket with mapped errors.
+    fileprivate func sendSocket(_ data: Data) async throws {
         guard let connection else { throw OutboundError.alreadyClosed(endpoint) }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(
@@ -190,8 +245,20 @@ final class NWStreamTransport: @unchecked Sendable {
         receiveEOF = true
     }
 
-    /// One raw chunk from the wire; `nil` at EOF (also flips `receiveEOF`).
+    /// One chunk of protocol bytes (through the framing layer when one is
+    /// installed); `nil` at EOF (also flips `receiveEOF`).
     func receiveRaw() async throws -> Data? {
+        let chunk = if let layer {
+            try await layer.receive()
+        } else {
+            try await receiveSocket()
+        }
+        if chunk == nil { receiveEOF = true }
+        return chunk
+    }
+
+    /// One raw chunk from the socket; `nil` at EOF.
+    fileprivate func receiveSocket() async throws -> Data? {
         guard let connection else { throw OutboundError.alreadyClosed(endpoint) }
         let chunk: Data = try await withCheckedThrowingContinuation { continuation in
             connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
@@ -206,11 +273,7 @@ final class NWStreamTransport: @unchecked Sendable {
                 continuation.resume(returning: data ?? Data())
             }
         }
-        guard !chunk.isEmpty else {
-            receiveEOF = true
-            return nil
-        }
-        return chunk
+        return chunk.isEmpty ? nil : chunk
     }
 
     /// Serialized `write` shell: open check → write mutex → not-closed check,
@@ -262,6 +325,15 @@ final class NWStreamTransport: @unchecked Sendable {
         if let prelude {
             try? await prelude()
         }
+        if let layer {
+            await layer.finishWriting()
+        } else {
+            await finishSocket()
+        }
+    }
+
+    /// TCP FIN (after TLS close_notify for Network.framework TLS).
+    fileprivate func finishSocket() async {
         guard let connection else { return }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             connection.send(
@@ -292,5 +364,26 @@ final class NWStreamTransport: @unchecked Sendable {
         default:
             return error
         }
+    }
+}
+
+/// The transport's socket as the bottom `ByteStream` of a framing layer.
+private final class SocketStream: ByteStream, @unchecked Sendable {
+    private unowned let transport: NWStreamTransport
+
+    init(transport: NWStreamTransport) {
+        self.transport = transport
+    }
+
+    func send(_ data: Data) async throws {
+        try await transport.sendSocket(data)
+    }
+
+    func receive() async throws -> Data? {
+        try await transport.receiveSocket()
+    }
+
+    func finishWriting() async {
+        await transport.finishSocket()
     }
 }

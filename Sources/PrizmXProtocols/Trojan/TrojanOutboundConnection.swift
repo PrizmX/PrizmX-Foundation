@@ -13,12 +13,21 @@ public struct TrojanOutboundFactory: OutboundConnectionFactory, Sendable {
     public let sni: String?
     /// Clash `skip-cert-verify`: accept any server certificate.
     public let skipCertVerify: Bool
+    /// Transport inside TLS (`tcp`, `ws`, …).
+    public let network: StreamTransport
 
-    public init(server: Endpoint, password: String, sni: String? = nil, skipCertVerify: Bool = false) {
+    public init(
+        server: Endpoint,
+        password: String,
+        sni: String? = nil,
+        skipCertVerify: Bool = false,
+        network: StreamTransport = .tcp
+    ) {
         self.server = server
         self.password = password
         self.sni = sni
         self.skipCertVerify = skipCertVerify
+        self.network = network
     }
 
     public func connect(to endpoint: Endpoint) async throws -> any OutboundConnection {
@@ -27,15 +36,17 @@ public struct TrojanOutboundFactory: OutboundConnectionFactory, Sendable {
             password: password,
             target: endpoint,
             sni: sni,
-            skipCertVerify: skipCertVerify
+            skipCertVerify: skipCertVerify,
+            network: network
         )
     }
 }
 
 // MARK: - Outbound connection
 
-/// Trojan TCP client: TLS handshake, then a one-shot header
-/// `hex(SHA224(password)) CRLF CMD SOCKS5-ADDR CRLF`, then a raw byte stream.
+/// Trojan TCP client: TLS handshake (plus the transport, e.g. WebSocket),
+/// then a one-shot header `hex(SHA224(password)) CRLF CMD SOCKS5-ADDR CRLF`,
+/// then a raw byte stream.
 public final class TrojanOutboundConnection: OutboundConnection, @unchecked Sendable {
 
     public let endpoint: Endpoint
@@ -44,6 +55,7 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
     public let command: TrojanCommand
     public let passwordHashHex: [UInt8]
     public let skipCertVerify: Bool
+    public let network: StreamTransport
 
     public var state: OutboundConnectionState {
         transport.state
@@ -60,19 +72,22 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
     ///   - sni: TLS server name. Defaults to `server`'s domain.
     ///   - command: CONNECT (TCP) or UDP ASSOCIATE.
     ///   - skipCertVerify: Accept any server certificate (explicit opt-in).
+    ///   - network: Transport inside TLS (`tcp`, `ws`, `httpupgrade`).
     public init(
         server: Endpoint,
         password: String,
         target: Endpoint,
         sni: String? = nil,
         command: TrojanCommand = .connect,
-        skipCertVerify: Bool = false
+        skipCertVerify: Bool = false,
+        network: StreamTransport = .tcp
     ) {
         self.server = server
         self.endpoint = target
         self.sni = sni
         self.command = command
         self.skipCertVerify = skipCertVerify
+        self.network = network
         let header = TrojanHeader(password: password, destination: target, command: command)
         self.header = header
         self.passwordHashHex = header.passwordHashHex
@@ -126,7 +141,7 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
         try await transport.ensureOpen { try await self.connectAndHandshake() }
         await transport.readMutex.acquire()
         defer { transport.readMutex.release() }
-        try transport.ensureNotClosed()
+        try transport.ensureReadable()
 
         while true {
             if transport.inbox.readableByteCount > 0 {
@@ -146,7 +161,8 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
         await transport.close()
     }
 
-    /// Half-close: Network.framework TLS sends close_notify, then TCP FIN.
+    /// Half-close: ends the uplink where the transport can (see
+    /// `ByteStream.finishWriting`); the downlink keeps flowing either way.
     public func closeWrite() async {
         await transport.finishWriting()
     }
@@ -156,20 +172,15 @@ public final class TrojanOutboundConnection: OutboundConnection, @unchecked Send
     // MARK: Handshake
 
     private func connectAndHandshake() async throws {
-        guard server.port > 0, let nwPort = NWEndpoint.Port(rawValue: server.port) else {
-            throw OutboundError.invalidEndpoint(server)
-        }
-        let serverName = TLSClient.resolvedServerName(explicit: sni, server: server)
-        let parameters = TLSClient.parameters(serverName: serverName, skipVerification: skipCertVerify)
-        let host = try await DNSClient.resolve(server.host, role: .proxyServer)
-        let nw = NWConnection(host: host, port: nwPort, using: parameters)
-        transport.attach(nw)
-
+        let settings = StreamSettings(
+            tls: TLSSettings(serverName: sni, skipCertVerify: skipCertVerify),
+            transport: network
+        )
+        try await transport.dial(server, settings: settings)
         do {
-            try await transport.waitUntilReady(nw)
             try await sendHeaderIfNeeded()
         } catch {
-            transport.failOpen(nw)
+            transport.failOpen()
             throw error
         }
         transport.markEstablished()

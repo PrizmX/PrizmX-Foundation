@@ -51,6 +51,12 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
                     nodes.append(try makeTrojan(outbound))
                 case "anytls":
                     nodes.append(try makeAnyTLS(outbound))
+                case "vmess":
+                    nodes.append(try makeVMess(outbound))
+                case "http":
+                    nodes.append(try makeHTTP(outbound))
+                case "socks":
+                    nodes.append(try makeSOCKS(outbound))
                 case "selector":
                     groups.append(makeGroup(outbound, mode: .select, builtins: builtins))
                 case "urltest":
@@ -111,13 +117,19 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
         let port = try outbound.requirePort()
         let method = outbound.method ?? ""
         let password = outbound.password ?? ""
+        let plugin = try ConfigMapping.shadowsocksPlugin(
+            name: outbound.plugin,
+            options: ConfigMapping.sip003Options(outbound.pluginOpts),
+            server: server
+        )
         return OutboundNode(
             id: tag,
             name: tag,
             protocolConfig: .shadowsocks(
                 server: try ConfigMapping.endpoint(host: server, port: port, field: "server_port"),
                 password: password,
-                cipher: try ConfigMapping.cipher(method)
+                cipher: try ConfigMapping.cipher(method),
+                plugin: plugin
             )
         )
     }
@@ -152,7 +164,8 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
                 reality: reality,
                 flow: flow,
                 skipCertVerify: outbound.tls?.insecure ?? false,
-                alpn: outbound.tls?.alpn.flatMap { $0.values.isEmpty ? nil : $0.values }
+                alpn: outbound.tls?.alpn.flatMap { $0.values.isEmpty ? nil : $0.values },
+                network: try outbound.streamTransport()
             )
         )
     }
@@ -170,7 +183,8 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
                 server: try ConfigMapping.endpoint(host: server, port: port, field: "server_port"),
                 password: password,
                 sni: sni,
-                skipCertVerify: outbound.tls?.insecure ?? false
+                skipCertVerify: outbound.tls?.insecure ?? false,
+                network: try outbound.streamTransport()
             )
         )
     }
@@ -190,6 +204,68 @@ public struct SingboxConfigParser: ConfigParserProtocol, Sendable {
                 sni: sni,
                 skipCertVerify: outbound.tls?.insecure ?? false,
                 session: AnyTLSSessionConfig()
+            )
+        )
+    }
+
+    private func makeVMess(_ outbound: SingboxOutbound) throws -> OutboundNode {
+        let tag = try outbound.requireTag()
+        let server = try ConfigMapping.endpoint(
+            host: try outbound.requireServer(),
+            port: try outbound.requirePort(),
+            field: "server_port"
+        )
+        let uuid = try ConfigMapping.uuid(outbound.uuid)
+        return OutboundNode(
+            id: tag,
+            name: tag,
+            protocolConfig: .vmess(
+                server: server,
+                uuid: uuid,
+                security: try ConfigMapping.vmessSecurity(outbound.security),
+                tls: outbound.tlsSettings,
+                network: try outbound.streamTransport()
+            )
+        )
+    }
+
+    private func makeHTTP(_ outbound: SingboxOutbound) throws -> OutboundNode {
+        let tag = try outbound.requireTag()
+        let server = try ConfigMapping.endpoint(
+            host: try outbound.requireServer(),
+            port: try outbound.requirePort(),
+            field: "server_port"
+        )
+        return OutboundNode(
+            id: tag,
+            name: tag,
+            protocolConfig: .http(
+                server: server,
+                credentials: outbound.credentials,
+                tls: outbound.tlsSettings,
+                headers: outbound.headers?.compactMapValues(\.values.first) ?? [:]
+            )
+        )
+    }
+
+    private func makeSOCKS(_ outbound: SingboxOutbound) throws -> OutboundNode {
+        let tag = try outbound.requireTag()
+        if let version = outbound.version, version != "5" {
+            throw ConfigError.unsupportedValue("socks version \(version)")
+        }
+        let server = try ConfigMapping.endpoint(
+            host: try outbound.requireServer(),
+            port: try outbound.requirePort(),
+            field: "server_port"
+        )
+        return OutboundNode(
+            id: tag,
+            name: tag,
+            protocolConfig: .socks5(
+                server: server,
+                credentials: outbound.credentials,
+                tls: outbound.tlsSettings,
+                udp: outbound.network != "tcp"
             )
         )
     }
@@ -299,10 +375,64 @@ struct SingboxOutbound: Codable, Sendable {
     var interval: SingboxInterval?
     var tolerance: Int?
     var strategy: String?
+    var username: String?
+    var headers: [String: StringOrArray]?
+    var version: String?
+    /// `tcp` / `udp` limits a socks outbound to one network; unset is both.
+    var network: String?
+    var transport: SingboxTransport?
+    /// VMess body security.
+    var security: String?
+    /// Shadowsocks SIP003 plugin name and `key=value;…` options.
+    var plugin: String?
+    var pluginOpts: String?
 
     enum CodingKeys: String, CodingKey {
         case type, tag, server, method, password, uuid, flow, tls, outbounds, url, interval, tolerance, strategy
+        case username, headers, version, network, transport, security, plugin
+        case pluginOpts = "plugin_opts"
         case serverPort = "server_port"
+    }
+
+    /// The V2Ray `transport` block; unsupported types fail the outbound.
+    func streamTransport() throws -> StreamTransport {
+        guard let transport else { return .tcp }
+        let headers = transport.headers?.compactMapValues(\.values.first) ?? [:]
+        switch transport.type.lowercased() {
+        case "ws":
+            return .webSocket(WebSocketSettings.parsing(
+                path: transport.path ?? "/",
+                headers: headers,
+                maxEarlyData: transport.maxEarlyData ?? 0,
+                earlyDataHeaderName: transport.earlyDataHeaderName ?? ""
+            ))
+        case "httpupgrade":
+            return .httpUpgrade(HTTPUpgradeSettings(
+                path: transport.path ?? "/",
+                host: transport.host?.values.first,
+                headers: headers
+            ))
+        default:
+            throw ConfigError.unsupportedValue("transport \(transport.type)")
+        }
+    }
+
+    /// `username` / `password` for http / socks; `nil` when both are empty.
+    var credentials: ProxyCredentials? {
+        let user = username ?? ""
+        let pass = password ?? ""
+        guard !user.isEmpty || !pass.isEmpty else { return nil }
+        return ProxyCredentials(username: user, password: pass)
+    }
+
+    /// Network.framework TLS from an enabled `tls` block (no REALITY).
+    var tlsSettings: TLSSettings? {
+        guard let tls, tls.enabled == true else { return nil }
+        return TLSSettings(
+            serverName: tls.serverName,
+            skipCertVerify: tls.insecure ?? false,
+            alpn: tls.alpn.flatMap { $0.values.isEmpty ? nil : $0.values }
+        )
     }
 
     func requireTag() throws -> String {
@@ -318,6 +448,24 @@ struct SingboxOutbound: Codable, Sendable {
     func requirePort() throws -> Int {
         guard let serverPort else { throw ConfigError.missingField("server_port") }
         return serverPort
+    }
+}
+
+/// sing-box V2Ray transport (`ws`, `httpupgrade`, `grpc`, …).
+struct SingboxTransport: Codable, Sendable {
+    var type: String
+    var path: String?
+    var host: StringOrArray?
+    var headers: [String: StringOrArray]?
+    var maxEarlyData: Int?
+    var earlyDataHeaderName: String?
+    var serviceName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, path, host, headers
+        case maxEarlyData = "max_early_data"
+        case earlyDataHeaderName = "early_data_header_name"
+        case serviceName = "service_name"
     }
 }
 

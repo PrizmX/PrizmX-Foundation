@@ -18,6 +18,8 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
     public let skipCertVerify: Bool
     /// Offered ALPN (`nil` = `h2`, `http/1.1`).
     public let alpn: [String]?
+    /// Transport (`tcp`, `ws`, …). REALITY / Vision require `tcp`.
+    public let network: StreamTransport
 
     public init(
         server: Endpoint,
@@ -27,7 +29,8 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
         reality: REALITYConfig? = nil,
         flow: String? = nil,
         skipCertVerify: Bool = false,
-        alpn: [String]? = nil
+        alpn: [String]? = nil,
+        network: StreamTransport = .tcp
     ) {
         self.server = server
         self.uuid = uuid
@@ -37,6 +40,7 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
         self.flow = VLESSVision.normalized(flow)
         self.skipCertVerify = skipCertVerify
         self.alpn = alpn
+        self.network = network
     }
 
     public func connect(to endpoint: Endpoint) async throws -> any OutboundConnection {
@@ -49,7 +53,8 @@ public struct VLESSOutboundFactory: OutboundConnectionFactory, Sendable {
             reality: reality,
             flow: flow,
             skipCertVerify: skipCertVerify,
-            alpn: alpn
+            alpn: alpn,
+            network: network
         )
         return connection
     }
@@ -91,6 +96,7 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     public let command: VLESSCommand
     public let skipCertVerify: Bool
     public let alpn: [String]?
+    public let network: StreamTransport
 
     public var state: OutboundConnectionState {
         transport.state
@@ -142,6 +148,8 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     ///   - command: `tcp` (default) or `udp`.
     ///   - skipCertVerify: Accept any server certificate (explicit opt-in).
     ///   - alpn: Offered ALPN; `nil` keeps the platform / `h2,http/1.1` default.
+    ///   - network: Transport above TCP/TLS. Anything but `tcp` excludes
+    ///     REALITY and Vision (rejected at `open()`).
     public init(
         server: Endpoint,
         uuid: String,
@@ -152,7 +160,8 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         flow: String? = nil,
         command: VLESSCommand = .tcp,
         skipCertVerify: Bool = false,
-        alpn: [String]? = nil
+        alpn: [String]? = nil,
+        network: StreamTransport = .tcp
     ) throws {
         self.server = server
         self.endpoint = target
@@ -164,6 +173,7 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         self.command = command
         self.skipCertVerify = skipCertVerify
         self.alpn = alpn
+        self.network = network
         self.transport = NWStreamTransport(
             queueLabel: "prizmx.vless.outbound",
             endpoint: target,
@@ -196,7 +206,7 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
         try await transport.ensureOpen { try await self.connectAndHandshake() }
         await transport.readMutex.acquire()
         defer { transport.readMutex.release() }
-        try transport.ensureNotClosed()
+        try transport.ensureReadable()
 
         // Lock-free check: only the very first read may need `sendMutex`,
         // so a stalled upload never blocks the download direction.
@@ -370,6 +380,10 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
     // MARK: Handshake
 
     private func connectAndHandshake() async throws {
+        if network != .tcp {
+            try await connectOverTransport()
+            return
+        }
         guard server.port > 0, let nwPort = NWEndpoint.Port(rawValue: server.port) else {
             throw OutboundError.invalidEndpoint(server)
         }
@@ -417,6 +431,26 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
             throw error
         }
 
+        transport.markEstablished()
+    }
+
+    /// WebSocket-style transports: Network.framework TLS (when on) plus the
+    /// transport layer from the shared dialer, then the VLESS header.
+    private func connectOverTransport() async throws {
+        guard reality == nil, visionWriter == nil else {
+            transport.markClosed()
+            throw VLESSError.transportUnsupported(network.name)
+        }
+        let tls = tlsEnabled
+            ? TLSSettings(serverName: tlsServerName, skipCertVerify: skipCertVerify, alpn: alpn)
+            : nil
+        try await transport.dial(server, settings: StreamSettings(tls: tls, transport: network))
+        do {
+            try await sendRequestHeader()
+        } catch {
+            transport.failOpen()
+            throw error
+        }
         transport.markEstablished()
     }
 

@@ -10,7 +10,8 @@ import SwiftTCP
 
 private typealias IPv4Address = PrizmXProtocols.IPv4Address
 
-/// Consumes `TUNStack.udpDatagrams()` and forwards DIRECT / SS-UDP / VLESS-UDP.
+/// Consumes `TUNStack.udpDatagrams()` and forwards DIRECT or through the
+/// node's `DatagramOutbound` (SS / VLESS / Trojan UDP).
 ///
 /// The ingest loop never waits on the network: each flow gets its own worker
 /// with a small bounded inbox, and policy lookup / DNS / outbound `open()` /
@@ -280,66 +281,35 @@ private struct UDPSessionOpener: Sendable {
             break
         }
         guard case .node(let node) = leaf else { return nil }
-        switch node.protocolConfig {
-        case .direct:
+        if case .direct = node.protocolConfig {
             return await openDirect(route: route)
-        case .vless:
-            do {
-                // Use the leaf picked above; dispatching through the group
-                // again would re-pick (load-balance round-robin skew).
-                let outbound = try NodeFactory.makeConnection(
-                    from: node,
-                    to: datagram.destination,
-                    command: .udp
+        }
+        do {
+            // Use the leaf picked above; dispatching through the group
+            // again would re-pick (load-balance round-robin skew).
+            guard let outbound = try NodeFactory.makeDatagramOutbound(
+                from: node,
+                to: datagram.destination
+            ) else {
+                await dropUDP(
+                    onceKey: "udp-proxy-unsupported-\(node.id)",
+                    reason: "UDP dropped: node \(node.name) does not relay UDP"
                 )
-                try await DNSClient.$current.withValue(engine.dns) {
-                    try await outbound.open()
-                }
-                return StreamUDPSession(
-                    outbound: outbound,
-                    route: route,
-                    flow: datagram.flow,
-                    stack: stack,
-                    traffic: engine.traffic,
-                    attribution: attribution()
-                )
-            } catch {
                 return nil
             }
-        case .trojan, .anytls:
-            await dropUDP(
-                onceKey: "udp-proxy-unsupported",
-                reason: "UDP dropped: proxy protocol does not support UDP relay (trojan/anytls)"
-            )
-            return nil
-        case .shadowsocks(let server, let password, let cipher):
-            let parameters = NWParameters.udp
-            parameters.preferNoProxies = true
-            guard let port = NWEndpoint.Port(rawValue: server.port) else { return nil }
-            let host: NWEndpoint.Host
-            do {
-                host = try await DNSClient.$current.withValue(engine.dns) {
-                    try await DNSClient.resolve(server.host, role: .proxyServer)
-                }
-            } catch {
-                return nil
+            try await DNSClient.$current.withValue(engine.dns) {
+                try await outbound.open()
             }
-            let connection = NWConnection(
-                host: host,
-                port: port,
-                using: parameters
-            )
-            connection.start(queue: DispatchQueue.global(qos: .userInitiated))
-            return ShadowsocksUDPSession(
-                connection: connection,
-                preSharedKey: cipher.masterKey(fromPassword: password),
-                cipher: cipher,
+            return ProxyUDPSession(
+                outbound: outbound,
                 route: route,
                 flow: datagram.flow,
                 stack: stack,
                 traffic: engine.traffic,
                 attribution: attribution()
             )
+        } catch {
+            return nil
         }
     }
 }
@@ -418,10 +388,11 @@ private final class DirectUDPSession: UDPSession, @unchecked Sendable {
     }
 }
 
-private final class StreamUDPSession: UDPSession, @unchecked Sendable {
+/// A proxied flow: datagrams go through the node's `DatagramOutbound`.
+private final class ProxyUDPSession: UDPSession, @unchecked Sendable {
     let route: FlowRoute
     let attribution: FlowAttribution?
-    private let outbound: any OutboundConnection
+    private let outbound: any DatagramOutbound
     private let flow: FlowKey
     private let stack: TUNStack
     private let traffic: TrafficCounter
@@ -430,7 +401,7 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
     var lastActivity: ContinuousClock.Instant { activity.value }
 
     init(
-        outbound: any OutboundConnection,
+        outbound: any DatagramOutbound,
         route: FlowRoute,
         flow: FlowKey,
         stack: TUNStack,
@@ -445,24 +416,18 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
         self.traffic = traffic
     }
 
-    /// The outbound was opened against the first destination; the flow key
-    /// pins the destination, so `destination` always matches.
-    func send(_ payload: Data, destination _: Endpoint) async {
+    func send(_ payload: Data, destination: Endpoint) async {
         activity.touch()
-        try? await outbound.writeAll(UDPOverStreamFrame.encode(payload))
+        try? await outbound.send(payload, to: destination)
     }
 
     func pump() async {
-        var decoder = UDPOverStreamFrame.Decoder()
         do {
             while !Task.isCancelled {
-                let chunk = try await outbound.readData(upTo: 16 * 1024)
-                if chunk.isEmpty { break }
+                guard let payload = try await outbound.receive() else { break }
                 activity.touch()
-                for payload in decoder.feed(chunk) {
-                    traffic.addBytes(up: 0, down: UInt64(payload.count), route: route, app: attribution, transport: .udp)
-                    await stack.sendUDP(flow: flow, payload: payload)
-                }
+                traffic.addBytes(up: 0, down: UInt64(payload.count), route: route, app: attribution, transport: .udp)
+                await stack.sendUDP(flow: flow, payload: payload)
             }
         } catch {
             // Closed.
@@ -472,68 +437,5 @@ private final class StreamUDPSession: UDPSession, @unchecked Sendable {
 
     func close() async {
         await outbound.close()
-    }
-}
-
-private final class ShadowsocksUDPSession: UDPSession, @unchecked Sendable {
-    let route: FlowRoute
-    let attribution: FlowAttribution?
-    private let connection: NWConnection
-    private let preSharedKey: [UInt8]
-    private let cipher: ShadowsocksCipher
-    private let flow: FlowKey
-    private let stack: TUNStack
-    private let traffic: TrafficCounter
-    private let activity = ActivityStamp()
-
-    var lastActivity: ContinuousClock.Instant { activity.value }
-
-    init(
-        connection: NWConnection,
-        preSharedKey: [UInt8],
-        cipher: ShadowsocksCipher,
-        route: FlowRoute,
-        flow: FlowKey,
-        stack: TUNStack,
-        traffic: TrafficCounter,
-        attribution: FlowAttribution?
-    ) {
-        self.connection = connection
-        self.preSharedKey = preSharedKey
-        self.cipher = cipher
-        self.route = route
-        self.attribution = attribution
-        self.flow = flow
-        self.stack = stack
-        self.traffic = traffic
-    }
-
-    func send(_ payload: Data, destination: Endpoint) async {
-        activity.touch()
-        guard let packet = try? ShadowsocksUDP.encode(
-            cipher: cipher,
-            preSharedKey: preSharedKey,
-            destination: destination,
-            payload: payload
-        ) else { return }
-        connection.send(content: packet, completion: .contentProcessed { _ in })
-    }
-
-    func pump() async {
-        while !Task.isCancelled {
-            guard let data = await connection.receiveDatagram(), !data.isEmpty else { return }
-            guard let decoded = try? ShadowsocksUDP.decode(
-                cipher: cipher,
-                preSharedKey: preSharedKey,
-                packet: data
-            ) else { continue }
-            activity.touch()
-            traffic.addBytes(up: 0, down: UInt64(decoded.payload.count), route: route, app: attribution, transport: .udp)
-            await stack.sendUDP(flow: flow, payload: decoded.payload)
-        }
-    }
-
-    func close() async {
-        connection.cancel()
     }
 }

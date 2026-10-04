@@ -37,6 +37,9 @@ public enum VLESSError: Error, Equatable, Sendable {
     case invalidAddressType(UInt8)
     /// Command byte is not TCP / UDP.
     case invalidCommand(UInt8)
+    /// REALITY / Vision need raw TCP; they cannot ride a WebSocket-style
+    /// transport.
+    case transportUnsupported(String)
 }
 
 // MARK: - Command / address type

@@ -128,7 +128,7 @@ struct ShadowsocksNonceTests {
 @Suite("Shadowsocks AEAD chunks")
 struct ShadowsocksChunkTests {
 
-    @Test(arguments: [ShadowsocksCipher.aes128GCM, .aes256GCM])
+    @Test(arguments: ShadowsocksCipher.allCases)
     func roundTripSingleChunk(cipher: ShadowsocksCipher) throws {
         let psk = cipher.masterKey(fromPassword: "correct horse")
         let salt = [UInt8](repeating: 0xAB, count: cipher.saltByteCount)
@@ -140,6 +140,28 @@ struct ShadowsocksChunkTests {
         #expect(sealed.count == ShadowsocksAEAD.sealedChunkByteCount(plaintextCount: plaintext.count))
         #expect(try decoder.openChunk(sealed) == plaintext)
         #expect(encoder.nonce.bytes == decoder.nonce.bytes)
+    }
+
+    /// Reference chunks sealed by Node.js `crypto` (HKDF-SHA1 subkey, SIP004
+    /// framing) for password "test", salt 0x11…, payload "hello".
+    @Test(arguments: [
+        (
+            ShadowsocksCipher.chacha20IETFPoly1305,
+            "bbcc0ab6bd7c04135c777fe99537a01da3b88c50ace5625c5cc7ef0943a0cdec8f194225c6eedd"
+        ),
+        (
+            ShadowsocksCipher.aes192GCM,
+            "c69fc055d20323aaa9efe93aaf61662982a04437ed21f4529d5c9c42ffd6fef404eff431138491"
+        ),
+    ])
+    func matchesReferenceChunk(cipher: ShadowsocksCipher, sealedHex: String) throws {
+        let psk = cipher.masterKey(fromPassword: "test")
+        let salt = [UInt8](repeating: 0x11, count: cipher.saltByteCount)
+        var encoder = try ShadowsocksAEADContext(cipher: cipher, preSharedKey: psk, salt: salt)
+        #expect(try encoder.sealChunk(utf8("hello")) == bytes(hex: sealedHex))
+
+        var decoder = try ShadowsocksAEADContext(cipher: cipher, preSharedKey: psk, salt: salt)
+        #expect(try decoder.openChunk(bytes(hex: sealedHex)) == utf8("hello"))
     }
 
     @Test func roundTripMultipleChunksPreservesOrder() throws {
@@ -284,8 +306,8 @@ struct ShadowsocksAddressTests {
 @Suite("Shadowsocks UDP AEAD")
 struct ShadowsocksUDPTests {
 
-    @Test func datagramRoundTrip() throws {
-        let cipher = ShadowsocksCipher.aes128GCM
+    @Test(arguments: ShadowsocksCipher.allCases)
+    func datagramRoundTrip(cipher: ShadowsocksCipher) throws {
         let key = cipher.masterKey(fromPassword: "udp-secret")
         let destination = Endpoint(domain: "example.com", port: 443)
         let payload = Data([0xDE, 0xAD, 0xBE, 0xEF])
