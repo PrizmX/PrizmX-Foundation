@@ -240,4 +240,20 @@ struct ProtocolImportTests {
         guard case .shadowsocks(_, _, _, let plugin) = node.protocolConfig else { Issue.record("\(node)"); return }
         #expect(plugin == .obfs(SimpleObfsSettings(mode: .http, host: "cdn.example")))
     }
+
+    // MARK: Labels
+
+    @Test func typeNamesDriveExcludeType() throws {
+        let result = try ClashConfigParser().parseWithWarnings(rawString: """
+        proxies:
+          - {name: s, type: ss, server: 1.1.1.1, port: 8388, cipher: aes-128-gcm, password: p}
+          - {name: v, type: vmess, server: 1.1.1.1, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811}
+          - {name: h, type: http, server: 1.1.1.1, port: 443, tls: true}
+        proxy-groups:
+          - {name: G, type: select, include-all: true, exclude-type: "vmess|http"}
+        """)
+        #expect(result.nodeManager.group(named: "G")?.nodeIDs == ["s"])
+        let labels = ["s", "v", "h"].compactMap { result.nodeManager.node(id: $0)?.protocolConfig.displayName }
+        #expect(labels == ["SS", "VMess", "HTTPS"])
+    }
 }

@@ -54,6 +54,39 @@ public enum ProtocolConfig: Sendable, Hashable {
     case direct
 }
 
+extension ProtocolConfig {
+    /// Lowercase protocol name as Clash / mihomo `type` and `exclude-type`
+    /// spell it (`shadowsocks`, `vmess`, `socks5`, …).
+    public var typeName: String {
+        switch self {
+        case .shadowsocks: "shadowsocks"
+        case .vmess: "vmess"
+        case .vless: "vless"
+        case .trojan: "trojan"
+        case .anytls: "anytls"
+        case .http: "http"
+        case .socks5: "socks5"
+        case .direct: "direct"
+        }
+    }
+
+    /// Short label for node lists (`SS`, `VMess`, `HTTPS`, …). Hosts show
+    /// this instead of switching over the cases themselves, so a new
+    /// protocol needs no app change.
+    public var displayName: String {
+        switch self {
+        case .shadowsocks: "SS"
+        case .vmess: "VMess"
+        case .vless: "VLESS"
+        case .trojan: "Trojan"
+        case .anytls: "AnyTLS"
+        case .http(_, _, let tls, _): tls == nil ? "HTTP" : "HTTPS"
+        case .socks5: "SOCKS5"
+        case .direct: "Direct"
+        }
+    }
+}
+
 /// A named outbound node (one Shadowsocks / VLESS / Direct configuration).
 public struct OutboundNode: Sendable, Hashable, Identifiable {
     public let id: String

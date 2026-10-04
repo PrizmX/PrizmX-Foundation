@@ -412,23 +412,10 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
         }
         return nodes.compactMap { node in
-            if excludedTypes.contains(Self.typeName(node.protocolConfig)) { return nil }
+            if excludedTypes.contains(node.protocolConfig.typeName) { return nil }
             if !include.isEmpty, !include.contains(where: { matches($0, node.name) }) { return nil }
             if exclude.contains(where: { matches($0, node.name) }) { return nil }
             return node.id
-        }
-    }
-
-    private static func typeName(_ config: ProtocolConfig) -> String {
-        switch config {
-        case .shadowsocks: "shadowsocks"
-        case .vless: "vless"
-        case .trojan: "trojan"
-        case .anytls: "anytls"
-        case .vmess: "vmess"
-        case .http: "http"
-        case .socks5: "socks5"
-        case .direct: "direct"
         }
     }
 
