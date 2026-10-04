@@ -1,0 +1,68 @@
+# Interop stack for `Interop/run.sh` (see Interop/README.md).
+#
+#   macOS host ──published ports──▶ proxy servers ──▶ targets network ──▶ target
+#
+# `targets` is internal: it has no published ports and no route out, so a
+# request that reaches web.test / dns.test / echo.test went through a proxy.
+# `mihomo` is the reference client; it loads the same profile.
+name: prizmx-interop
+
+networks:
+  edge: {}
+  targets:
+    internal: true
+
+services:
+  target:
+    build: ./target
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      targets:
+        aliases: [web.test, dns.test, echo.test]
+
+  sing-box:
+    image: ghcr.io/sagernet/sing-box:v1.14.2
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    volumes:
+      - ./servers/sing-box.json:/etc/sing-box/config.json:ro
+      - ./certs:/certs:ro
+    networks: [edge, targets]
+    ports:
+      - "10001-10099:10001-10099/tcp"
+      - "10001-10099:10001-10099/udp"
+    depends_on: [target]
+
+  xray:
+    image: ghcr.io/xtls/xray-core:26.3.27
+    command: ["run", "-c", "/etc/xray/config.json"]
+    volumes:
+      - ./servers/xray.json:/etc/xray/config.json:ro
+      - ./certs:/certs:ro
+    networks: [edge, targets]
+    ports:
+      - "10100-10199:10100-10199/tcp"
+      - "10100-10199:10100-10199/udp"
+    depends_on: [target]
+
+  ss-libev:
+    build: ./servers/ss-libev
+    volumes:
+      - ./certs:/certs:ro
+    networks: [edge, targets]
+    ports:
+      - "10200-10299:10200-10299/tcp"
+      - "10200-10299:10200-10299/udp"
+    depends_on: [target]
+
+  mihomo:
+    image: metacubex/mihomo:v1.19.32
+    volumes:
+      - ./.generated/mihomo.yaml:/root/.config/mihomo/config.yaml:ro
+    networks: [edge]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "17890:7890"
+      - "19090:9090"
+    depends_on: [sing-box, xray, ss-libev]

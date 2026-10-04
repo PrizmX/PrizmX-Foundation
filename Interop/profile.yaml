@@ -1,0 +1,66 @@
+# PrizmX interop profile: one node per protocol variant, all reachable on
+# 127.0.0.1 through the ports docker-compose.yml publishes.
+#
+# The suite imports this file through the real config importer, starts the
+# engine's mixed-port, and runs every node through it. mihomo loads the same
+# nodes as the reference client (run.sh rewrites 127.0.0.1 for it).
+#
+# `interop:` holds what the suite expects of a node (default false / true):
+#   udp:        UDP relay works (DNS query + datagram echo)
+#   half-close: closeWrite reaches the target as EOF (TCP FIN or an in-band
+#               end marker; not WebSocket / mux / simple-obfs / NW TLS)
+#   reference:  mihomo must also pass (default true)
+#   singbox:    profile.singbox.json carries an equivalent node (default true)
+#   known-issue: {<family>: "reason"} for open bugs; those scenarios run as
+#               known issues (reported, not failing) until fixed. Families:
+#               http, https, tcp, half-close, udp
+# Node names are `<protocol>-<variant>@<server>`.
+
+proxies:
+  # sing-box ------------------------------------------------------------------
+  - {name: ss-aes128@sing-box, type: ss, server: 127.0.0.1, port: 10001, cipher: aes-128-gcm, password: interop, udp: true, interop: {udp: true, half-close: true}}
+  - {name: ss-chacha@sing-box, type: ss, server: 127.0.0.1, port: 10002, cipher: chacha20-ietf-poly1305, password: interop, udp: true, interop: {udp: true, half-close: true}}
+  - {name: ss-aes192@sing-box, type: ss, server: 127.0.0.1, port: 10003, cipher: aes-192-gcm, password: interop, udp: true, interop: {udp: true, half-close: true}}
+  - {name: trojan-tls@sing-box, type: trojan, server: 127.0.0.1, port: 10010, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, udp: true, interop: {udp: true}}
+  - {name: trojan-ws-tls@sing-box, type: trojan, server: 127.0.0.1, port: 10011, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, network: ws, ws-opts: {path: /trojan, headers: {Host: interop.prizmx.test}}, udp: true, interop: {udp: true}}
+  - {name: socks5-auth@sing-box, type: socks5, server: 127.0.0.1, port: 10020, username: u, password: interop, udp: true, interop: {udp: true, half-close: true}}
+  - {name: socks5@sing-box, type: socks5, server: 127.0.0.1, port: 10023, udp: true, interop: {udp: true, half-close: true}}
+  - {name: http-auth@sing-box, type: http, server: 127.0.0.1, port: 10021, username: u, password: interop, interop: {half-close: true}}
+  - {name: https-auth@sing-box, type: http, server: 127.0.0.1, port: 10022, username: u, password: interop, tls: true, sni: interop.prizmx.test, skip-cert-verify: true, interop: {}}
+  - {name: vmess-tcp@sing-box, type: vmess, server: 127.0.0.1, port: 10030, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-tcp-chacha@sing-box, type: vmess, server: 127.0.0.1, port: 10030, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: chacha20-poly1305, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-tcp-none@sing-box, type: vmess, server: 127.0.0.1, port: 10030, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: none, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-tcp-zero@sing-box, type: vmess, server: 127.0.0.1, port: 10030, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: zero, interop: {half-close: true}}
+  - {name: vmess-ws@sing-box, type: vmess, server: 127.0.0.1, port: 10031, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, network: ws, ws-opts: {path: /vmess}, udp: true, interop: {udp: true}}
+  - {name: vmess-ws-tls@sing-box, type: vmess, server: 127.0.0.1, port: 10032, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, network: ws, ws-opts: {path: /vmess}, udp: true, interop: {udp: true}}
+  - {name: vless-tcp@sing-box, type: vless, server: 127.0.0.1, port: 10052, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: false, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vless-ws@sing-box, type: vless, server: 127.0.0.1, port: 10040, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: false, network: ws, ws-opts: {path: /vless}, udp: true, interop: {udp: true}}
+  - {name: vless-ws-tls@sing-box, type: vless, server: 127.0.0.1, port: 10041, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, network: ws, ws-opts: {path: /vless}, udp: true, interop: {udp: true}}
+  - {name: vless-httpupgrade@sing-box, type: vless, server: 127.0.0.1, port: 10042, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: false, network: ws, ws-opts: {path: /up, v2ray-http-upgrade: true}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vless-ws-ed@sing-box, type: vless, server: 127.0.0.1, port: 10043, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: false, network: ws, ws-opts: {path: /ed, max-early-data: 2048, early-data-header-name: Sec-WebSocket-Protocol}, udp: true, interop: {udp: true}}
+  - {name: vless-tls-vision@sing-box, type: vless, server: 127.0.0.1, port: 10051, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, flow: xtls-rprx-vision, udp: true, interop: {udp: true, half-close: true, known-issue: {udp: "Vision users need UDP as XUDP over mux.cool; sing-box rejects plain VLESS UDP"}}}
+  - {name: anytls@sing-box, type: anytls, server: 127.0.0.1, port: 10050, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, interop: {}}
+
+  # Xray ----------------------------------------------------------------------
+  - {name: vmess-tcp@xray, type: vmess, server: 127.0.0.1, port: 10100, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-tcp-chacha@xray, type: vmess, server: 127.0.0.1, port: 10100, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: chacha20-poly1305, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-tcp-none@xray, type: vmess, server: 127.0.0.1, port: 10100, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: none, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-tcp-zero@xray, type: vmess, server: 127.0.0.1, port: 10100, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: zero, interop: {half-close: true}}
+  - {name: vmess-ws@xray, type: vmess, server: 127.0.0.1, port: 10101, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, network: ws, ws-opts: {path: /vmess}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vmess-ws-tls@xray, type: vmess, server: 127.0.0.1, port: 10102, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, network: ws, ws-opts: {path: /vmess}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: ss-chacha@xray, type: ss, server: 127.0.0.1, port: 10110, cipher: chacha20-ietf-poly1305, password: interop, udp: true, interop: {udp: true, half-close: true}}
+  - {name: trojan-tls@xray, type: trojan, server: 127.0.0.1, port: 10111, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, udp: true, interop: {udp: true}}
+  - {name: vless-reality-vision@xray, type: vless, server: 127.0.0.1, port: 10120, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: web.test, flow: xtls-rprx-vision, client-fingerprint: chrome, reality-opts: {public-key: Ewd11OB6lhe3-lyTgKFPcTzMbLXIeYpdaUihxjyiRR0, short-id: 0123456789abcdef}, udp: true, interop: {udp: true, half-close: true}}
+  - {name: vless-tls-vision@xray, type: vless, server: 127.0.0.1, port: 10121, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, flow: xtls-rprx-vision, udp: true, interop: {udp: true, half-close: true}}
+
+  # shadowsocks-libev + SIP003 plugins -----------------------------------------
+  - {name: ss-obfs-http@ss-libev, type: ss, server: 127.0.0.1, port: 10200, cipher: aes-128-gcm, password: interop, plugin: obfs, plugin-opts: {mode: http, host: cdn.prizmx.test}, udp: true, interop: {udp: true}}
+  - {name: ss-obfs-tls@ss-libev, type: ss, server: 127.0.0.1, port: 10201, cipher: aes-128-gcm, password: interop, plugin: obfs, plugin-opts: {mode: tls, host: cdn.prizmx.test}, udp: true, interop: {udp: true}}
+  - {name: ss-v2ray-ws@ss-libev, type: ss, server: 127.0.0.1, port: 10202, cipher: aes-128-gcm, password: interop, plugin: v2ray-plugin, plugin-opts: {mode: websocket, path: /v2, mux: true}, udp: true, interop: {udp: true}}
+  - {name: ss-v2ray-ws-tls@ss-libev, type: ss, server: 127.0.0.1, port: 10203, cipher: aes-128-gcm, password: interop, plugin: v2ray-plugin, plugin-opts: {mode: websocket, tls: true, host: interop.prizmx.test, path: /v2, mux: true, skip-cert-verify: true}, udp: true, interop: {udp: true}}
+
+proxy-groups:
+  - {name: Interop, type: select, include-all: true}
+
+rules:
+  - MATCH,Interop

@@ -1,0 +1,456 @@
+{
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-aes128@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10001,
+      "method": "aes-128-gcm",
+      "password": "interop"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-chacha@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10002,
+      "method": "chacha20-ietf-poly1305",
+      "password": "interop"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-aes192@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10003,
+      "method": "aes-192-gcm",
+      "password": "interop"
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-tls@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10010,
+      "password": "interop",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-ws-tls@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10011,
+      "password": "interop",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/trojan",
+        "headers": {
+          "Host": "interop.prizmx.test"
+        }
+      }
+    },
+    {
+      "type": "socks",
+      "tag": "socks5-auth@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10020,
+      "version": "5",
+      "username": "u",
+      "password": "interop"
+    },
+    {
+      "type": "socks",
+      "tag": "socks5@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10023,
+      "version": "5"
+    },
+    {
+      "type": "http",
+      "tag": "http-auth@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10021,
+      "username": "u",
+      "password": "interop"
+    },
+    {
+      "type": "http",
+      "tag": "https-auth@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10022,
+      "username": "u",
+      "password": "interop",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10030,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "alter_id": 0
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp-chacha@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10030,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "chacha20-poly1305",
+      "alter_id": 0
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp-none@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10030,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "none",
+      "alter_id": 0
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp-zero@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10030,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "zero",
+      "alter_id": 0
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10031,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "alter_id": 0,
+      "transport": {
+        "type": "ws",
+        "path": "/vmess"
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws-tls@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10032,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "alter_id": 0,
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vmess"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-tcp@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10052,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10040,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "transport": {
+        "type": "ws",
+        "path": "/vless"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-tls@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10041,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vless"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-httpupgrade@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10042,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "transport": {
+        "type": "httpupgrade",
+        "path": "/up"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-ed@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10043,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "transport": {
+        "type": "ws",
+        "path": "/ed",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-tls-vision@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10051,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls@sing-box",
+      "server": "127.0.0.1",
+      "server_port": 10050,
+      "password": "interop",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp@xray",
+      "server": "127.0.0.1",
+      "server_port": 10100,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "alter_id": 0
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp-chacha@xray",
+      "server": "127.0.0.1",
+      "server_port": 10100,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "chacha20-poly1305",
+      "alter_id": 0
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp-none@xray",
+      "server": "127.0.0.1",
+      "server_port": 10100,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "none",
+      "alter_id": 0
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp-zero@xray",
+      "server": "127.0.0.1",
+      "server_port": 10100,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "zero",
+      "alter_id": 0
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws@xray",
+      "server": "127.0.0.1",
+      "server_port": 10101,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "alter_id": 0,
+      "transport": {
+        "type": "ws",
+        "path": "/vmess"
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws-tls@xray",
+      "server": "127.0.0.1",
+      "server_port": 10102,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "alter_id": 0,
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vmess"
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-chacha@xray",
+      "server": "127.0.0.1",
+      "server_port": 10110,
+      "method": "chacha20-ietf-poly1305",
+      "password": "interop"
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-tls@xray",
+      "server": "127.0.0.1",
+      "server_port": 10111,
+      "password": "interop",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-reality-vision@xray",
+      "server": "127.0.0.1",
+      "server_port": 10120,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "web.test",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "Ewd11OB6lhe3-lyTgKFPcTzMbLXIeYpdaUihxjyiRR0",
+          "short_id": "0123456789abcdef"
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-tls-vision@xray",
+      "server": "127.0.0.1",
+      "server_port": 10121,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "interop.prizmx.test",
+        "insecure": true
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-obfs-http@ss-libev",
+      "server": "127.0.0.1",
+      "server_port": 10200,
+      "method": "aes-128-gcm",
+      "password": "interop",
+      "plugin": "obfs-local",
+      "plugin_opts": "obfs=http;obfs-host=cdn.prizmx.test"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-obfs-tls@ss-libev",
+      "server": "127.0.0.1",
+      "server_port": 10201,
+      "method": "aes-128-gcm",
+      "password": "interop",
+      "plugin": "obfs-local",
+      "plugin_opts": "obfs=tls;obfs-host=cdn.prizmx.test"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-v2ray-ws@ss-libev",
+      "server": "127.0.0.1",
+      "server_port": 10202,
+      "method": "aes-128-gcm",
+      "password": "interop",
+      "plugin": "v2ray-plugin",
+      "plugin_opts": "mode=websocket;path=/v2;mux=1"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-v2ray-ws-tls@ss-libev",
+      "server": "127.0.0.1",
+      "server_port": 10203,
+      "method": "aes-128-gcm",
+      "password": "interop",
+      "plugin": "v2ray-plugin",
+      "plugin_opts": "mode=websocket;tls;host=interop.prizmx.test;path=/v2;mux=1;skip-cert-verify"
+    },
+    {
+      "type": "selector",
+      "tag": "Interop",
+      "outbounds": [
+        "ss-aes128@sing-box",
+        "ss-chacha@sing-box",
+        "ss-aes192@sing-box",
+        "trojan-tls@sing-box",
+        "trojan-ws-tls@sing-box",
+        "socks5-auth@sing-box",
+        "socks5@sing-box",
+        "http-auth@sing-box",
+        "https-auth@sing-box",
+        "vmess-tcp@sing-box",
+        "vmess-tcp-chacha@sing-box",
+        "vmess-tcp-none@sing-box",
+        "vmess-tcp-zero@sing-box",
+        "vmess-ws@sing-box",
+        "vmess-ws-tls@sing-box",
+        "vless-tcp@sing-box",
+        "vless-ws@sing-box",
+        "vless-ws-tls@sing-box",
+        "vless-httpupgrade@sing-box",
+        "vless-ws-ed@sing-box",
+        "vless-tls-vision@sing-box",
+        "anytls@sing-box",
+        "vmess-tcp@xray",
+        "vmess-tcp-chacha@xray",
+        "vmess-tcp-none@xray",
+        "vmess-tcp-zero@xray",
+        "vmess-ws@xray",
+        "vmess-ws-tls@xray",
+        "ss-chacha@xray",
+        "trojan-tls@xray",
+        "vless-reality-vision@xray",
+        "vless-tls-vision@xray",
+        "ss-obfs-http@ss-libev",
+        "ss-obfs-tls@ss-libev",
+        "ss-v2ray-ws@ss-libev",
+        "ss-v2ray-ws-tls@ss-libev"
+      ]
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "Interop"
+  }
+}

@@ -45,6 +45,8 @@ Half-close reaches the server where the path can carry it (TCP FIN, VMess's end 
 
 **Not implemented**: Hysteria, TUIC, WireGuard, Shadowsocks 2022, ShadowsocksR, gRPC / HTTP2 transport, VMess legacy `alterId > 0` auth, `client-fingerprint`, `packet-encoding: xudp`, Mux.
 
+`Interop/` runs every protocol against real servers (sing-box, Xray, shadowsocks-libev) in Docker, with mihomo as the reference client; see [Interop/README.md](Interop/README.md).
+
 ## Develop
 
 ```bash

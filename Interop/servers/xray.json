@@ -1,0 +1,156 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "vmess-tcp",
+      "port": 10100,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811"
+          }
+        ]
+      }
+    },
+    {
+      "tag": "vmess-ws",
+      "port": 10101,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vmess"
+        }
+      }
+    },
+    {
+      "tag": "vmess-ws-tls",
+      "port": 10102,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "wsSettings": {
+          "path": "/vmess"
+        },
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/certs/server.crt",
+              "keyFile": "/certs/server.key"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "tag": "ss-chacha",
+      "port": 10110,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "chacha20-ietf-poly1305",
+        "password": "interop",
+        "network": "tcp,udp"
+      }
+    },
+    {
+      "tag": "trojan-tls",
+      "port": 10111,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {
+            "password": "interop"
+          }
+        ]
+      },
+      "streamSettings": {
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/certs/server.crt",
+              "keyFile": "/certs/server.key"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "tag": "vless-reality-vision",
+      "port": 10120,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "web.test:443",
+          "serverNames": [
+            "web.test"
+          ],
+          "privateKey": "-HeVI9soj4YO3R6nTrzMu1dbwBKlDyUJY2qOXVq6MGQ",
+          "shortIds": [
+            "0123456789abcdef"
+          ]
+        }
+      }
+    },
+    {
+      "tag": "vless-tls-vision",
+      "port": 10121,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/certs/server.crt",
+              "keyFile": "/certs/server.key"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom"
+    }
+  ]
+}

@@ -1,0 +1,279 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-aes128",
+      "listen": "::",
+      "listen_port": 10001,
+      "method": "aes-128-gcm",
+      "password": "interop"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-chacha",
+      "listen": "::",
+      "listen_port": 10002,
+      "method": "chacha20-ietf-poly1305",
+      "password": "interop"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-aes192",
+      "listen": "::",
+      "listen_port": 10003,
+      "method": "aes-192-gcm",
+      "password": "interop"
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-tls",
+      "listen": "::",
+      "listen_port": 10010,
+      "users": [
+        {
+          "password": "interop"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-ws-tls",
+      "listen": "::",
+      "listen_port": 10011,
+      "users": [
+        {
+          "password": "interop"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/trojan"
+      }
+    },
+    {
+      "type": "socks",
+      "tag": "socks-auth",
+      "listen": "::",
+      "listen_port": 10020,
+      "users": [
+        {
+          "username": "u",
+          "password": "interop"
+        }
+      ]
+    },
+    {
+      "type": "http",
+      "tag": "http-auth",
+      "listen": "::",
+      "listen_port": 10021,
+      "users": [
+        {
+          "username": "u",
+          "password": "interop"
+        }
+      ]
+    },
+    {
+      "type": "http",
+      "tag": "https-auth",
+      "listen": "::",
+      "listen_port": 10022,
+      "users": [
+        {
+          "username": "u",
+          "password": "interop"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      }
+    },
+    {
+      "type": "socks",
+      "tag": "socks-open",
+      "listen": "::",
+      "listen_port": 10023
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp",
+      "listen": "::",
+      "listen_port": 10030,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "alterId": 0
+        }
+      ]
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws",
+      "listen": "::",
+      "listen_port": 10031,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "alterId": 0
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/vmess"
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws-tls",
+      "listen": "::",
+      "listen_port": 10032,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "alterId": 0
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vmess"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws",
+      "listen": "::",
+      "listen_port": 10040,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/vless"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-tls",
+      "listen": "::",
+      "listen_port": 10041,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vless"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-httpupgrade",
+      "listen": "::",
+      "listen_port": 10042,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+        }
+      ],
+      "transport": {
+        "type": "httpupgrade",
+        "path": "/up"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-ed",
+      "listen": "::",
+      "listen_port": 10043,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/ed",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls",
+      "listen": "::",
+      "listen_port": 10050,
+      "users": [
+        {
+          "password": "interop"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-tls-vision",
+      "listen": "::",
+      "listen_port": 10051,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/certs/server.crt",
+        "key_path": "/certs/server.key"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-tcp",
+      "listen": "::",
+      "listen_port": 10052,
+      "users": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+        }
+      ]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct"
+    }
+  ]
+}

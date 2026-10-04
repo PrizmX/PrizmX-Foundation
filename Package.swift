@@ -88,6 +88,12 @@ let package = Package(
             dependencies: ["PrizmXAttribution", "PrizmXCore"]
         ),
         .testTarget(name: "PrizmXScriptsTests", dependencies: ["PrizmXScripts"]),
+        // Opt-in suite against real servers (Interop/run.sh); the profile
+        // checks in it run everywhere.
+        .testTarget(
+            name: "PrizmXInteropTests",
+            dependencies: ["PrizmXConfig", "PrizmXCore", "PrizmXNodes", "PrizmXRules", "PrizmXProtocols"]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
