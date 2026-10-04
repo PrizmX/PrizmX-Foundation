@@ -197,18 +197,37 @@ public enum EngineTCPRelay: Sendable {
                 await outbound.close()
             }
             group.addTask {
+                // Pipelined: the next outbound read overlaps the previous
+                // client write. Protocols that return one small record per
+                // read (Shadowsocks, VMess) otherwise wait out every write.
+                let pipe = RelayPipe(capacity: Self.downlinkPipeBytes)
+                let reader = Task {
+                    do {
+                        while true {
+                            let data = try await outbound.readData(upTo: Self.readChunkBytes)
+                            tally.touch()
+                            guard !data.isEmpty else {
+                                pipe.finish()
+                                return
+                            }
+                            guard await pipe.push(data) else { return }
+                        }
+                    } catch {
+                        pipe.finish(throwing: error)
+                    }
+                }
                 do {
-                    while true {
-                        let data = try await outbound.readData(upTo: 16 * 1024)
-                        tally.touch()
-                        if data.isEmpty {
-                            tally.remoteEnded("eof")
-                            break
+                    while var data = try await pipe.pop() {
+                        // Coalesce what the reader queued meanwhile: each
+                        // client write has a fixed cost, small records add up.
+                        while data.count < Self.downlinkPipeBytes, let more = pipe.tryPop() {
+                            data.append(more)
                         }
                         try await inbound.write(data)
                         tally.addDown(data.count)
                         record(0, UInt64(data.count))
                     }
+                    tally.remoteEnded("eof")
                     if inbound.supportsHalfClose {
                         // FIN toward the client; its remaining upload still flows.
                         await inbound.closeWrite()
@@ -217,7 +236,12 @@ public enum EngineTCPRelay: Sendable {
                     }
                 } catch {
                     tally.remoteEnded("error")
+                    // A failed client write leaves the reader parked in an
+                    // outbound read; closing the outbound releases it.
+                    pipe.cancel()
+                    await outbound.close()
                 }
+                _ = await reader.result
                 await inbound.close()
             }
             await group.waitForAll()
@@ -227,6 +251,11 @@ public enum EngineTCPRelay: Sendable {
         await inbound.close()
         return tally.snapshot()
     }
+
+    /// Largest outbound read per relay step (matches the inbound reads).
+    static let readChunkBytes = 64 * 1024
+    /// Downlink bytes read ahead of the client while a write is pending.
+    static let downlinkPipeBytes = 256 * 1024
 
     static func isLoopbackClient(_ address: String) -> Bool {
         if address.isEmpty { return true }
@@ -375,6 +404,175 @@ final class PrefixedInboundStream: InboundStream, @unchecked Sendable {
     func write(_ data: Data) async throws { try await inner.write(data) }
     func close() async { await inner.close() }
     func closeWrite() async { await inner.closeWrite() }
+}
+
+/// Bounded single-producer / single-consumer byte queue between the relay's
+/// downlink reader and writer. `push` waits while `capacity` bytes are
+/// queued; `cancel` (consumer gone) makes pushes return `false`.
+final class RelayPipe: @unchecked Sendable {
+    private struct State {
+        var chunks: [Data] = []
+        var head = 0
+        var bytes = 0
+        var finished = false
+        var cancelled = false
+        var failure: Error?
+        var consumer: CheckedContinuation<Data?, Error>?
+        var producer: CheckedContinuation<Bool, Never>?
+    }
+
+    let capacity: Int
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(capacity: Int) {
+        self.capacity = capacity
+    }
+
+    /// Queues `data`; `false` once the consumer cancelled.
+    func push(_ data: Data) async -> Bool {
+        enum Step { case delivered(CheckedContinuation<Data?, Error>), queued, full, cancelled }
+        let step: Step = state.withLock { current in
+            if current.cancelled { return .cancelled }
+            if let consumer = current.consumer {
+                current.consumer = nil
+                return .delivered(consumer)
+            }
+            current.chunks.append(data)
+            current.bytes += data.count
+            return current.bytes >= capacity ? .full : .queued
+        }
+        switch step {
+        case .delivered(let consumer):
+            consumer.resume(returning: data)
+            return true
+        case .queued:
+            return true
+        case .cancelled:
+            return false
+        case .full:
+            return await withCheckedContinuation { continuation in
+                let resumeNow: Bool? = state.withLock { current in
+                    if current.cancelled { return false }
+                    if current.bytes < capacity { return true }
+                    current.producer = continuation
+                    return nil
+                }
+                if let resumeNow { continuation.resume(returning: resumeNow) }
+            }
+        }
+    }
+
+    /// No more data; `error` is rethrown by `pop` after the queued data.
+    func finish(throwing error: Error? = nil) {
+        let consumer = state.withLock { current -> CheckedContinuation<Data?, Error>? in
+            current.finished = true
+            current.failure = error
+            defer { current.consumer = nil }
+            return current.consumer
+        }
+        if let error {
+            consumer?.resume(throwing: error)
+        } else {
+            consumer?.resume(returning: nil)
+        }
+    }
+
+    /// A queued chunk without waiting; `nil` when none is queued.
+    func tryPop() -> Data? {
+        let (data, producer): (Data?, CheckedContinuation<Bool, Never>?) = state.withLock { current in
+            guard current.head < current.chunks.count else { return (nil, nil) }
+            let data = current.chunks[current.head]
+            current.head += 1
+            current.bytes -= data.count
+            if current.head == current.chunks.count {
+                current.chunks.removeAll(keepingCapacity: true)
+                current.head = 0
+            }
+            guard current.bytes < capacity else { return (data, nil) }
+            defer { current.producer = nil }
+            return (data, current.producer)
+        }
+        producer?.resume(returning: true)
+        return data
+    }
+
+    /// Next chunk; `nil` once finished and drained.
+    func pop() async throws -> Data? {
+        enum Step { case chunk(Data, CheckedContinuation<Bool, Never>?), end, failed(Error), wait }
+        let step: Step = state.withLock { current in
+            if current.head < current.chunks.count {
+                let data = current.chunks[current.head]
+                current.head += 1
+                current.bytes -= data.count
+                if current.head == current.chunks.count {
+                    current.chunks.removeAll(keepingCapacity: true)
+                    current.head = 0
+                }
+                var producer: CheckedContinuation<Bool, Never>?
+                if current.bytes < capacity {
+                    producer = current.producer
+                    current.producer = nil
+                }
+                return .chunk(data, producer)
+            }
+            if current.finished {
+                return current.failure.map(Step.failed) ?? .end
+            }
+            return .wait
+        }
+        switch step {
+        case .chunk(let data, let producer):
+            producer?.resume(returning: true)
+            return data
+        case .end:
+            return nil
+        case .failed(let error):
+            throw error
+        case .wait:
+            return try await withCheckedThrowingContinuation { continuation in
+                enum Late { case chunk(Data, CheckedContinuation<Bool, Never>?), end, failed(Error), parked }
+                let late: Late = state.withLock { current in
+                    if current.head < current.chunks.count {
+                        let data = current.chunks[current.head]
+                        current.head += 1
+                        current.bytes -= data.count
+                        let producer = current.producer
+                        current.producer = nil
+                        return .chunk(data, producer)
+                    }
+                    if current.finished {
+                        return current.failure.map(Late.failed) ?? .end
+                    }
+                    current.consumer = continuation
+                    return .parked
+                }
+                switch late {
+                case .chunk(let data, let producer):
+                    producer?.resume(returning: true)
+                    continuation.resume(returning: data)
+                case .end:
+                    continuation.resume(returning: nil)
+                case .failed(let error):
+                    continuation.resume(throwing: error)
+                case .parked:
+                    break
+                }
+            }
+        }
+    }
+
+    /// The consumer stops: queued data is dropped, a waiting producer wakes.
+    func cancel() {
+        let producer = state.withLock { current -> CheckedContinuation<Bool, Never>? in
+            current.cancelled = true
+            current.chunks.removeAll()
+            current.head = 0
+            current.bytes = 0
+            defer { current.producer = nil }
+            return current.producer
+        }
+        producer?.resume(returning: false)
+    }
 }
 
 /// Bounds a half-closed flow: once one direction has finished, the flow is

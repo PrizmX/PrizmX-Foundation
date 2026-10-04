@@ -57,6 +57,8 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
 
     private let preSharedKey: [UInt8]
     private let transport: NWStreamTransport
+    /// Plaintext bytes sealed into one send.
+    static let maxWriteBatch = 256 * 1024
 
     // Send path (transport.writeMutex)
     private var encryptor: ShadowsocksAEADContext?
@@ -133,9 +135,18 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
                 return try await self.sendHandshakeIfNeeded(prefixing: buffer)
             }
 
-            let take = min(buffer.count, ShadowsocksAEAD.maxPayloadLength)
-            let chunk = UnsafeRawBufferPointer(rebasing: buffer.prefix(take))
-            try await self.encryptAndSend(plaintext: chunk)
+            // Seal the whole write as consecutive chunks and send them at
+            // once: one Network.framework send per 16 KiB chunk costs more
+            // than the encryption.
+            let take = min(buffer.count, Self.maxWriteBatch)
+            self.sendCiphertext.clear()
+            var offset = 0
+            while offset < take {
+                let end = min(offset + ShadowsocksAEAD.maxPayloadLength, take)
+                try self.appendSealedChunk(plaintext: UnsafeRawBufferPointer(rebasing: buffer[offset..<end]))
+                offset = end
+            }
+            try await self.sendCiphertextBuffer()
             return take
         }
     }
@@ -283,12 +294,6 @@ public final class ShadowsocksOutboundConnection: OutboundConnection, @unchecked
         if !saltSent {
             _ = try await sendHandshakeIfNeeded(prefixing: UnsafeRawBufferPointer(start: nil, count: 0))
         }
-    }
-
-    private func encryptAndSend(plaintext: UnsafeRawBufferPointer) async throws {
-        sendCiphertext.clear()
-        try appendSealedChunk(plaintext: plaintext)
-        try await sendCiphertextBuffer()
     }
 
     private func appendSealedChunk(plaintext: UnsafeRawBufferPointer) throws {
