@@ -38,14 +38,15 @@ A protocol frames the proxied stream; a **transport** carries those bytes (TCP, 
 | AnyTLS | TLS 1.3 | SNI, `skip-cert-verify`, idle session pool | yes | no |
 | HTTP | TCP, TLS (`https`) | Basic auth, extra headers (`CONNECT`) | yes | no |
 | SOCKS5 | TCP, TLS | username / password | yes | yes (UDP ASSOCIATE, when `udp`) |
+| ShadowsocksR | TCP | stream ciphers: `none`, `rc4-md5`, `aes-{128,192,256}-{cfb,ctr}`, `chacha20`, `chacha20-ietf`; `protocol`: `origin`, `auth_sha1_v4`, `auth_aes128_md5`, `auth_aes128_sha1`, `auth_chain_a` (also `protocol-param` `uid:password`); `obfs`: `plain`, `http_simple`, `http_post`, `tls1.2_ticket_auth`, `tls1.2_ticket_fastauth` | yes | no |
 
-WebSocket supports early data (`max-early-data` / Xray `?ed=`). gRPC is Xray's "gun" (`/<service>/Tun` or a custom `/a/b/Tun` path) over HTTP/2: h2 with TLS, h2c without; multi mode (`TunMulti`) is not used. Clash YAML, Surge INI and sing-box JSON import the rows above; a node whose transport, cipher or plugin is not supported is skipped with a warning instead of being imported half-configured.
+WebSocket supports early data (`max-early-data` / Xray `?ed=`). gRPC is Xray's "gun" (`/<service>/Tun` or a custom `/a/b/Tun` path) over HTTP/2: h2 with TLS, h2c without; multi mode (`TunMulti`) is not used. Clash YAML, Surge INI and sing-box JSON import the rows above (ShadowsocksR only from Clash YAML, `type: ssr`); a node whose transport, cipher or plugin is not supported is skipped with a warning instead of being imported half-configured.
 
-Half-close reaches the server where the path can carry it (TCP FIN, VMess's end chunk, gRPC END_STREAM). Network.framework TLS, WebSocket, mux.cool, simple-obfs and AnyTLS cannot; there the uplink just stops and the relay's linger bound ends the flow.
+Half-close reaches the server where the path can carry it (TCP FIN, VMess's end chunk, gRPC END_STREAM). Network.framework TLS, WebSocket, mux.cool, simple-obfs and AnyTLS cannot, and the ShadowsocksR reference server drops the whole connection on FIN; there the uplink just stops and the relay's linger bound ends the flow.
 
-**Not implemented**: Hysteria, TUIC, WireGuard, ShadowsocksR, HTTP/2 (`h2`) transport, VMess legacy `alterId > 0` auth, `client-fingerprint`, Mux (multiplexing several flows per connection). `packet-encoding` is ignored: Vision users always get XUDP, others the plain `udp` command.
+**Not implemented**: Hysteria, TUIC, WireGuard, ShadowsocksR UDP and `auth_chain_b`+, HTTP/2 (`h2`) transport, VMess legacy `alterId > 0` auth, `client-fingerprint`, Mux (multiplexing several flows per connection). `packet-encoding` is ignored: Vision users always get XUDP, others the plain `udp` command.
 
-`Interop/` runs every protocol against real servers (sing-box, Xray, shadowsocks-libev) in Docker, with mihomo as the reference client; see [Interop/README.md](Interop/README.md).
+`Interop/` runs every protocol against real servers (sing-box, Xray, shadowsocks-libev, the Python ShadowsocksR server) in Docker, with mihomo as the reference client; see [Interop/README.md](Interop/README.md).
 
 ## Develop
 

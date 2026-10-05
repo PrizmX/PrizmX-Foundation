@@ -179,6 +179,43 @@ enum ConfigMapping {
         throw ConfigError.unsupportedCipher(raw)
     }
 
+    /// ShadowsocksR options. Unknown methods, protocols (`auth_chain_b`…) or
+    /// obfs (`random_head`…) fail the proxy so it is reported at import.
+    /// `_compatible` names are server-side fallbacks; clients send the same.
+    static func shadowsocksR(
+        cipher: String,
+        protocol: String?,
+        protocolParam: String?,
+        obfs: String?,
+        obfsParam: String?
+    ) throws -> ShadowsocksRSettings {
+        func name(_ raw: String?, default value: String) -> String {
+            let key = (raw ?? "").lowercased()
+            guard !key.isEmpty else { return value }
+            return key.hasSuffix("_compatible") ? String(key.dropLast("_compatible".count)) : key
+        }
+        let method = cipher.lowercased()
+        // mihomo spells the null cipher `dummy`.
+        guard let ssrCipher = SSRCipher(rawValue: method == "dummy" ? "none" : method) else {
+            throw ConfigError.unsupportedCipher(cipher)
+        }
+        let protocolName = name(`protocol`, default: "origin")
+        guard let protocolKind = SSRProtocolKind(rawValue: protocolName) else {
+            throw ConfigError.unsupportedValue("ssr protocol \(protocolName)")
+        }
+        let obfsName = name(obfs, default: "plain")
+        guard let obfsKind = SSRObfsKind(rawValue: obfsName) else {
+            throw ConfigError.unsupportedValue("ssr obfs \(obfsName)")
+        }
+        return ShadowsocksRSettings(
+            cipher: ssrCipher,
+            protocolKind: protocolKind,
+            protocolParam: protocolParam ?? "",
+            obfs: obfsKind,
+            obfsParam: obfsParam ?? ""
+        )
+    }
+
     /// VMess `cipher` / `security`. Legacy CFB / `aes-128-cfb` bodies (the
     /// `alterId > 0` era) are not supported.
     static func vmessSecurity(_ raw: String?) throws -> VMessSecurity {

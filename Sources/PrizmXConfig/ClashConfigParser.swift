@@ -204,6 +204,27 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
                     session: session
                 )
             )
+        case "ssr":
+            let endpoint = try ConfigMapping.endpoint(
+                host: try node.requiredString("server"),
+                port: try node.int(for: "port"),
+                field: "port"
+            )
+            return OutboundNode(
+                id: name,
+                name: name,
+                protocolConfig: .shadowsocksR(
+                    server: endpoint,
+                    password: try node.requiredString("password"),
+                    settings: try ConfigMapping.shadowsocksR(
+                        cipher: try node.requiredString("cipher"),
+                        protocol: node.string(for: "protocol"),
+                        protocolParam: node.string(for: "protocol-param"),
+                        obfs: node.string(for: "obfs"),
+                        obfsParam: node.string(for: "obfs-param")
+                    )
+                )
+            )
         default:
             return nil
         }

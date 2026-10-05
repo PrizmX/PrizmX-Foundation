@@ -55,6 +55,13 @@ services:
       - "10200-10299:10200-10299/udp"
     depends_on: [target]
 
+  ssr:
+    build: ./servers/ssr
+    networks: [edge, targets]
+    ports:
+      - "10300-10399:10300-10399/tcp"
+    depends_on: [target]
+
   mihomo:
     image: metacubex/mihomo:v1.19.32
     volumes:
@@ -65,4 +72,4 @@ services:
     ports:
       - "17890:7890"
       - "19090:9090"
-    depends_on: [sing-box, xray, ss-libev]
+    depends_on: [sing-box, xray, ss-libev, ssr]

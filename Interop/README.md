@@ -13,7 +13,7 @@ macOS host: PrizmXInteropTests
               │                                  │
               └──────────► published ports ◄─────┘
                                  │
-        sing-box · Xray · shadowsocks-libev (+ obfs, v2ray-plugin)
+   sing-box · Xray · shadowsocks-libev (+ obfs, v2ray-plugin) · ShadowsocksR
                                  │  "targets" network (internal: true)
                                  ▼
           target: web.test :80/:443 · dns.test :53/udp · echo.test :7
@@ -61,7 +61,7 @@ on the fly and verify while streaming, so sizes are only limited by time.
 | `profile.yaml` | Every node (Clash format), with `interop:` expectations. The single source of truth |
 | `profile.singbox.json` | The same nodes in sing-box format (importer parity only) |
 | `docker-compose.yml` | Networks, servers (pinned image versions), target, mihomo |
-| `servers/` | Server configs: `sing-box.json`, `xray.json`, `ss-libev/` |
+| `servers/` | Server configs: `sing-box.json`, `xray.json`, `ss-libev/`, `ssr/` (Python reference server, one process per cipher / protocol / obfs combination) |
 | `target/` | Go target: web, DNS, echo |
 | `run.sh` | Certificates, mihomo profile, stack lifecycle, `swift test` |
 | `../Tests/PrizmXInteropTests/` | Harness, scenarios, load runner, tests |

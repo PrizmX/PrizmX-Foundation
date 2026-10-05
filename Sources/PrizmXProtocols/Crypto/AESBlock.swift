@@ -2,8 +2,7 @@ import CommonCrypto
 import Foundation
 
 /// Raw AES operations CryptoKit does not expose: single-block ECB (VMess
-/// auth ID, Shadowsocks 2022 UDP header) and the legacy stream / block modes
-/// ShadowsocksR still uses.
+/// auth ID, Shadowsocks 2022 UDP header, ShadowsocksR auth block).
 enum AESBlock {
     /// Encrypts exactly one 16-byte block with `key` (16 / 24 / 32 bytes).
     static func encrypt(block: [UInt8], key: [UInt8]) -> [UInt8] {

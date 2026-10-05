@@ -50,6 +50,8 @@ public enum ProtocolConfig: Sendable, Hashable {
     )
     /// Upstream SOCKS5 proxy; `udp` enables UDP ASSOCIATE relay.
     case socks5(server: Endpoint, credentials: ProxyCredentials?, tls: TLSSettings?, udp: Bool = true)
+    /// ShadowsocksR (stream cipher + protocol plugin + obfs); TCP only.
+    case shadowsocksR(server: Endpoint, password: String, settings: ShadowsocksRSettings)
     /// Unproxied TCP; `NodeFactory` ignores the node server and dials the target.
     case direct
 }
@@ -66,6 +68,7 @@ extension ProtocolConfig {
         case .anytls: "anytls"
         case .http: "http"
         case .socks5: "socks5"
+        case .shadowsocksR: "ssr"
         case .direct: "direct"
         }
     }
@@ -82,6 +85,7 @@ extension ProtocolConfig {
         case .anytls: "AnyTLS"
         case .http(_, _, let tls, _): tls == nil ? "HTTP" : "HTTPS"
         case .socks5: "SOCKS5"
+        case .shadowsocksR: "SSR"
         case .direct: "Direct"
         }
     }
@@ -269,6 +273,8 @@ public enum NodeFactory: Sendable {
                 credentials: credentials,
                 settings: StreamSettings(tls: tls)
             )
+        case .shadowsocksR(let server, let password, let settings):
+            return try SSROutboundConnection(server: server, password: password, settings: settings, target: target)
         case .direct:
             return DirectOutboundConnection(endpoint: target)
         }
@@ -278,7 +284,8 @@ public enum NodeFactory: Sendable {
 extension NodeFactory {
     /// Builds an unopened UDP relay through `node` for a flow whose first
     /// datagram goes to `target`. `nil` when the protocol carries no UDP
-    /// (AnyTLS) or the node is `direct` (the TUN relay dials it natively).
+    /// (AnyTLS, ShadowsocksR) or the node is `direct` (the TUN relay dials
+    /// it natively).
     public static func makeDatagramOutbound(
         from node: OutboundNode,
         to target: Endpoint
@@ -326,7 +333,7 @@ extension NodeFactory {
         case .socks5(let server, let credentials, let tls, let udp):
             guard udp else { return nil }
             return SOCKS5DatagramOutbound(server: server, credentials: credentials, settings: StreamSettings(tls: tls))
-        case .anytls, .http, .direct:
+        case .anytls, .http, .shadowsocksR, .direct:
             return nil
         }
     }
@@ -724,7 +731,8 @@ extension OutboundNode {
             return server
         case .anytls(let server, _, _, _, _):
             return server
-        case .vmess(let server, _, _, _, _), .http(let server, _, _, _), .socks5(let server, _, _, _):
+        case .vmess(let server, _, _, _, _), .http(let server, _, _, _), .socks5(let server, _, _, _),
+             .shadowsocksR(let server, _, _):
             return server
         case .direct:
             return nil

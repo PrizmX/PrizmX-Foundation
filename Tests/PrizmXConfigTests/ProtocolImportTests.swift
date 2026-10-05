@@ -131,6 +131,50 @@ struct ProtocolImportTests {
         #expect(result.warnings.first?.text == "v")
     }
 
+    // MARK: ShadowsocksR
+
+    @Test func clashShadowsocksR() throws {
+        let node = try clashNode(
+            "{name: r, type: ssr, server: r.example, port: 8388, cipher: aes-256-cfb, password: p, "
+                + "protocol: auth_aes128_md5, protocol-param: '1024:secret', obfs: http_simple, obfs-param: cdn.example}"
+        )
+        #expect(node.protocolConfig == .shadowsocksR(
+            server: Endpoint(domain: "r.example", port: 8388),
+            password: "p",
+            settings: ShadowsocksRSettings(
+                cipher: .aes256CFB,
+                protocolKind: .authAES128MD5,
+                protocolParam: "1024:secret",
+                obfs: .httpSimple,
+                obfsParam: "cdn.example"
+            )
+        ))
+        #expect(node.protocolConfig.displayName == "SSR")
+        #expect(node.protocolConfig.typeName == "ssr")
+    }
+
+    @Test func clashShadowsocksRAliasesAndDefaults() throws {
+        // `dummy` is mihomo's null cipher; `_compatible` names are server-side
+        // fallbacks; missing protocol / obfs mean origin / plain.
+        let node = try clashNode(
+            "{name: r, type: ssr, server: r.example, port: 8388, cipher: dummy, password: p, obfs: tls1.2_ticket_auth_compatible}"
+        )
+        guard case .shadowsocksR(_, _, let settings) = node.protocolConfig else { Issue.record("\(node)"); return }
+        #expect(settings == ShadowsocksRSettings(cipher: .none, protocolKind: .origin, obfs: .tls12TicketAuth))
+    }
+
+    @Test func clashShadowsocksRUnsupportedOptionsAreReported() throws {
+        for proxy in [
+            "{name: r, type: ssr, server: r.example, port: 1, cipher: salsa20, password: p}",
+            "{name: r, type: ssr, server: r.example, port: 1, cipher: none, password: p, protocol: auth_chain_b}",
+            "{name: r, type: ssr, server: r.example, port: 1, cipher: none, password: p, obfs: random_head}",
+        ] {
+            let result = try ClashConfigParser().parseWithWarnings(rawString: "proxies:\n  - \(proxy)\n")
+            #expect(result.nodeManager.nodesByID.isEmpty, "\(proxy)")
+            #expect(result.warnings.first?.text == "r", "\(proxy)")
+        }
+    }
+
     @Test func singboxWebSocketAndHTTPUpgrade() throws {
         let ws = try singboxNode(#"""
         {"type": "vless", "tag": "v", "server": "v.example", "server_port": 443, "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
