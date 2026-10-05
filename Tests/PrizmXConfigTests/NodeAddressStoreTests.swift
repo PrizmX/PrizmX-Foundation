@@ -79,3 +79,56 @@ import PrizmXProtocols
     ])
     #expect(good["www.apple.com"] == nil)
 }
+
+@Test func clearCacheRemovesPinsAndProvenAddresses() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent("node-dns-clear-\(UUID().uuidString)")
+    let appGroupKit = root.appendingPathComponent("group", isDirectory: true)
+    let runtimeKit = root.appendingPathComponent("runtime", isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    for kit in [appGroupKit, runtimeKit] {
+        try fileManager.createDirectory(
+            at: kit.appendingPathComponent("tunnel", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try #"{"node.example.sbs":["1.2.3.4"]}"#.write(
+            to: kit.appendingPathComponent(NodeAddressStore.relativePath),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"proxy-server|node.example.sbs":["1.2.3.4"]}"#.write(
+            to: kit.appendingPathComponent("dns-good.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "proxies: []\n".write(
+            to: kit.appendingPathComponent("tunnel/active.conf"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    NodeAddressStore.clearCache(kitRoots: [appGroupKit, runtimeKit])
+
+    for kit in [appGroupKit, runtimeKit] {
+        #expect(!fileManager.fileExists(atPath: kit.appendingPathComponent(NodeAddressStore.relativePath).path))
+        #expect(!fileManager.fileExists(atPath: kit.appendingPathComponent("dns-good.json").path))
+        // Only the DNS cache goes; the staged profile stays.
+        #expect(fileManager.fileExists(atPath: kit.appendingPathComponent("tunnel/active.conf").path))
+    }
+}
+
+@Test func followsProfileDNSNeedsEnabledNameserverWithoutOverride() {
+    let yaml = """
+    dns:
+      enable: true
+      nameserver:
+        - https://dns.example.com/dns-query
+    proxies: []
+    rules:
+      - MATCH,DIRECT
+    """
+    #expect(NodeAddressStore.followsProfileDNS(configText: yaml, overrideDNS: false))
+    #expect(!NodeAddressStore.followsProfileDNS(configText: yaml, overrideDNS: true))
+    #expect(!NodeAddressStore.followsProfileDNS(configText: "proxies: []\nrules:\n  - MATCH,DIRECT\n", overrideDNS: false))
+}

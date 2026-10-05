@@ -110,7 +110,8 @@ public final class DNSClient: Sendable {
     ///
     /// Proven (`markGood`) addresses win over App-pinned ones, which win over
     /// a fresh lookup. If any preferred address exists, it is returned
-    /// immediately — the union lookup must not block the first dial.
+    /// immediately — the union lookup must not block the first dial. Node
+    /// hostnames that follow the profile's DNS skip proven addresses.
     public func resolveAll(_ domain: String, role: DNSRole) async throws -> [IPv4Address] {
         if let mapped = SystemHosts.lookup(domain) {
             if !mapped.ipv4.isEmpty { return mapped.ipv4 }
@@ -152,7 +153,11 @@ public final class DNSClient: Sendable {
     }
 
     private func preferredAddresses(key: CacheKey) -> [IPv4Address] {
-        let goodList = good.withLock { $0[key]?.addresses ?? [] }
+        // Following the profile's DNS: a proven address from an earlier
+        // session must not outrank a fresh profile answer (the provider may
+        // have moved its nodes). App pins were resolved via the profile too.
+        let followsProfile = key.role == .proxyServer && settings.resolvesNodesViaProfile
+        let goodList = followsProfile ? [] : good.withLock { $0[key]?.addresses ?? [] }
         let pinList = pinned[key.domain] ?? []
         return Self.mergeGoodFirst(good: goodList, answers: pinList).filter { !isBad(key, $0) }
     }

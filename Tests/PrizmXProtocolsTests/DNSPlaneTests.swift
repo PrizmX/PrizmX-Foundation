@@ -178,6 +178,26 @@ import Network
     #expect(addresses.contains(dead))
 }
 
+@Test func followingProfileDNSSkipsProvenAddresses() async throws {
+    let stale = IPv4Address(155, 254, 102, 209)
+    let fresh = IPv4Address(218, 245, 102, 118)
+    let client = DNSClient(
+        settings: DNSSettings(
+            defaultNameservers: [.udp(address: "223.5.5.5", port: 53)],
+            nameservers: [.doh(url: "https://dns.example.com/dns-query")],
+            nodeDNSFromProfile: true
+        ),
+        pinnedNodeAddresses: ["node.example.sbs": [fresh]]
+    )
+    // A proven address from an earlier session must not outrank the pin
+    // the app just resolved through the profile's DNS.
+    client.markGood(domain: "node.example.sbs", role: .proxyServer, address: stale)
+    #expect(try await client.resolveAll("node.example.sbs", role: .proxyServer) == [fresh])
+    // DIRECT is untouched by the node-DNS switch.
+    client.markGood(domain: "cdn.example.com", role: .direct, address: stale)
+    #expect(client.preferredAddresses(domain: "cdn.example.com", role: .direct) == [stale])
+}
+
 @Test func badMarkExpiresAndPinBecomesVisibleAgain() async throws {
     let edge = IPv4Address(155, 254, 102, 209)
     let client = DNSClient(

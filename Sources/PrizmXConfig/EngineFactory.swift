@@ -8,6 +8,7 @@ import PrizmXRules
 public enum EngineFactory: Sendable {
     /// `systemDNS`: resolver IPs captured in the **app** (not the extension).
     /// `pinnedNodeAddresses`: node hostnames already resolved in the app.
+    /// `overrideDNS`: nil reads the stored "Override DNS" switch.
     public static func make(
         configText: String?,
         geoIPURL: URL? = nil,
@@ -19,7 +20,8 @@ public enum EngineFactory: Sendable {
         globalGroup: String? = nil,
         overlay: ProfileOverlay = .empty,
         flowAttributor: (any FlowAttributing)? = nil,
-        dnsPersistenceURL: URL? = DNSClient.defaultPersistenceURL
+        dnsPersistenceURL: URL? = DNSClient.defaultPersistenceURL,
+        overrideDNS: Bool? = nil
     ) throws -> Engine {
         let parsed: (Router, NodeManager)
         if let configText {
@@ -41,7 +43,13 @@ public enum EngineFactory: Sendable {
         }
 
         let dnsSection = configText.flatMap { ClashDNSSection.parse(from: $0) }
-        var dnsSettings = DNSSettings.fromClash(section: dnsSection, systemDNS: systemDNS)
+        let overrideDNS = overrideDNS ?? DNSPreferenceStore.load().overrideDNS
+        var dnsSettings = DNSSettings.fromClash(
+            section: dnsSection,
+            systemDNS: systemDNS,
+            overrideDNS: overrideDNS
+        )
+        Self.logNodeDNS(section: dnsSection, settings: dnsSettings, overrideDNS: overrideDNS)
         // Node server domains never receive fake IPs: an app-side lookup
         // (node ping, subscription refresh) must not loop into the tunnel.
         let nodeHosts = parsed.1.nodesByID.values.compactMap { node -> String? in
@@ -90,6 +98,35 @@ public enum EngineFactory: Sendable {
             globalGroup: group,
             flowAttributor: flowAttributor
         )
+    }
+
+    /// One line naming who resolves node hostnames, plus profile
+    /// nameservers dropped for an unsupported transport (`tls://`, …).
+    private static func logNodeDNS(section: ClashDNSSection?, settings: DNSSettings, overrideDNS: Bool) {
+        if let section {
+            // Loopback (Clash's own listener) is dropped on purpose; only
+            // transports we cannot speak are worth a warning.
+            let declared = section.proxyServerNameservers + section.nameservers + section.defaultNameservers
+            let dropped = declared.filter { raw in
+                guard let separator = raw.range(of: "://") else { return raw == "system" }
+                return !["udp", "https"].contains(raw[..<separator.lowerBound].lowercased())
+            }
+            if !dropped.isEmpty {
+                let labels = dropped.map { raw in
+                    URL(string: raw).map { "\($0.scheme ?? "")://\($0.host ?? "?")" } ?? raw
+                }
+                TunnelLog.write(.warn, "dns profile nameservers skipped (unsupported): \(labels)")
+            }
+        }
+        let source = settings.resolvesNodesViaProfile
+            ? "profile"
+            : (overrideDNS ? "prizmx (override)" : "prizmx (profile DNS off or no usable nameserver)")
+        let resolvers = settings.endpoints(for: .proxyServer).map { endpoint in
+            // Host only: DoH paths often carry the provider's access token.
+            guard case .doh(let url) = endpoint else { return endpoint.description }
+            return "doh://\(URL(string: url)?.host ?? "?")"
+        }
+        TunnelLog.write(.info, "dns node hostnames via \(source) \(resolvers)")
     }
 
     private static func directOnly() -> (Router, NodeManager) {

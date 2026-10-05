@@ -6,6 +6,9 @@ import PrizmXProtocols
 /// Only the fields the outbound DNS plane consumes are extracted; `listen`,
 /// `enhanced-mode`, etc. belong to the local responder, not outbound lookups.
 public struct ClashDNSSection: Sendable, Equatable {
+    /// Clash `dns.enable`. Mihomo defaults to false and then ignores the
+    /// section's nameservers (node hostnames use the system resolver).
+    public var enable: Bool = false
     public var defaultNameservers: [String] = []
     public var nameservers: [String] = []
     public var proxyServerNameservers: [String] = []
@@ -23,6 +26,7 @@ public struct ClashDNSSection: Sendable, Equatable {
         guard let first = trimmed.first, first != "{", first != "[" else { return nil }
         guard let root = try? YAMLParser.parse(trimmed), let dns = root.mapping?["dns"] else { return nil }
         var section = ClashDNSSection()
+        section.enable = dns.bool(for: "enable", default: false)
         section.defaultNameservers = strings(dns, "default-nameserver")
         section.nameservers = strings(dns, "nameserver")
         section.proxyServerNameservers = strings(dns, "proxy-server-nameserver")
@@ -55,7 +59,15 @@ extension DNSSettings {
     ///   (`udp://127.0.0.1:<listen>`) collapses to `nameservers`
     /// - `direct-nameserver` empty → the machine's effective resolver
     ///   (captured before FakeDNS is installed)
-    public static func fromClash(section: ClashDNSSection?, systemDNS: [String]) -> DNSSettings {
+    ///
+    /// `overrideDNS` false (default) lets the profile's nameservers alone
+    /// resolve node hostnames when `dns.enable` is on; true restores
+    /// PrizmX's merged resolvers.
+    public static func fromClash(
+        section: ClashDNSSection?,
+        systemDNS: [String],
+        overrideDNS: Bool = false
+    ) -> DNSSettings {
         let system = systemDNS.compactMap { NameserverEndpoint.udp(ip: $0) }
         let bootstrap = (section?.defaultNameservers ?? []).compactMap(NameserverEndpoint.parse)
         let general = (section?.nameservers ?? []).compactMap(NameserverEndpoint.parse)
@@ -73,7 +85,8 @@ extension DNSSettings {
             systemNameservers: system,
             fakeIPFilter: (section?.fakeIPFilter ?? []) + ["*.lan", "*.local", "*.localhost"],
             ipv6: section?.ipv6 ?? false,
-            cacheTTL: 60
+            cacheTTL: 60,
+            nodeDNSFromProfile: !overrideDNS && (section?.enable ?? false)
         )
     }
 }

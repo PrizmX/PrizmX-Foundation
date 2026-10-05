@@ -102,6 +102,12 @@ public struct DNSSettings: Sendable, Hashable {
     public var ipv6: Bool
     /// Fallback positive-cache lifetime when the answer carries no TTL.
     public var cacheTTL: TimeInterval
+    /// Node hostnames resolve through the profile's own
+    /// `proxy-server-nameserver` / `nameserver` only — Clash clients with
+    /// "DNS override" off. Tail resolvers and proven addresses stay out of
+    /// the answer; public resolvers step in only after the profile's
+    /// answers fail. Ignored while both lists are empty.
+    public var nodeDNSFromProfile: Bool
 
     public init(
         defaultNameservers: [NameserverEndpoint],
@@ -111,7 +117,8 @@ public struct DNSSettings: Sendable, Hashable {
         systemNameservers: [NameserverEndpoint] = [],
         fakeIPFilter: [String] = [],
         ipv6: Bool = false,
-        cacheTTL: TimeInterval = 60
+        cacheTTL: TimeInterval = 60,
+        nodeDNSFromProfile: Bool = false
     ) {
         self.defaultNameservers = defaultNameservers
         self.nameservers = nameservers
@@ -121,6 +128,13 @@ public struct DNSSettings: Sendable, Hashable {
         self.fakeIPFilter = fakeIPFilter
         self.ipv6 = ipv6
         self.cacheTTL = cacheTTL
+        self.nodeDNSFromProfile = nodeDNSFromProfile
+    }
+
+    /// True when node hostnames are answered by the profile's nameservers
+    /// alone (`nodeDNSFromProfile` and the profile actually lists some).
+    public var resolvesNodesViaProfile: Bool {
+        nodeDNSFromProfile && !(proxyServerNameservers.isEmpty && nameservers.isEmpty)
     }
 
     /// Freeze effective DNS IPs captured **before** tunnel settings apply.
@@ -171,11 +185,12 @@ public struct DNSSettings: Sendable, Hashable {
     public func endpoints(for role: DNSRole) -> [NameserverEndpoint] {
         switch role {
         case .proxyServer:
-            // Clash: proxy-server-nameserver → nameserver → default. We
-            // additionally append bootstrap + system as tail sources: answers
+            // Clash: proxy-server-nameserver → nameserver → default.
+            let primary = !proxyServerNameservers.isEmpty ? proxyServerNameservers : nameservers
+            if resolvesNodesViaProfile { return Self.deduplicate(primary) }
+            // Override: append bootstrap + system as tail sources. Answers
             // are merged, and a dead CDN edge from the provider's DoH must not
             // starve the dial when another resolver already has a live one.
-            let primary = !proxyServerNameservers.isEmpty ? proxyServerNameservers : nameservers
             return Self.deduplicate(primary + defaultNameservers + systemNameservers)
         case .direct:
             let primary = !directNameservers.isEmpty ? directNameservers : systemNameservers
