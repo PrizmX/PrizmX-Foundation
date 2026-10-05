@@ -130,6 +130,10 @@ enum GunHunk {
 
     /// Incremental decoder of gRPC messages to hunk payloads.
     struct Decoder {
+        /// grpc-go's default receive limit, which a gun server talking to
+        /// grpc-go clients (Xray) already stays under.
+        static let maxMessageBytes = 4 * 1024 * 1024
+
         private var buffer = Data()
 
         mutating func feed(_ chunk: Data) throws -> [Data] {
@@ -139,6 +143,11 @@ enum GunHunk {
                 let bytes = buffer.startIndex
                 guard buffer[bytes] == 0 else { throw TransportError.protocolViolation("compressed gRPC message") }
                 let length = buffer[(bytes + 1)..<(bytes + 5)].reduce(0) { $0 << 8 | Int($1) }
+                // A partial message is credited back as framing, so flow
+                // control does not bound it; the length cap does.
+                guard length <= Self.maxMessageBytes else {
+                    throw TransportError.protocolViolation("gRPC message of \(length) bytes")
+                }
                 guard buffer.count >= 5 + length else { break }
                 let message = buffer.subdata(in: (bytes + 5)..<(bytes + 5 + length))
                 buffer.removeFirst(5 + length)

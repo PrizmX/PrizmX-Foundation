@@ -82,6 +82,19 @@ struct GRPCTests {
         }
     }
 
+    @Test func rejectsOversizedMessages() throws {
+        // A partial message is credited back as framing, so only the cap
+        // stops a peer from growing the buffer without bound.
+        let length = GunHunk.Decoder.maxMessageBytes + 1
+        let header = Data([0, UInt8(length >> 24), UInt8(length >> 16 & 0xFF), UInt8(length >> 8 & 0xFF), UInt8(length & 0xFF)])
+        var decoder = GunHunk.Decoder()
+        #expect(throws: TransportError.self) { try decoder.feed(header) }
+        // At the cap the decoder still waits for the rest.
+        let atCap = GunHunk.Decoder.maxMessageBytes
+        var accepting = GunHunk.Decoder()
+        #expect(try accepting.feed(Data([0, UInt8(atCap >> 24), UInt8(atCap >> 16 & 0xFF), UInt8(atCap >> 8 & 0xFF), UInt8(atCap & 0xFF)])) == [])
+    }
+
     @Test func gracefulGoAwayLetsTheStreamFinish() async throws {
         let peer = ScriptedPeer()
         let stream = GRPCStream(lower: peer)
