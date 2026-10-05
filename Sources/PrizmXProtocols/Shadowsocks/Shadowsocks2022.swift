@@ -65,6 +65,13 @@ enum Shadowsocks2022 {
 
     static var now: Int64 { Int64(Date().timeIntervalSince1970) }
 
+    /// Whether a peer timestamp is within `maxTimeDifference` of now. The
+    /// timestamp comes off the wire, so the difference must not trap.
+    static func isFresh(_ time: Int64) -> Bool {
+        let (difference, overflow) = time.subtractingReportingOverflow(now)
+        return !overflow && difference.magnitude <= UInt64(maxTimeDifference)
+    }
+
     static func be64(_ value: UInt64) -> [UInt8] {
         withUnsafeBytes(of: value.bigEndian) { Array($0) }
     }
@@ -312,7 +319,7 @@ public final class Shadowsocks2022OutboundConnection: OutboundConnection, @unche
             throw Shadowsocks2022Error.badHeaderType(header[0])
         }
         let time = Int64(bitPattern: Shadowsocks2022.readBE64(header[1..<9]))
-        guard abs(time - Shadowsocks2022.now) <= Shadowsocks2022.maxTimeDifference else {
+        guard Shadowsocks2022.isFresh(time) else {
             throw Shadowsocks2022Error.badTimestamp(time)
         }
         guard Array(header[9..<(9 + saltCount)]) == requestSalt else {
@@ -436,7 +443,7 @@ public final class Shadowsocks2022DatagramOutbound: DatagramOutbound, @unchecked
         guard body.count >= 1 + 8 + 8 + 2 else { throw ShadowsocksError.truncated(expected: 19, actual: body.count) }
         guard body[0] == Shadowsocks2022.headerTypeServer else { throw Shadowsocks2022Error.badHeaderType(body[0]) }
         let time = Int64(bitPattern: Shadowsocks2022.readBE64(body[1..<9]))
-        guard abs(time - Shadowsocks2022.now) <= Shadowsocks2022.maxTimeDifference else {
+        guard Shadowsocks2022.isFresh(time) else {
             throw Shadowsocks2022Error.badTimestamp(time)
         }
         guard Shadowsocks2022.readBE64(body[9..<17]) == sessionID else { throw Shadowsocks2022Error.badClientSession }

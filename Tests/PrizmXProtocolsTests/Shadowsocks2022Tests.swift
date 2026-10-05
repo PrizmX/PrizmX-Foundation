@@ -26,6 +26,13 @@ struct Shadowsocks2022Tests {
     }
 
     /// draft-irtf-cfrg-xchacha-03 §2.2.1.
+    @Test func timestampCheckDoesNotTrap() {
+        #expect(Shadowsocks2022.isFresh(Shadowsocks2022.now + 10))
+        #expect(!Shadowsocks2022.isFresh(Shadowsocks2022.now - 31))
+        #expect(!Shadowsocks2022.isFresh(.min))
+        #expect(!Shadowsocks2022.isFresh(.max))
+    }
+
     @Test func hchacha20MatchesDraftVector() {
         let key = (0..<32).map { UInt8($0) }
         let nonce: [UInt8] = [0, 0, 0, 0x09, 0, 0, 0, 0x4A, 0, 0, 0, 0, 0x31, 0x41, 0x59, 0x27]
