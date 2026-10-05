@@ -115,7 +115,7 @@ public final class ScriptEngine: @unchecked Sendable {
         sessions.withLock { $0[ObjectIdentifier(session)] = session }
         state.onFinish { [weak session] in
             // Timers must not outlive the run (they retain JS values).
-            queue.async { session?.teardown() }
+            queue.async { [weak session] in session?.teardown() }
         }
         session.install()
         session.evaluate()

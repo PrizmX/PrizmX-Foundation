@@ -130,8 +130,9 @@ final class NWStreamTransport: @unchecked Sendable {
     /// cancelled, which also unwinds the suspended ready-wait child task.
     func waitUntilReady(_ nw: NWConnection, timeout: Duration = .seconds(8)) async throws {
         let peer = endpoint
+        let queue = self.queue
         try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
+            group.addTask { [weak self] in
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     let once = OnceResume(continuation)
                     nw.stateUpdateHandler = { [weak self] state in
@@ -150,7 +151,7 @@ final class NWStreamTransport: @unchecked Sendable {
                             break
                         }
                     }
-                    nw.start(queue: self.queue)
+                    nw.start(queue: queue)
                 }
             }
             group.addTask {
