@@ -292,13 +292,11 @@ final class NWStreamTransport: @unchecked Sendable {
         return try await send(buffer)
     }
 
+    /// Idempotent. A peer failure already left the state `.closed` but kept
+    /// the socket for draining reads (see `ensureReadable`); it is cancelled
+    /// here, since a failed `NWConnection` holds its resources until then.
     func close() async {
-        let shouldCancel: Bool = lifecycle.withLock { life in
-            if life.state == .closed { return false }
-            life.state = .closed
-            return true
-        }
-        guard shouldCancel else { return }
+        lifecycle.withLock { $0.state = .closed }
         let nw = connectionBox.withLock { box -> NWConnection? in
             defer { box = nil }
             return box
