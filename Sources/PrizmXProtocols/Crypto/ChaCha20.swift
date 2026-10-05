@@ -68,7 +68,7 @@ struct ChaCha20 {
     private static let constants: [UInt32] = [0x6170_7865, 0x3320_646E, 0x7962_2D32, 0x6B20_6574]
 
     private static func words(_ bytes: [UInt8]) -> [UInt32] {
-        stride(from: 0, to: bytes.count, by: 4).map { index in
+        stride(from: 0, to: bytes.count, by: 4).map { (index: Int) -> UInt32 in
             UInt32(bytes[index]) | UInt32(bytes[index + 1]) << 8
                 | UInt32(bytes[index + 2]) << 16 | UInt32(bytes[index + 3]) << 24
         }
