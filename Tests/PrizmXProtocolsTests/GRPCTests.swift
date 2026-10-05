@@ -74,6 +74,34 @@ struct GRPCTests {
         #expect(try GunHunk.Decoder.hunkData(Data(message)) == Data("hi".utf8))
     }
 
+    @Test func rejectsNegativeVarintLength() {
+        // Field 1, length varint 0xFF×9 0x01 decodes to a negative Int.
+        let message: [UInt8] = [0x0A] + [UInt8](repeating: 0xFF, count: 9) + [0x01, 0x68]
+        #expect(throws: TransportError.protocolViolation("protobuf length")) {
+            try GunHunk.Decoder.hunkData(Data(message))
+        }
+    }
+
+    @Test func gracefulGoAwayLetsTheStreamFinish() async throws {
+        let peer = ScriptedPeer()
+        let stream = GRPCStream(lower: peer)
+        try await stream.connect(settings: GRPCSettings(serviceName: "Gun"), authority: "s.example", tls: true)
+        // GOAWAY(last stream 2^31-1, NO_ERROR), then stream 1 keeps going.
+        peer.push(HTTP2.frame(.goAway, stream: 0, payload: Data([0x7F, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0])))
+        peer.push(HTTP2.frame(.data, stream: 1, payload: GunHunk.encode(Data("late".utf8))))
+        peer.push(HTTP2.frame(.headers, flags: HTTP2.flagEndHeaders | HTTP2.flagEndStream, stream: 1, payload: Data()))
+        #expect(try await stream.receive() == Data("late".utf8))
+        #expect(try await stream.receive() == nil)
+    }
+
+    @Test func goAwayExcludingTheStreamFails() async throws {
+        let peer = ScriptedPeer()
+        let stream = GRPCStream(lower: peer)
+        try await stream.connect(settings: GRPCSettings(serviceName: "Gun"), authority: "s.example", tls: true)
+        peer.push(HTTP2.frame(.goAway, stream: 0, payload: Data([0, 0, 0, 0, 0, 0, 0, 0])))
+        await #expect(throws: TransportError.self) { try await stream.receive() }
+    }
+
     @Test func hpackIntegersUsePrefixContinuation() {
         var block = Data()
         HTTP2.appendInteger(10, prefixBits: 7, to: &block)

@@ -175,7 +175,8 @@ enum GunHunk {
                     offset += 8
                 case 2:
                     let length = try varint()
-                    guard offset + length <= bytes.count else { throw TransportError.protocolViolation("protobuf length") }
+                    // A 10-byte varint can come out negative.
+                    guard length >= 0, length <= bytes.count - offset else { throw TransportError.protocolViolation("protobuf length") }
                     if key >> 3 == 1 {
                         result = Data(bytes[offset..<(offset + length)])
                     }
@@ -475,8 +476,16 @@ final class GRPCStream: ByteStream, @unchecked Sendable {
                 return true
             }
         case .goAway:
-            end(nil)
-            return true
+            // Streams up to the last stream ID may still finish; only a
+            // GOAWAY that excludes ours, or one carrying an error, ends it.
+            let bytes = [UInt8](payload)
+            guard bytes.count >= 8 else { throw TransportError.protocolViolation("GOAWAY") }
+            let lastStream = (UInt32(bytes[0]) << 24 | UInt32(bytes[1]) << 16 | UInt32(bytes[2]) << 8 | UInt32(bytes[3])) & 0x7FFF_FFFF
+            let errorCode = UInt32(bytes[4]) << 24 | UInt32(bytes[5]) << 16 | UInt32(bytes[6]) << 8 | UInt32(bytes[7])
+            if lastStream < Self.streamID || errorCode != 0 {
+                end(TransportError.protocolViolation("GOAWAY (last stream \(lastStream), error \(errorCode))"))
+                return true
+            }
         case .priority, .pushPromise, nil:
             break
         }
