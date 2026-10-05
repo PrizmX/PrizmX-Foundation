@@ -81,6 +81,22 @@ private let testIdentity = AnyTLSServerIdentity(
     #expect(core.closedStreams == [9])
 }
 
+@Test func streamReadAfterCloseEnds() async throws {
+    let core = StubCore()
+    let stream = AnyTLSSessionStream(id: 10, target: testTarget, core: core)
+    await stream.close()
+    // Nothing ingests or finishes a closed stream: a read that lost the race
+    // with close() used to park forever.
+    let result = OSAllocatedUnfairLock<(done: Bool, data: Data?)>(initialState: (false, nil))
+    _ = Task {
+        let data = try await stream.readData()
+        result.withLock { $0 = (true, data) }
+    }
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(result.withLock { $0.done })
+    #expect(result.withLock { $0.data } == nil)
+}
+
 @Test func poolBusySessionDoesNotTakeASecondStream() async throws {
     let pool = AnyTLSSessionPool()
     let calls = CallCounter()

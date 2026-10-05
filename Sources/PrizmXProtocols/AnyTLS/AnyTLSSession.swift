@@ -249,7 +249,9 @@ public final class AnyTLSSessionStream: @unchecked Sendable {
             continuation.resume(throwing: failure)
             return
         }
-        if inputFinished {
+        // After close() nothing ingests or finishes this stream any more, so
+        // a read that lost the race with close() must not park.
+        if inputFinished || closed {
             lock.unlock()
             continuation.resume(returning: nil)
             return
