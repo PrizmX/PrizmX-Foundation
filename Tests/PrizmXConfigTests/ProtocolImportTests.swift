@@ -64,6 +64,12 @@ struct ProtocolImportTests {
             credentials: ProxyCredentials(username: "u", password: "p"),
             tls: TLSSettings(serverName: "s.example")
         ))
+        // Base64 padding in a positional password is not an option.
+        #expect(try surgeNode("h = http, p.example, 8080, u, cGFzcw==, tfo=true").protocolConfig == .http(
+            server: Endpoint(domain: "p.example", port: 8080),
+            credentials: ProxyCredentials(username: "u", password: "cGFzcw=="),
+            tls: nil
+        ))
         #expect(try surgeNode("s = socks5, 10.0.0.1, 1080, udp-relay=true").protocolConfig == .socks5(
             server: Endpoint(host: .ipv4(IPv4Address(10, 0, 0, 1)), port: 1080),
             credentials: nil,

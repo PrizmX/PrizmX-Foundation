@@ -584,7 +584,12 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             guard parts.count >= 3 else { throw ConfigError.malformedRule(line) }
             let host = parts[1]
             guard let port = Int(parts[2]) else { throw ConfigError.invalidPort(parts[2]) }
-            let positional = parts.dropFirst(3).filter { !$0.contains("=") }
+            // Positional credentials come right after the port. Base64
+            // padding (`cGFzcw==`) is not an option: an option has a value.
+            let positional = parts.dropFirst(3).prefix { part in
+                let pair = part.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                return pair.count < 2 || pair[0].isEmpty || pair[1].isEmpty || pair[1].hasPrefix("=")
+            }
             let username = named("username") ?? positional.first
             let password = named("password") ?? positional.dropFirst().first
             let credentials = (username ?? "").isEmpty && (password ?? "").isEmpty
