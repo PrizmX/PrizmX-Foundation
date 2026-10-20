@@ -18,6 +18,10 @@ struct NodeTests {
         .tcpHalfClose(bytes: 20_000),
         .dnsQuery,
         .udpEcho(bytes: 1200),
+        // The target named by its IPv6 address.
+        .httpPingIPv6,
+        .tcpEcho(bytes: 64 * 1024, ipv6: true),
+        .udpEcho(bytes: 1200, ipv6: true),
     ]
 
     /// Reference pass on mihomo: proves the server side of each node works,
@@ -26,6 +30,7 @@ struct NodeTests {
         .httpDownload(bytes: 1024 * 1024),
         .httpsDownload(bytes: 256 * 1024),
         .httpUpload(bytes: 256 * 1024),
+        .httpPingIPv6,
     ]
 
     @Test(arguments: InteropProfile.selectedNodes)

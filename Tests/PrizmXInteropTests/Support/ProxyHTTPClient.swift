@@ -76,10 +76,11 @@ final class ProxyHTTPClient: NSObject, URLSessionDataDelegate, @unchecked Sendab
         return TransferSample(bytes: count, duration: ContinuousClock.now - start)
     }
 
-    /// `GET /ping` round trip (request latency, small payload).
-    func ping() async throws -> TransferSample {
+    /// `GET /ping` round trip (request latency, small payload). `host` is
+    /// `webHost`, or `webHost6` to name the target by its IPv6 address.
+    func ping(host: String = InteropEnvironment.webHost) async throws -> TransferSample {
         let start = ContinuousClock.now
-        let (data, response) = try await session.data(from: URL(string: "http://\(InteropEnvironment.webHost)/ping")!)
+        let (data, response) = try await session.data(from: URL(string: "http://\(host)/ping")!)
         let text = String(decoding: data, as: UTF8.self)
         try Self.check(response, body: text)
         guard text == "pong" else { throw InteropHTTPError.badReply(text) }

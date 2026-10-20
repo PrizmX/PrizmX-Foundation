@@ -17,7 +17,8 @@ struct ScenarioContext: Sendable {
 /// repeatedly. New protocols need no new scenarios: they are new nodes.
 struct InteropScenario: Sendable, CustomTestStringConvertible {
     let name: String
-    /// `http`, `https`, `tcp`, `half-close` or `udp` (keys of `known-issue:`).
+    /// `http`, `https`, `tcp`, `half-close`, `udp`, `ipv6` or `ipv6-udp`
+    /// (keys of `known-issue:`).
     let family: String
     /// Routes that can carry it (stream / UDP scenarios are PrizmX only).
     let routes: Set<InteropRoute>
@@ -52,6 +53,12 @@ extension InteropScenario {
         try await $0.http.ping()
     }
 
+    /// An IPv6 address as the target (`http://[fd00:…]/ping`): the client
+    /// sends the address itself, which the server must parse and dial.
+    static let httpPingIPv6 = InteropScenario(name: "http-ping-ipv6", family: "ipv6", routes: [.prizmx, .reference], applies: { _ in true }) {
+        try await $0.http.ping(host: InteropEnvironment.webHost6)
+    }
+
     /// A real DNS query to `dns.test` over the node's UDP relay.
     static let dnsQuery = InteropScenario(name: "udp-dns", family: "udp", routes: [.prizmx], applies: { $0.expectsUDP }) { context in
         let outbound = try #require(try NodeFactory.makeDatagramOutbound(from: context.node.node, to: InteropEnvironment.dnsTarget))
@@ -71,10 +78,16 @@ extension InteropScenario {
         return TransferSample(bytes: query.count, duration: ContinuousClock.now - start)
     }
 
-    /// Datagrams up to a typical MTU payload, echoed back.
-    static func udpEcho(bytes: Int) -> InteropScenario {
-        InteropScenario(name: "udp-echo-\(bytes)", family: "udp", routes: [.prizmx], applies: { $0.expectsUDP }) { context in
-            let target = InteropEnvironment.echoTarget
+    /// Datagrams up to a typical MTU payload, echoed back. `ipv6`: the
+    /// target is named by its IPv6 address.
+    static func udpEcho(bytes: Int, ipv6: Bool = false) -> InteropScenario {
+        InteropScenario(
+            name: ipv6 ? "udp-echo-ipv6-\(bytes)" : "udp-echo-\(bytes)",
+            family: ipv6 ? "ipv6-udp" : "udp",
+            routes: [.prizmx],
+            applies: { $0.expectsUDP }
+        ) { context in
+            let target = ipv6 ? InteropEnvironment.echoTarget6 : InteropEnvironment.echoTarget
             let outbound = try #require(try NodeFactory.makeDatagramOutbound(from: context.node.node, to: target))
             try await outbound.open()
             defer { Task { await outbound.close() } }
@@ -90,10 +103,17 @@ extension InteropScenario {
         }
     }
 
-    /// Full-duplex stream: upload while reading the echo back.
-    static func tcpEcho(bytes: Int) -> InteropScenario {
-        InteropScenario(name: "tcp-echo-\(bytes)", family: "tcp", routes: [.prizmx], applies: { _ in true }) { context in
-            let connection = try NodeFactory.makeConnection(from: context.node.node, to: InteropEnvironment.echoTarget)
+    /// Full-duplex stream: upload while reading the echo back. `ipv6`: the
+    /// target is named by its IPv6 address.
+    static func tcpEcho(bytes: Int, ipv6: Bool = false) -> InteropScenario {
+        InteropScenario(
+            name: ipv6 ? "tcp-echo-ipv6-\(bytes)" : "tcp-echo-\(bytes)",
+            family: ipv6 ? "ipv6" : "tcp",
+            routes: [.prizmx],
+            applies: { _ in true }
+        ) { context in
+            let target = ipv6 ? InteropEnvironment.echoTarget6 : InteropEnvironment.echoTarget
+            let connection = try NodeFactory.makeConnection(from: context.node.node, to: target)
             try await connection.open()
             defer { Task { await connection.close() } }
             var pattern = PayloadPattern(seed: context.seed)

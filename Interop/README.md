@@ -17,6 +17,7 @@ macOS host: PrizmXInteropTests
                                  │  "targets" network (internal: true)
                                  ▼
           target: web.test :80/:443 · dns.test :53/udp · echo.test :7
+                  (also as [fd00:7a6e:7a6e::10] for the IPv6 scenarios)
 
 mihomo (reference client) loads the same nodes; the suite drives it through
 its mixed-port and controller to tell server-side problems from ours.
@@ -24,7 +25,9 @@ its mixed-port and controller to tell server-side problems from ours.
 
 The `targets` network has no published ports and no route out. A request that
 reaches `web.test`, `dns.test` or `echo.test` therefore went through a proxy
-server; no test can pass by accident over a direct path.
+server; no test can pass by accident over a direct path. The network is
+dual-stack: the IPv6 scenarios name the target by its address,
+`fd00:7a6e:7a6e::10`, so each server must parse and dial an IPv6 address.
 
 ## Flow of a run
 
@@ -49,6 +52,8 @@ server; no test can pass by accident over a direct path.
 | `tcp-echo-N` | node outbound | full-duplex stream integrity |
 | `tcp-half-close` | node outbound | `closeWrite` reaches the target as EOF |
 | `udp-dns` / `udp-echo-N` | node `DatagramOutbound` | a real DNS answer from `dns.test`; datagram echo |
+| `http-ping-ipv6` | PrizmX mixed-port, mihomo | `http://[fd00:7a6e:7a6e::10]/ping`: an IPv6 address as the target |
+| `tcp-echo-ipv6-N` / `udp-echo-ipv6-N` | node outbound / `DatagramOutbound` | stream and datagram echo to the IPv6 address |
 
 Payloads are a seeded xorshift64* stream (`target/main.go`,
 `Tests/PrizmXInteropTests/Support/PayloadPattern.swift`). Both sides generate it

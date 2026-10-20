@@ -4,6 +4,8 @@
 #
 # `targets` is internal: it has no published ports and no route out, so a
 # request that reaches web.test / dns.test / echo.test went through a proxy.
+# It is dual-stack: the target also answers on fd00:7a6e:7a6e::10, which the
+# IPv6 scenarios name as an address (no DNS).
 # `mihomo` is the reference client; it loads the same profile.
 name: prizmx-interop
 
@@ -11,6 +13,10 @@ networks:
   edge: {}
   targets:
     internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd00:7a6e:7a6e::/64
 
 services:
   target:
@@ -20,6 +26,7 @@ services:
     networks:
       targets:
         aliases: [web.test, dns.test, echo.test]
+        ipv6_address: fd00:7a6e:7a6e::10
 
   sing-box:
     image: ghcr.io/sagernet/sing-box:v1.14.2

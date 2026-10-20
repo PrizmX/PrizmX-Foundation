@@ -13,7 +13,8 @@
 #   singbox:    profile.singbox.json carries an equivalent node (default true)
 #   known-issue: {<family>: "reason"} for open bugs; those scenarios run as
 #               known issues (reported, not failing) until fixed. Families:
-#               http, https, tcp, half-close, udp
+#               http, https, tcp, half-close, udp, ipv6 (TCP / HTTP to an
+#               IPv6 address), ipv6-udp
 # Node names are `<protocol>-<variant>@<server>`.
 
 proxies:

@@ -38,6 +38,11 @@ enum InteropEnvironment {
     static let echoTarget = Endpoint(domain: "echo.test", port: 7)
     /// The A record `dns.test` serves for any name under `.test`.
     static let dnsAnswer = IPv4Address(198, 51, 100, 7)
+    /// The target's address on the dual-stack `targets` network
+    /// (docker-compose.yml): IPv6 scenarios name it as an address.
+    static let targetIPv6 = IPv6Address(high: 0xfd00_7a6e_7a6e_0000, low: 0x10)
+    static let webHost6 = "[\(targetIPv6)]"
+    static let echoTarget6 = Endpoint(host: .ipv6(targetIPv6), port: 7)
 }
 
 /// One node of `Interop/profile.yaml` with the suite's expectations.

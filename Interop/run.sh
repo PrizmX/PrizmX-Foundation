@@ -38,7 +38,7 @@ fi
 mkdir -p .generated
 {
     printf 'mixed-port: 7890\nallow-lan: true\nbind-address: "*"\nmode: rule\n'
-    printf 'log-level: warning\nipv6: false\nexternal-controller: 0.0.0.0:9090\n\n'
+    printf 'log-level: warning\nipv6: true\nexternal-controller: 0.0.0.0:9090\n\n'
     sed 's/server: 127\.0\.0\.1/server: host.docker.internal/' profile.yaml
 } > .generated/mihomo.yaml
 
