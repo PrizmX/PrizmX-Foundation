@@ -13,6 +13,9 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
     /// Group member names in failover order (selected / first member first).
     public let candidateNames: [String]
     private let makers: [(name: String, make: () throws -> any OutboundConnection)]
+    /// Told which member failed to open (and why), so the group can stop
+    /// picking it.
+    private let onMemberFailure: (@Sendable (String, any Error) -> Void)?
     private let lifecycle = OSAllocatedUnfairLock(initialState: State())
 
     private struct State {
@@ -22,11 +25,17 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
         var chain: [String] = []
     }
 
-    init(target: Endpoint, groupName: String, makers: [(String, () throws -> any OutboundConnection)]) {
+    init(
+        target: Endpoint,
+        groupName: String,
+        makers: [(String, () throws -> any OutboundConnection)],
+        onMemberFailure: (@Sendable (String, any Error) -> Void)? = nil
+    ) {
         self.endpoint = target
         self.groupName = groupName
         self.candidateNames = makers.map(\.0)
         self.makers = makers
+        self.onMemberFailure = onMemberFailure
     }
 
     public var state: OutboundConnectionState {
@@ -81,6 +90,9 @@ public final class FailoverGroupConnection: OutboundConnection, @unchecked Senda
             } catch {
                 TunnelLog.write(.debug, "failover member \(maker.name) for \(endpoint) failed: \(error.localizedDescription)")
                 lastError = error
+                // A flow closed while dialing is not the member's fault.
+                if Task.isCancelled || error is CancellationError { throw error }
+                onMemberFailure?(maker.name, error)
             }
         }
         throw lastError

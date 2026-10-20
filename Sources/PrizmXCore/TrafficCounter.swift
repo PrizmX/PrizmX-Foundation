@@ -58,6 +58,9 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     public var exitBytes: [String: TrafficByteCount]
     public var exitTCPBytes: [String: UInt64]
     public var exitUDPBytes: [String: UInt64]
+    /// Member each url-test / fallback group currently routes through, as
+    /// the engine decided it (the app does not probe and cannot know).
+    public var groupSelections: [String: String]
 
     public init(
         uploadBytesPerSecond: Double = 0,
@@ -83,7 +86,8 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         policyUDPBytes: [String: UInt64] = [:],
         exitBytes: [String: TrafficByteCount] = [:],
         exitTCPBytes: [String: UInt64] = [:],
-        exitUDPBytes: [String: UInt64] = [:]
+        exitUDPBytes: [String: UInt64] = [:],
+        groupSelections: [String: String] = [:]
     ) {
         self.uploadBytesPerSecond = uploadBytesPerSecond
         self.downloadBytesPerSecond = downloadBytesPerSecond
@@ -109,6 +113,7 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         self.exitBytes = exitBytes
         self.exitTCPBytes = exitTCPBytes
         self.exitUDPBytes = exitUDPBytes
+        self.groupSelections = groupSelections
     }
 
     public static let zero = TrafficSnapshot()
@@ -168,7 +173,9 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
             policyUDPBytes: mergeCount(policyUDPBytes, other.policyUDPBytes),
             exitBytes: mergeMap(exitBytes, other.exitBytes),
             exitTCPBytes: mergeCount(exitTCPBytes, other.exitTCPBytes),
-            exitUDPBytes: mergeCount(exitUDPBytes, other.exitUDPBytes)
+            exitUDPBytes: mergeCount(exitUDPBytes, other.exitUDPBytes),
+            // Both engines probe the same groups; this side's (the tunnel's) wins.
+            groupSelections: other.groupSelections.merging(groupSelections) { _, mine in mine }
         )
     }
 
@@ -182,6 +189,7 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         case appTCPBytes, appUDPBytes, domainTCPBytes, domainUDPBytes
         case policyTCPBytes, policyUDPBytes
         case exitBytes, exitTCPBytes, exitUDPBytes
+        case groupSelections
     }
 
     public init(from decoder: Decoder) throws {
@@ -216,6 +224,7 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         exitBytes = try container.decodeIfPresent([String: TrafficByteCount].self, forKey: .exitBytes) ?? [:]
         exitTCPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .exitTCPBytes) ?? [:]
         exitUDPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .exitUDPBytes) ?? [:]
+        groupSelections = try container.decodeIfPresent([String: String].self, forKey: .groupSelections) ?? [:]
     }
 }
 

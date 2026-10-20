@@ -16,6 +16,9 @@ public enum TunnelIPC: Sendable {
         case setOutboundMode
         case setCaptureMode
         case clearFlows
+        /// Rebuild the engine from `providerConfiguration` without
+        /// restarting the tunnel (open flows and FakeIP mappings stay).
+        case reloadConfig
     }
 
     public struct Request: Sendable, Codable, Equatable {
@@ -27,6 +30,9 @@ public enum TunnelIPC: Sendable {
         public var fakeIP: Bool?
         public var systemProxy: Bool?
         public var allowLAN: Bool?
+        /// `reloadConfig`: the new `providerConfiguration` payload, as a
+        /// binary property list.
+        public var providerConfiguration: Data?
 
         public init(
             method: Method,
@@ -36,6 +42,7 @@ public enum TunnelIPC: Sendable {
             fakeIP: Bool? = nil,
             systemProxy: Bool? = nil,
             allowLAN: Bool? = nil,
+            providerConfiguration: Data? = nil,
             version: Int = TunnelIPC.protocolVersion
         ) {
             self.version = version
@@ -46,6 +53,7 @@ public enum TunnelIPC: Sendable {
             self.fakeIP = fakeIP
             self.systemProxy = systemProxy
             self.allowLAN = allowLAN
+            self.providerConfiguration = providerConfiguration
         }
     }
 

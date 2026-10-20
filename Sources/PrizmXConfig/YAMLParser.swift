@@ -1,8 +1,8 @@
 import Foundation
 
-/// Minimal YAML 1.1 subset used by Clash configs: block mappings/sequences,
-/// quoted scalars (including `\u` / `\U` / `\x` escapes), and one-line flow
-/// maps/lists. Not a full YAML 1.2 implementation.
+/// A parsed YAML document as the Clash importer reads it: every scalar is a
+/// string (`~` / `null` read as empty). `YAMLParser.parse` builds it with
+/// libyaml (Yams), falling back to the lenient subset parser below.
 enum YAMLNode: Equatable, Sendable {
     case scalar(String)
     case mapping([String: YAMLNode])
@@ -56,6 +56,11 @@ enum YAMLNode: Equatable, Sendable {
     }
 }
 
+/// Lenient subset parser kept as a fallback for files libyaml rejects but
+/// earlier PrizmX builds imported: tab indentation, several `---` documents
+/// read as one. Block mappings / sequences, quoted scalars (including `\u` /
+/// `\U` / `\x` escapes) and one-line flow maps / lists; no anchors, merge
+/// keys or block scalars.
 enum YAMLParser {
     private struct Line {
         var indent: Int
@@ -63,7 +68,7 @@ enum YAMLParser {
         var number: Int
     }
 
-    static func parse(_ text: String) throws -> YAMLNode {
+    static func parseSubset(_ text: String) throws -> YAMLNode {
         let lines = tokenize(ConfigText.strippingBOM(text))
         guard !lines.isEmpty else { return .mapping([:]) }
         var index = 0

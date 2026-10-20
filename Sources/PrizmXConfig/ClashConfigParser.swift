@@ -37,43 +37,57 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         var warnings: [ConfigWarning] = []
 
         var nodes: [OutboundNode] = []
-        if let proxies = mapping["proxies"]?.sequence {
-            for item in proxies {
-                let name = item.string(for: "name") ?? "?"
-                do {
-                    if let node = try parseClashProxy(item) {
-                        nodes.append(node)
-                    } else {
-                        let type = item.string(for: "type") ?? "?"
-                        warnings.append(ConfigWarning(kind: .proxy, text: name, reason: "unsupported proxy type \(type)"))
-                    }
-                } catch {
-                    warnings.append(ConfigWarning(kind: .proxy, text: name, reason: "invalid proxy: \(error)"))
-                }
+        for item in mapping["proxies"]?.sequence ?? [] {
+            if let node = parseProxyEntry(item, warnings: &warnings) {
+                nodes.append(node)
             }
+        }
+        let mainNodes = nodes
+
+        // proxy-providers: their proxies join the catalog, and groups pick
+        // them up through `use` / `include-all-providers`.
+        var providerNodes: [String: [OutboundNode]] = [:]
+        var names = Set(nodes.map(\.id))
+        for definition in ProviderStore.definitions(in: root) where definition.kind == .proxy {
+            let provided = loadProxyProvider(
+                definition,
+                node: mapping["proxy-providers"]?.mapping?[definition.name],
+                names: &names,
+                warnings: &warnings
+            )
+            providerNodes[definition.name] = provided
+            nodes.append(contentsOf: provided)
         }
 
         var groups = ConfigMapping.implicitGroups(for: nodes)
         if let proxyGroups = mapping["proxy-groups"]?.sequence ?? mapping["proxy_groups"]?.sequence {
             for item in proxyGroups {
-                if let group = parseClashGroup(item, nodes: nodes, warnings: &warnings) {
+                if let group = parseClashGroup(
+                    item,
+                    nodes: mainNodes,
+                    providers: providerNodes,
+                    warnings: &warnings
+                ) {
                     groups.removeAll { $0.name == group.name }
                     groups.append(group)
                 }
             }
         }
 
+        let ruleProviders = RuleProviderResolver(root: root, parser: self)
         var rules: [RouteRule] = []
         if let ruleList = mapping["rules"]?.sequence {
             for item in ruleList {
                 guard let line = item.string, !line.isEmpty else { continue }
                 do {
-                    rules.append(contentsOf: try parseRule(line))
+                    rules.append(contentsOf: try parseRule(line, providers: ruleProviders))
                 } catch let skip as RuleSkip {
                     warnings.append(ConfigWarning(kind: .rule, text: line, reason: skip.reason))
                 }
             }
         }
+        warnings += ruleProviders.warnings
+        warnings += ClashDNSSection.importWarnings(root: root)
 
         groups = ConfigMapping.pruningUndefinedMembers(groups, nodes: nodes, warnings: &warnings)
         let manager = NodeManager(nodes: nodes, groups: groups)
@@ -83,6 +97,97 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             nodeManager: manager,
             warnings: warnings
         )
+    }
+
+    /// One `proxies` entry, or nil (reported) when it cannot be imported.
+    private func parseProxyEntry(_ item: YAMLNode, warnings: inout [ConfigWarning]) -> OutboundNode? {
+        let name = item.string(for: "name") ?? "?"
+        if let hop = item.string(for: "dialer-proxy"), !hop.isEmpty {
+            // Without the chain it would dial the server directly and expose
+            // the client's address; leave it out instead.
+            warnings.append(ConfigWarning(
+                kind: .proxy,
+                text: name,
+                reason: "dialer-proxy (proxy chain via \(hop)) is not supported; skipped so it never connects without it"
+            ))
+            return nil
+        }
+        do {
+            if let node = try parseClashProxy(item) { return node }
+            let type = item.string(for: "type") ?? "?"
+            warnings.append(ConfigWarning(kind: .proxy, text: name, reason: "unsupported proxy type \(type)"))
+        } catch {
+            warnings.append(ConfigWarning(kind: .proxy, text: name, reason: "invalid proxy: \(error)"))
+        }
+        return nil
+    }
+
+    /// Proxies of one `proxy-providers` entry: inline `payload`, or the
+    /// downloaded body (Clash YAML `proxies`, or a share-link list). Names
+    /// already taken get the provider's name appended.
+    private func loadProxyProvider(
+        _ definition: ProviderStore.Definition,
+        node: YAMLNode?,
+        names: inout Set<String>,
+        warnings: inout [ConfigWarning]
+    ) -> [OutboundNode] {
+        func warn(_ reason: String) {
+            warnings.append(ConfigWarning(kind: .proxy, text: "provider \(definition.name)", reason: reason))
+        }
+        if definition.unsupportedKeys.contains("dialer-proxy") {
+            warn("dialer-proxy (proxy chain) is not supported; its proxies are left out")
+            return []
+        }
+        if definition.unsupportedKeys.contains("override") {
+            warn("override is not supported; proxies are imported as the provider sends them")
+        }
+        let entries: [YAMLNode]
+        switch definition.type {
+        case "inline":
+            entries = node?.mapping?["payload"]?.sequence ?? []
+        case "http":
+            guard let body = ProviderStore.cachedBody(for: definition)?.text else {
+                warn("not downloaded yet; its proxies are missing until it is")
+                return []
+            }
+            entries = Self.providerProxies(body)
+        default:
+            warn("\(definition.type) providers are not supported (use http or inline)")
+            return []
+        }
+        var provided: [OutboundNode] = []
+        for entry in entries {
+            guard var parsed = parseProxyEntry(entry, warnings: &warnings) else { continue }
+            if names.contains(parsed.id) {
+                let renamed = "\(parsed.id) (\(definition.name))"
+                guard !names.contains(renamed) else {
+                    warn("duplicate proxy name \(parsed.id) skipped")
+                    continue
+                }
+                parsed = OutboundNode(id: renamed, name: renamed, protocolConfig: parsed.protocolConfig)
+            }
+            provided.append(parsed)
+        }
+        // Provider-level filters (mihomo `filter` / `exclude-filter` / `exclude-type`).
+        if let node {
+            let kept = Set(filtered(provided, by: node, name: "provider \(definition.name)", warnings: &warnings))
+            provided = provided.filter { kept.contains($0.id) }
+        }
+        names.formUnion(provided.map(\.id))
+        return provided
+    }
+
+    /// `proxies` of a provider body: Clash YAML, or share links (plain or
+    /// base64) converted the same way subscriptions are.
+    static func providerProxies(_ body: String) -> [YAMLNode] {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let root = try? YAMLParser.parse(trimmed), let proxies = root.mapping?["proxies"]?.sequence {
+            return proxies
+        }
+        let links = ProxyURIList.clashYAML(from: trimmed)
+            ?? ProxyURIList.decodeBase64(trimmed).flatMap(ProxyURIList.clashYAML(from:))
+        guard let links, let root = try? YAMLParser.parse(links) else { return [] }
+        return root.mapping?["proxies"]?.sequence ?? []
     }
 
     private func parseClashProxy(_ node: YAMLNode) throws -> OutboundNode? {
@@ -358,6 +463,7 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
     private func parseClashGroup(
         _ node: YAMLNode,
         nodes: [OutboundNode],
+        providers: [String: [OutboundNode]] = [:],
         warnings: inout [ConfigWarning]
     ) -> PolicyGroup? {
         guard let name = node.string(for: "name"), !name.isEmpty else {
@@ -365,22 +471,49 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             return nil
         }
         let type = node.string(for: "type") ?? "select"
-        var members: [String] = node.mapping?["proxies"]?.sequence?.compactMap(\.string) ?? []
-
-        let usesProviders = !(node.mapping?["use"]?.sequence ?? []).isEmpty
-            || node.bool(for: "include-all-providers")
-        if usesProviders {
+        switch type.lowercased() {
+        case "relay":
+            // A chain dials each hop through the previous one, which the
+            // outbound stack cannot do; never let it go out on one hop.
             warnings.append(ConfigWarning(
                 kind: .group,
                 text: name,
-                reason: "proxy providers (use / include-all-providers) are not supported; their proxies are missing"
+                reason: "relay (proxy chain) groups are not supported; rules using it fail closed"
             ))
+            return nil
+        case "smart":
+            warnings.append(ConfigWarning(kind: .group, text: name, reason: "smart groups are imported as url-test"))
+        case "select", "url-test", "urltest", "fallback", "load-balance", "loadbalance":
+            break
+        default:
+            warnings.append(ConfigWarning(kind: .group, text: name, reason: "unknown group type \(type), imported as select"))
         }
-        if node.bool(for: "include-all") || node.bool(for: "include-all-proxies") {
-            let included = includeAll(node, name: name, nodes: nodes, warnings: &warnings)
-            for id in included where !members.contains(id) {
+        var members: [String] = node.mapping?["proxies"]?.sequence?.compactMap(\.string) ?? []
+        func add(_ ids: [String]) {
+            for id in ids where !members.contains(id) {
                 members.append(id)
             }
+        }
+
+        // mihomo applies the group's filters to provider and include-all
+        // proxies, never to the ones listed by name.
+        var candidates: [OutboundNode] = []
+        for provider in node.mapping?["use"]?.sequence?.compactMap(\.string) ?? [] {
+            guard let provided = providers[provider] else {
+                warnings.append(ConfigWarning(kind: .group, text: name, reason: "proxy provider \(provider) is not defined"))
+                continue
+            }
+            candidates += provided
+        }
+        let includeAll = node.bool(for: "include-all")
+        if includeAll || node.bool(for: "include-all-providers") {
+            candidates += providers.keys.sorted().flatMap { providers[$0] ?? [] }
+        }
+        if includeAll || node.bool(for: "include-all-proxies") {
+            candidates += nodes
+        }
+        if !candidates.isEmpty {
+            add(filtered(candidates, by: node, name: name, warnings: &warnings))
         }
         guard !members.isEmpty else {
             warnings.append(ConfigWarning(
@@ -393,7 +526,7 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         let icon = node.string(for: "icon")
         return PolicyGroup(
             name: name,
-            mode: ConfigMapping.groupMode(clashType: type),
+            mode: type.lowercased() == "smart" ? .urlTest : ConfigMapping.groupMode(clashType: type),
             nodeIDs: members,
             selectedNodeID: members.first,
             iconURL: icon.flatMap(URL.init(string:)),
@@ -406,10 +539,12 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         )
     }
 
-    private func includeAll(
-        _ node: YAMLNode,
+    /// `filter` / `exclude-filter` / `exclude-type` of `node` (a group or a
+    /// proxy provider) applied to `nodes`.
+    private func filtered(
+        _ nodes: [OutboundNode],
+        by node: YAMLNode,
         name: String,
-        nodes: [OutboundNode],
         warnings: inout [ConfigWarning]
     ) -> [String] {
         // mihomo splits multiple patterns with a backtick.
@@ -714,69 +849,293 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         }
     }
 
-    /// `TYPE,payload,target[,no-resolve]` or `MATCH,target` / `FINAL,target`.
+    /// `TYPE,payload,target[,no-resolve]`, `MATCH,target` / `FINAL,target`,
+    /// or a logical rule (`AND,((DOMAIN,a),(NETWORK,UDP)),target`).
+    /// `providers` resolves `RULE-SET` names (Clash YAML only).
     /// Throws `RuleSkip` for anything that cannot be imported exactly.
-    func parseRule(_ raw: String) throws -> [RouteRule] {
-        let line = raw.trimmingCharacters(in: .whitespaces)
-        let parts = line.split(separator: ",", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+    func parseRule(_ raw: String, providers: RuleProviderResolver? = nil) throws -> [RouteRule] {
+        let parts = Self.splitTopLevel(raw.trimmingCharacters(in: .whitespaces))
         guard let kind = parts.first?.uppercased(), !kind.isEmpty else {
             throw RuleSkip("malformed rule")
         }
 
         if kind == "MATCH" || kind == "FINAL" {
             guard parts.count >= 2, !parts[1].isEmpty else { throw RuleSkip("missing policy") }
+            if parts[1].uppercased() == "PASS" { return [] }
             return [RouteRule(.matchAll, policy: ConfigMapping.policy(named: parts[1]))]
-        }
-        guard Self.supportedRuleTypes.contains(kind) else {
-            throw RuleSkip("unsupported rule type \(kind)")
         }
         guard parts.count >= 3, !parts[1].isEmpty, !parts[2].isEmpty else {
             throw RuleSkip("malformed rule")
         }
         let payload = parts[1]
+        // PASS hands the connection to the next rule, which is what leaving
+        // the rule out does.
+        if parts[2].uppercased() == "PASS" { return [] }
         let policy = ConfigMapping.policy(named: parts[2])
+        let noResolve = try Self.noResolve(parts.dropFirst(3))
+
+        // mihomo's `LAN` pseudo-country is not in the MMDB.
+        if kind == "GEOIP", payload.uppercased() == "LAN" {
+            return try ConfigMapping.privateCIDRs.map {
+                try RouteRule(type: .ipCIDR($0), policy: policy, noResolve: noResolve)
+            }
+        }
+        let matcher = try compileCondition(kind: kind, payload: payload, providers: providers)
+        return [RouteRule(matcher, policy: policy, noResolve: noResolve)]
+    }
+
+    /// One condition without a target: a rule's matcher, a part of AND /
+    /// OR / NOT, or a line of a classical rule set.
+    func compileCondition(
+        kind rawKind: String,
+        payload: String,
+        providers: RuleProviderResolver?
+    ) throws -> RouteRule.HostMatcher {
+        let kind = rawKind.uppercased()
+        switch kind {
+        case "AND", "OR", "NOT":
+            let conditions = try Self.logicalOperands(payload).map { body in
+                try parseCondition(body, providers: providers)
+            }
+            switch kind {
+            case "AND":
+                guard !conditions.isEmpty else { throw RuleSkip("AND without conditions") }
+                return .and(conditions)
+            case "OR":
+                guard !conditions.isEmpty else { throw RuleSkip("OR without conditions") }
+                return .or(conditions)
+            default:
+                guard conditions.count == 1 else { throw RuleSkip("NOT takes exactly one condition") }
+                return .not(conditions[0])
+            }
+        case "RULE-SET":
+            guard let providers else { throw RuleSkip("RULE-SET is only supported in Clash profiles") }
+            return .ruleSet(try providers.ruleSet(named: payload))
+        case "GEOIP" where payload.uppercased() == "LAN":
+            return .or(try ConfigMapping.privateCIDRs.map { RuleCondition(try RouteRule.compile(.ipCIDR($0))) })
+        default:
+            break
+        }
+        guard let type = Self.ruleType(kind: kind, payload: payload) else {
+            throw RuleSkip("unsupported rule type \(kind)")
+        }
+        do {
+            return try RouteRule.compile(type)
+        } catch {
+            throw RuleSkip("invalid payload \(payload)")
+        }
+    }
+
+    /// `TYPE,payload[,no-resolve]` (a logical operand or a classical line).
+    func parseCondition(_ body: String, providers: RuleProviderResolver?) throws -> RuleCondition {
+        let parts = Self.splitTopLevel(body)
+        guard parts.count >= 2, let kind = parts.first, !kind.isEmpty else {
+            throw RuleSkip("malformed condition \(body)")
+        }
+        let matcher = try compileCondition(kind: kind, payload: parts[1], providers: providers)
+        return RuleCondition(matcher, noResolve: try Self.noResolve(parts.dropFirst(2)))
+    }
+
+    private static func ruleType(kind: String, payload: String) -> RuleType? {
+        switch kind {
+        case "DOMAIN": .domain(payload)
+        case "DOMAIN-SUFFIX", "DOMAINSUFFIX": .domainSuffix(payload)
+        case "DOMAIN-KEYWORD", "DOMAINKEYWORD": .domainKeyword(payload)
+        case "DOMAIN-REGEX": .domainRegex(payload)
+        case "DOMAIN-WILDCARD": .domainWildcard(payload)
+        case "IP-CIDR", "IP-CIDR6", "IPCIDR": .ipCIDR(payload)
+        case "SRC-IP-CIDR": .srcIPCIDR(payload)
+        case "GEOIP": .geoIP(code: payload)
+        case "GEOSITE": .geosite(tag: payload)
+        case "DST-PORT": .dstPort(payload)
+        case "SRC-PORT": .srcPort(payload)
+        case "IN-PORT": .inPort(payload)
+        case "NETWORK": .network(payload)
+        case "PROCESS-NAME": .processName(payload)
+        case "PROCESS-PATH": .processPath(payload)
+        case "PROCESS-NAME-REGEX": .processNameRegex(payload)
+        case "PROCESS-PATH-REGEX": .processPathRegex(payload)
+        default: nil
+        }
+    }
+
+    /// Only `no-resolve` is honored; other options (e.g. `src`) change what
+    /// is matched.
+    private static func noResolve(_ options: some Collection<String>) throws -> Bool {
         var noResolve = false
-        for option in parts.dropFirst(3) where !option.isEmpty {
-            // Other options (e.g. `src`) change what is matched.
+        for option in options where !option.isEmpty {
             guard option.lowercased() == "no-resolve" else {
                 throw RuleSkip("unsupported rule option \(option)")
             }
             noResolve = true
         }
+        return noResolve
+    }
 
-        do {
-            switch kind {
-            case "DOMAIN":
-                return [try RouteRule(type: .domain(payload), policy: policy, noResolve: noResolve)]
-            case "DOMAIN-SUFFIX", "DOMAINSUFFIX":
-                return [try RouteRule(type: .domainSuffix(payload), policy: policy, noResolve: noResolve)]
-            case "DOMAIN-KEYWORD", "DOMAINKEYWORD":
-                return [try RouteRule(type: .domainKeyword(payload), policy: policy, noResolve: noResolve)]
-            case "IP-CIDR", "IP-CIDR6", "IPCIDR":
-                return [try RouteRule(type: .ipCIDR(payload), policy: policy, noResolve: noResolve)]
-            case "GEOIP":
-                // mihomo's `LAN` pseudo-country is not in the MMDB.
-                if payload.uppercased() == "LAN" {
-                    return try ConfigMapping.privateCIDRs.map {
-                        try RouteRule(type: .ipCIDR($0), policy: policy, noResolve: noResolve)
-                    }
-                }
-                return [try RouteRule(type: .geoIP(code: payload), policy: policy, noResolve: noResolve)]
-            case "GEOSITE":
-                return [try RouteRule(type: .geosite(tag: payload), policy: policy)]
+    /// Splits on commas outside parentheses: `AND,((A,b),(C,d)),P` →
+    /// `AND`, `((A,b),(C,d))`, `P`.
+    static func splitTopLevel(_ text: String) -> [String] {
+        var parts: [String] = []
+        var current = ""
+        var depth = 0
+        for character in text {
+            switch character {
+            case "(":
+                depth += 1
+            case ")":
+                depth = max(0, depth - 1)
+            case "," where depth == 0:
+                parts.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+                continue
             default:
-                throw RuleSkip("unsupported rule type \(kind)")
+                break
             }
-        } catch is RuleCompileError {
-            throw RuleSkip("invalid payload \(payload)")
+            current.append(character)
+        }
+        parts.append(current.trimmingCharacters(in: .whitespaces))
+        return parts
+    }
+
+    /// `((A,b),(C,d))` → `A,b` and `C,d`.
+    private static func logicalOperands(_ payload: String) throws -> [String] {
+        var inner = payload.trimmingCharacters(in: .whitespaces)
+        guard inner.hasPrefix("("), inner.hasSuffix(")") else { throw RuleSkip("malformed logical rule") }
+        inner = String(inner.dropFirst().dropLast())
+        return try splitTopLevel(inner).map { operand in
+            let trimmed = operand.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("("), trimmed.hasSuffix(")") else { throw RuleSkip("malformed logical rule") }
+            return String(trimmed.dropFirst().dropLast())
+        }
+    }
+}
+
+extension ClashConfigParser {
+    /// Rule providers named outside `rules` (DNS `rule-set:` keys), built
+    /// the same way RULE-SET builds them. Unknown or failing names are left out.
+    static func ruleSets(named names: [String], configText: String) -> [String: RuleSet] {
+        guard !names.isEmpty, let root = try? YAMLParser.parse(ConfigText.normalized(configText)) else { return [:] }
+        let resolver = RuleProviderResolver(root: root, parser: ClashConfigParser())
+        var sets: [String: RuleSet] = [:]
+        for name in names {
+            if let set = try? resolver.ruleSet(named: name) { sets[name] = set }
+        }
+        return sets
+    }
+}
+
+/// Loads `rule-providers` payloads for `RULE-SET` while one profile is
+/// parsed: inline payloads, or files `ProviderStore` downloaded. Each set is
+/// built once per parse (and reused across parses while its file is
+/// unchanged). Problems are collected in `warnings`.
+final class RuleProviderResolver {
+    private let definitions: [String: ProviderStore.Definition]
+    private let inline: [String: [String]]
+    private let parser: ClashConfigParser
+    private var loaded: [String: RuleSet] = [:]
+    private var loading: Set<String> = []
+    private(set) var warnings: [ConfigWarning] = []
+
+    init(root: YAMLNode, parser: ClashConfigParser) {
+        var definitions: [String: ProviderStore.Definition] = [:]
+        for definition in ProviderStore.definitions(in: root) where definition.kind == .rule {
+            definitions[definition.name] = definition
+        }
+        var inline: [String: [String]] = [:]
+        for (name, node) in root.mapping?["rule-providers"]?.mapping ?? [:] {
+            if let payload = node.mapping?["payload"]?.sequence {
+                inline[name] = payload.compactMap(\.string)
+            }
+        }
+        self.definitions = definitions
+        self.inline = inline
+        self.parser = parser
+    }
+
+    func ruleSet(named name: String) throws -> RuleSet {
+        if let set = loaded[name] { return set }
+        guard let definition = definitions[name] else {
+            throw RuleSkip("rule provider \(name) is not defined")
+        }
+        guard !loading.contains(name) else { throw RuleSkip("rule provider \(name) refers to itself") }
+        loading.insert(name)
+        defer { loading.remove(name) }
+        if definition.format == "mrs" {
+            throw RuleSkip("rule provider \(name): mrs (binary) format is not supported")
+        }
+        let set: RuleSet
+        switch definition.type {
+        case "inline":
+            set = build(definition, entries: inline[name] ?? []).set
+        case "http":
+            guard let cached = ProviderStore.cachedBody(for: definition) else {
+                warn(name, "not downloaded yet; RULE-SET matches nothing until it is")
+                set = RuleSet(name: name, domains: [])
+                break
+            }
+            if let hit = RuleSetCache.lookup(definition, modified: cached.modified) {
+                set = hit.0
+                if hit.1 > 0 { warn(name, "\(hit.1) entries skipped (unsupported or malformed)") }
+            } else {
+                let built = build(definition, entries: Self.entries(of: cached.text, format: definition.format))
+                if definition.behavior != "classical" {
+                    // Classical sets may name other providers; keep those per parse.
+                    RuleSetCache.store(built.set, skipped: built.skipped, for: definition, modified: cached.modified)
+                }
+                set = built.set
+            }
+        default:
+            throw RuleSkip("rule provider \(name): \(definition.type) providers are not supported (use http or inline)")
+        }
+        loaded[name] = set
+        return set
+    }
+
+    private func build(_ definition: ProviderStore.Definition, entries: [String]) -> (set: RuleSet, skipped: Int) {
+        let name = definition.name
+        switch definition.behavior ?? "classical" {
+        case "domain":
+            return (RuleSet(name: name, domains: entries), 0)
+        case "ipcidr":
+            let set = RuleSet(name: name, cidrs: entries)
+            let skipped = entries.count - set.count
+            if skipped > 0 { warn(name, "\(skipped) malformed CIDR entries skipped") }
+            return (set, skipped)
+        default:
+            var conditions: [RuleCondition] = []
+            var skipped = 0
+            for entry in entries {
+                if let condition = try? parser.parseCondition(entry, providers: self) {
+                    conditions.append(condition)
+                } else {
+                    skipped += 1
+                }
+            }
+            if skipped > 0 { warn(name, "\(skipped) entries skipped (unsupported or malformed)") }
+            return (RuleSet(name: name, conditions: conditions), skipped)
         }
     }
 
-    private static let supportedRuleTypes: Set<String> = [
-        "DOMAIN", "DOMAIN-SUFFIX", "DOMAINSUFFIX", "DOMAIN-KEYWORD", "DOMAINKEYWORD",
-        "IP-CIDR", "IP-CIDR6", "IPCIDR", "GEOIP", "GEOSITE",
-    ]
+    /// Provider body lines: YAML `payload:`, or plain text, one per line.
+    static func entries(of body: String, format: String) -> [String] {
+        if format != "text",
+           let root = try? YAMLParser.parse(body),
+           let payload = root.mapping?["payload"]?.sequence {
+            return payload.compactMap(\.string).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        }
+        return body.split(whereSeparator: \.isNewline).compactMap { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), !trimmed.hasPrefix("//") else { return nil }
+            // `- 'entry'` lines of a YAML body that did not parse as a whole.
+            var entry = trimmed
+            if entry.hasPrefix("- ") { entry.removeFirst(2) }
+            return entry.trimmingCharacters(in: CharacterSet(charactersIn: "'\" "))
+        }
+    }
+
+    private func warn(_ name: String, _ reason: String) {
+        warnings.append(ConfigWarning(kind: .rule, text: "RULE-SET \(name)", reason: reason))
+    }
 }
 
 /// A rule the importer refuses to apply (unsupported or malformed).

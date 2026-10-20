@@ -18,7 +18,13 @@ private typealias IPv4Address = PrizmXProtocols.IPv4Address
 /// sends run there. A slow or dead destination only delays its own flow.
 public enum TUNUDPRelay: Sendable {
     public static func run(stack: TUNStack, engine: Engine) async {
-        let state = UDPRelayState(stack: stack, engine: engine)
+        await run(stack: stack, engineProvider: { engine })
+    }
+
+    /// `engineProvider` is read for each new flow, so a config reload takes
+    /// effect without dropping open UDP sessions.
+    public static func run(stack: TUNStack, engineProvider: @escaping @Sendable () -> Engine) async {
+        let state = UDPRelayState(stack: stack, engineProvider: engineProvider)
         await stack.setUDPSessionClosedHandler { flow in
             Task { await state.stackClosed(flow) }
         }
@@ -32,7 +38,9 @@ public enum TUNUDPRelay: Sendable {
 
 private actor UDPRelayState {
     private let stack: TUNStack
-    private let engine: Engine
+    private let engineProvider: @Sendable () -> Engine
+    /// Current engine. Its traffic counter is shared across reloads.
+    private var engine: Engine { engineProvider() }
     private var slots: [UDPFlowKey: FlowSlot] = [:]
     private var keysByFlow: [FlowKey: UDPFlowKey] = [:]
 
@@ -57,9 +65,9 @@ private actor UDPRelayState {
         }
     }
 
-    init(stack: TUNStack, engine: Engine) {
+    init(stack: TUNStack, engineProvider: @escaping @Sendable () -> Engine) {
         self.stack = stack
-        self.engine = engine
+        self.engineProvider = engineProvider
     }
 
     func ingest(_ datagram: TUNUDPDatagram) {
@@ -198,7 +206,16 @@ private struct UDPSessionOpener: Sendable {
     let datagram: TUNUDPDatagram
 
     func open() async -> (any UDPSession)? {
-        switch await engine.resolvePolicy(for: datagram.destination) {
+        // Process lookup reads the socket table; do it only for PROCESS rules.
+        let process = engine.router.needsProcess ? attribution() : nil
+        let context = RouteContext(
+            network: .udp,
+            sourceHost: .ipv4(key.client),
+            sourcePort: key.clientPort,
+            processName: process?.processName,
+            processPath: process?.executablePath
+        )
+        switch await engine.resolvePolicy(for: datagram.destination, context: context) {
         case .reject:
             await dropUDP(onceKey: "udp-reject", reason: "UDP dropped: reject")
             return nil

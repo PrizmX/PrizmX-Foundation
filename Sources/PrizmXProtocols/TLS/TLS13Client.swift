@@ -190,6 +190,13 @@ enum TLS13ClientHelloBuilder {
         let random = random ?? TLS13Random.bytes(32)
         precondition(random.count == 32, "ClientHello.Random must be 32 bytes")
         let publicKey = Array(ephemeral.publicKey.rawRepresentation)
+        // SNI and ALPN come from the profile. Their wire lengths are 8 / 16
+        // bits and the writer traps past them, so bound them here: a host
+        // name is at most 255 bytes, and a few ALPN ids keep the hello far
+        // below 64 KiB. An oversized SNI is left out (the handshake then
+        // fails like any other mismatch instead of crashing the extension).
+        let serverName = serverName.flatMap { $0.utf8.count <= 255 ? $0 : nil }
+        let alpn = Array(alpn.filter { !$0.isEmpty }.prefix(16))
 
         var body = TLS13ByteWriter()
         body.u16(TLS13.versionTLS12)

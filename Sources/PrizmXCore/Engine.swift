@@ -84,7 +84,8 @@ public final class Engine: Sendable {
     public func matchTarget(
         _ endpoint: Endpoint,
         resolvedIPv4: IPv4Address? = nil,
-        resolvedIPv6: IPv6Address? = nil
+        resolvedIPv6: IPv6Address? = nil,
+        context: RouteContext = .none
     ) -> (policy: Policy, rule: String) {
         let state = runtime.withLock { $0 }
         switch state.mode {
@@ -98,7 +99,8 @@ public final class Engine: Sendable {
             let result = router.matchResult(
                 endpoint: endpoint,
                 resolvedIPv4: resolvedIPv4,
-                resolvedIPv6: resolvedIPv6
+                resolvedIPv6: resolvedIPv6,
+                context: context
             )
             return (result.policy, result.rule?.inspectorLabel ?? "FINAL")
         }
@@ -109,7 +111,7 @@ public final class Engine: Sendable {
         case .ipv4(let address):
             return address
         case .domain(let domain):
-            if let address = SystemHosts.lookup(domain)?.ipv4.first {
+            if let address = dns.hostsLookup(domain)?.ipv4.first {
                 return address
             }
             guard router.needsIPResolution else { return nil }
@@ -122,11 +124,14 @@ public final class Engine: Sendable {
     /// Rule match that resolves a domain only when the walk first reaches a
     /// GEOIP / IP-CIDR rule that needs it (once). A domain rule matching
     /// earlier never sends the name to the direct resolver.
-    public func resolveAndMatch(_ endpoint: Endpoint) async -> (policy: Policy, rule: String) {
+    public func resolveAndMatch(
+        _ endpoint: Endpoint,
+        context: RouteContext = .none
+    ) async -> (policy: Policy, rule: String) {
         let state = runtime.withLock { $0 }
         guard state.mode == .rule else { return matchTarget(endpoint) }
         let dns = self.dns
-        let result = await router.matchResult(endpoint: endpoint) {
+        let result = await router.matchResult(endpoint: endpoint, context: context) {
             guard case .domain(let domain) = endpoint.host else { return ResolvedAddresses() }
             // The answer lands in DNSClient's cache, so a DIRECT dial of the
             // same name reuses it instead of querying again.
@@ -136,13 +141,18 @@ public final class Engine: Sendable {
     }
 
     /// Effective policy with lazy resolution (see `resolveAndMatch`).
-    public func resolvePolicy(for endpoint: Endpoint) async -> Policy {
+    public func resolvePolicy(for endpoint: Endpoint, context: RouteContext = .none) async -> Policy {
         if let hosts = hostsMapping(for: endpoint) {
-            let policy = policy(for: endpoint, resolvedIPv4: hosts.ipv4.first, resolvedIPv6: hosts.ipv6.first)
+            let policy = matchTarget(
+                endpoint,
+                resolvedIPv4: hosts.ipv4.first,
+                resolvedIPv6: hosts.ipv6.first,
+                context: context
+            ).policy
             if hosts.isLocalBinding, case .proxy = policy { return .direct }
             return policy
         }
-        return await resolveAndMatch(endpoint).policy
+        return await resolveAndMatch(endpoint, context: context).policy
     }
 
     /// Matches `target` and returns the corresponding outbound connection.
@@ -157,13 +167,19 @@ public final class Engine: Sendable {
     public func resolveAndDispatch(
         target: Endpoint,
         command: VLESSCommand = .tcp,
-        remoteClient: Bool = false
+        remoteClient: Bool = false,
+        context: RouteContext = .none
     ) async throws -> (connection: any OutboundConnection, rule: String, policy: String) {
         if let hosts = hostsMapping(for: target) {
-            let matched = matchTarget(target, resolvedIPv4: hosts.ipv4.first, resolvedIPv6: hosts.ipv6.first)
+            let matched = matchTarget(
+                target,
+                resolvedIPv4: hosts.ipv4.first,
+                resolvedIPv6: hosts.ipv6.first,
+                context: context
+            )
             return try connection(for: target, command: command, matched: matched, hosts: hosts, remoteClient: remoteClient)
         }
-        let matched = await resolveAndMatch(target)
+        let matched = await resolveAndMatch(target, context: context)
         return try connection(for: target, command: command, matched: matched, hosts: nil, remoteClient: remoteClient)
     }
 
@@ -245,7 +261,7 @@ public final class Engine: Sendable {
     /// Hosts-file hit for a domain destination. IP literals are already resolved.
     private func hostsMapping(for endpoint: Endpoint) -> SystemHosts.Mapping? {
         guard case .domain(let domain) = endpoint.host else { return nil }
-        guard let mapping = SystemHosts.lookup(domain), !mapping.isEmpty else { return nil }
+        guard let mapping = dns.hostsLookup(domain), !mapping.isEmpty else { return nil }
         return mapping
     }
 
@@ -258,9 +274,22 @@ public final class Engine: Sendable {
     public func dnsPolicy(host: String) async -> Policy? {
         let endpoint = Endpoint(domain: host, port: 443)
         let policy: Policy
-        if hostsMapping(for: endpoint) != nil || outboundMode != .rule {
-            // Hosts hits and MODE,DIRECT / GLOBAL match without a lookup.
+        if outboundMode != .rule {
+            // MODE,DIRECT / GLOBAL match without a lookup.
             policy = await resolvePolicy(for: endpoint)
+        } else if let hosts = hostsMapping(for: endpoint) {
+            // The hosts addresses stand in for a lookup; rules that need the
+            // connection still leave the answer to the dial.
+            guard let matched = router.matchWithoutResolving(
+                endpoint: endpoint,
+                resolvedIPv4: hosts.ipv4.first,
+                resolvedIPv6: hosts.ipv6.first
+            ) else { return nil }
+            if hosts.isLocalBinding, case .proxy = matched.policy {
+                policy = .direct
+            } else {
+                policy = matched.policy
+            }
         } else {
             guard let matched = router.matchWithoutResolving(endpoint: endpoint) else { return nil }
             policy = matched.policy
@@ -320,10 +349,15 @@ public final class Engine: Sendable {
                             if remaining < sleepFor { sleepFor = remaining }
                         }
                     }
+                    // A failed dial queues its groups for an early re-probe,
+                    // so a dead member is confirmed (or restored) in seconds
+                    // rather than at the next interval.
+                    due.formUnion(manager.takePendingRechecks())
                     if !due.isEmpty {
                         await manager.probeURLTestGroups(groupNames: due)
                     }
-                    let wait = sleepFor < .milliseconds(200) ? Duration.milliseconds(200) : sleepFor
+                    // Wake at least once a second to pick up those requests.
+                    let wait = min(max(sleepFor, .milliseconds(200)), .seconds(1))
                     try? await Task.sleep(for: wait)
                 }
             }

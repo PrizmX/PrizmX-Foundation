@@ -151,7 +151,7 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
         // IP and the next candidate is tried immediately. A hosts-file hit is
         // dialed as written and does not fall through to upstream DNS.
         var candidates: [(host: NWEndpoint.Host, address: PrizmXProtocols.IPv4Address?)]
-        if case .domain(let domain) = endpoint.host, let mapped = SystemHosts.lookup(domain) {
+        if case .domain(let domain) = endpoint.host, let mapped = DNSClient.hostsLookup(domain) {
             candidates = mapped.addresses.filter(permits).prefix(8).map { (NWEndpoint.Host($0.description), nil) }
         } else if case .domain = endpoint.host {
             guard DNSClient.current != nil else { throw DNSError.notConfigured }

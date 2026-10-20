@@ -21,7 +21,8 @@ public enum EngineFactory: Sendable {
         overlay: ProfileOverlay = .empty,
         flowAttributor: (any FlowAttributing)? = nil,
         dnsPersistenceURL: URL? = DNSClient.defaultPersistenceURL,
-        overrideDNS: Bool? = nil
+        overrideDNS: Bool? = nil,
+        traffic: TrafficCounter? = nil
     ) throws -> Engine {
         let parsed: (Router, NodeManager)
         if let configText {
@@ -44,10 +45,26 @@ public enum EngineFactory: Sendable {
 
         let dnsSection = configText.flatMap { ClashDNSSection.parse(from: $0) }
         let overrideDNS = overrideDNS ?? DNSPreferenceStore.load().overrideDNS
+
+        // Geo data first: the DNS section (nameserver-policy, fallback-filter)
+        // uses it as well as the rules. Nested rules count too: AND / OR /
+        // NOT and classical rule sets.
+        let geoIP = Self.loadGeoIP(geoIPURL)
+        let ruleTags = parsed.0.rules.flatMap(\.matcher.flattened).compactMap { matcher -> String? in
+            if case .geosite(let tag) = matcher { return tag }
+            return nil
+        }
+        let geositeTags = Set(ruleTags + (dnsSection?.geositeTags ?? []))
+        let geosite = Self.loadGeosite(url: geositeURL, json: geositeJSON, tags: geositeTags)
+        let dnsRuleSets = configText.map {
+            ClashConfigParser.ruleSets(named: dnsSection?.ruleSetNames ?? [], configText: $0)
+        } ?? [:]
+
         var dnsSettings = DNSSettings.fromClash(
             section: dnsSection,
             systemDNS: systemDNS,
-            overrideDNS: overrideDNS
+            overrideDNS: overrideDNS,
+            matchers: DNSMatchers(geoIP: geoIP, geosite: geosite, ruleSets: dnsRuleSets)
         )
         Self.logNodeDNS(section: dnsSection, settings: dnsSettings, overrideDNS: overrideDNS)
         // Node server domains never receive fake IPs: an app-side lookup
@@ -66,12 +83,6 @@ public enum EngineFactory: Sendable {
             pinnedNodeAddresses: pinnedNodeAddresses
         )
 
-        let geoIP = Self.loadGeoIP(geoIPURL)
-        let geositeTags = Set(parsed.0.rules.compactMap { rule -> String? in
-            if case .geosite(let tag) = rule.matcher { return tag }
-            return nil
-        })
-        let geosite = Self.loadGeosite(url: geositeURL, json: geositeJSON, tags: geositeTags)
         let router = Router(
             rules: parsed.0.rules,
             default: parsed.0.defaultPolicy,
@@ -94,10 +105,28 @@ public enum EngineFactory: Sendable {
             router: router,
             nodeManager: nodeManager,
             dns: dns,
+            traffic: traffic ?? TrafficCounter(),
             outboundMode: mode,
             globalGroup: group,
             flowAttributor: flowAttributor
         )
+    }
+
+    /// Resolver for app-side work outside an engine (UI delay tests): the
+    /// profile's DNS section over the app-captured system resolvers, with
+    /// the pinned node addresses.
+    public static func makeAppDNS(
+        configText: String?,
+        systemDNS: [String],
+        pinnedNodeAddresses: [String: [IPv4Address]]
+    ) -> DNSClient {
+        let section = configText.flatMap { ClashDNSSection.parse(from: $0) }
+        let settings = DNSSettings.fromClash(
+            section: section,
+            systemDNS: systemDNS,
+            overrideDNS: DNSPreferenceStore.load().overrideDNS
+        )
+        return DNSClient(settings: settings, persistenceURL: nil, pinnedNodeAddresses: pinnedNodeAddresses)
     }
 
     /// One line naming who resolves node hostnames, plus profile

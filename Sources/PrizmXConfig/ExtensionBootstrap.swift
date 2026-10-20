@@ -44,7 +44,12 @@ public struct ExtensionBootstrap: Sendable {
         overlay = ProfileOverlayStore.load(from: provider)
     }
 
-    public func makeEngine(flowAttributor: (any FlowAttributing)? = nil) throws -> Engine {
+    /// `traffic`: the running engine's counter on a reload, so totals and
+    /// open flows carry over.
+    public func makeEngine(
+        flowAttributor: (any FlowAttributing)? = nil,
+        traffic: TrafficCounter? = nil
+    ) throws -> Engine {
         try EngineFactory.make(
             configText: configText,
             geoIPURL: geoIPURL,
@@ -53,7 +58,8 @@ public struct ExtensionBootstrap: Sendable {
             systemDNS: systemDNS,
             pinnedNodeAddresses: pinnedNodeAddresses,
             overlay: overlay,
-            flowAttributor: flowAttributor
+            flowAttributor: flowAttributor,
+            traffic: traffic
         )
     }
 }

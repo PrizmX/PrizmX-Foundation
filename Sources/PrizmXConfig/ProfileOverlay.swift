@@ -80,6 +80,8 @@ public struct OverlayRule: Sendable, Hashable, Codable, Equatable, Identifiable 
         case ipCIDR
         case geoIP
         case geosite
+        /// Executable name (`Telegram`, `curl`): route one app.
+        case processName
         case matchAll
 
         public var id: String { rawValue }
@@ -92,6 +94,7 @@ public struct OverlayRule: Sendable, Hashable, Codable, Equatable, Identifiable 
             case .ipCIDR: "IP-CIDR"
             case .geoIP: "GEOIP"
             case .geosite: "GEOSITE"
+            case .processName: "PROCESS-NAME"
             case .matchAll: "MATCH"
             }
         }
@@ -121,7 +124,7 @@ public struct OverlayRule: Sendable, Hashable, Codable, Equatable, Identifiable 
         let mapped = ConfigMapping.policy(named: policy)
         let value = payload.trimmingCharacters(in: .whitespacesAndNewlines)
         switch type {
-        case .domain, .domainSuffix, .domainKeyword, .geoIP, .geosite:
+        case .domain, .domainSuffix, .domainKeyword, .geoIP, .geosite, .processName:
             guard !value.isEmpty else { throw ConfigError.malformedRule(type.clashType) }
             fallthrough
         case .matchAll, .ipCIDR:
@@ -141,6 +144,7 @@ public struct OverlayRule: Sendable, Hashable, Codable, Equatable, Identifiable 
         case .domainKeyword: .domainKeyword(value)
         case .geoIP: .geoIP(code: value)
         case .geosite: .geosite(tag: value)
+        case .processName: .processName(value)
         case .matchAll: .matchAll
         case .ipCIDR: .ipCIDR(value)
         }

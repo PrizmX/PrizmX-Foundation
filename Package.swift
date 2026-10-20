@@ -34,6 +34,9 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../SwiftTCP"),
+        // libyaml-backed YAML 1.1 parser (anchors, merge keys, block
+        // scalars). Pinned exactly: it parses untrusted subscriptions.
+        .package(url: "https://github.com/jpsim/Yams.git", exact: "6.2.2"),
     ],
     targets: [
         .target(name: "PrizmXProtocols"),
@@ -51,7 +54,13 @@ let package = Package(
         ),
         .target(
             name: "PrizmXConfig",
-            dependencies: ["PrizmXProtocols", "PrizmXRules", "PrizmXNodes", "PrizmXCore"]
+            dependencies: [
+                "PrizmXProtocols",
+                "PrizmXRules",
+                "PrizmXNodes",
+                "PrizmXCore",
+                .product(name: "Yams", package: "Yams"),
+            ]
         ),
         .target(name: "PrizmXScripts"),
         .target(

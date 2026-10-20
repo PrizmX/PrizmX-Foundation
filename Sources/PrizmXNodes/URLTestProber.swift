@@ -7,6 +7,18 @@ import PrizmXProtocols
 /// `http://` sends a real GET. `https://` completes a TLS ClientHello with SNI
 /// and waits for a ServerHello (full inner HTTP-over-TLS is not required to
 /// prove the node can reach the probe host).
+/// UI delay test (Clash "delay"): the same request url-test groups send,
+/// through `node`. Bind `DNSClient.current` so node hostnames resolve.
+public enum NodeDelayTest: Sendable {
+    public static func measure(
+        _ node: OutboundNode,
+        url: URL,
+        timeout: Duration = .seconds(5)
+    ) async -> Duration? {
+        await URLTestProber.probe(node: node, url: url, timeout: timeout)
+    }
+}
+
 enum URLTestProber: Sendable {
     static func probe(
         node: OutboundNode,
@@ -58,7 +70,8 @@ enum URLTestProber: Sendable {
     static func request(for url: URL) -> (endpoint: Endpoint, payload: Data?, https: Bool)? {
         guard let host = url.host, !host.isEmpty else { return nil }
         let https = url.scheme?.lowercased() == "https"
-        let port = UInt16(url.port ?? (https ? 443 : 80))
+        // `UInt16(_:)` traps on an out-of-range port from a profile.
+        guard let port = UInt16(exactly: url.port ?? (https ? 443 : 80)), port != 0 else { return nil }
         let endpoint: Endpoint
         if let address = IPv4Address(parsing: host) {
             endpoint = Endpoint(host: .ipv4(address), port: port)

@@ -161,3 +161,78 @@ private func anytlsNode(id: String, host: String, port: UInt16) -> OutboundNode 
     #expect(URLTestProber.isHTTPResponseStart(Data("HTTP/1.1 204".utf8)))
     #expect(!URLTestProber.isHTTPResponseStart(Data("HTTX".utf8)))
 }
+
+/// `url: http://host:99999/` used to reach `UInt16(_:)` in the prober and
+/// trap the Packet Tunnel at its first health check.
+@Test func outOfRangeTestURLPortFallsBackToDefault() throws {
+    let group = PolicyGroup(
+        name: "Auto",
+        mode: .urlTest,
+        nodeIDs: ["hk1"],
+        testURL: "http://probe.example:99999/generate_204"
+    )
+    #expect(group.testURL == PolicyGroup.defaultTestURL)
+    let url = try #require(URL(string: "http://probe.example:70000/"))
+    #expect(URLTestProber.request(for: url) == nil)
+}
+
+/// A dead first member used to cost every new flow the full dial timeout
+/// until the next scheduled url-test; a dial failure now takes it out at once.
+private func socksNode(_ id: String, port: UInt16) -> OutboundNode {
+    OutboundNode(
+        id: id,
+        name: id,
+        protocolConfig: .socks5(server: Endpoint(domain: "\(id).example", port: port), credentials: nil, tls: nil)
+    )
+}
+
+@Test func dialFailureTakesMemberOutUntilAProbeRestoresIt() {
+    let nodes = [socksNode("a", port: 1080), socksNode("b", port: 1081)]
+    let group = PolicyGroup(name: "Backup", mode: .fallback, nodeIDs: ["a", "b"])
+    let manager = NodeManager(nodes: nodes, groups: [group])
+    manager.recordLatency(.milliseconds(40), nodeID: "a", inGroup: "Backup")
+    manager.recordLatency(.milliseconds(30), nodeID: "b", inGroup: "Backup")
+    #expect(manager.selectedNode(inGroup: "Backup")?.id == "a")
+
+    manager.reportDialFailure(member: "a", inGroup: "Backup")
+    #expect(manager.selectedNode(inGroup: "Backup")?.id == "b")
+    #expect(manager.takePendingRechecks() == ["Backup"])
+    // Rechecks of one group are spaced out.
+    manager.reportDialFailure(member: "a", inGroup: "Backup")
+    #expect(manager.takePendingRechecks().isEmpty)
+
+    manager.recordLatency(.milliseconds(40), nodeID: "a", inGroup: "Backup")
+    #expect(manager.selectedNode(inGroup: "Backup")?.id == "a")
+}
+
+/// A nested group is never probed, so a failure mark on it could only age
+/// out; its own nodes report themselves instead.
+@Test func dialFailureDoesNotMarkNestedGroupsOrDirectNodes() {
+    let nodes = [socksNode("a", port: 1080), OutboundNode(id: "d", name: "D", protocolConfig: .direct)]
+    let groups = [
+        PolicyGroup(name: "HK", mode: .select, nodeIDs: ["a"]),
+        PolicyGroup(name: "Backup", mode: .fallback, nodeIDs: ["HK", "d"]),
+    ]
+    let manager = NodeManager(nodes: nodes, groups: groups)
+    manager.reportDialFailure(member: "HK", inGroup: "Backup")
+    manager.reportDialFailure(member: "d", inGroup: "Backup")
+    #expect(manager.selectedNode(inGroup: "Backup")?.id == "a")
+    #expect(manager.takePendingRechecks().isEmpty)
+}
+
+/// The node answered and the target did not: not the node's fault.
+@Test func targetSideFailuresAreNotCountedAgainstTheNode() {
+    #expect(NodeManager.isTargetFailure(ProxyHandshakeError.socksRequestFailed(5)))
+    #expect(NodeManager.isTargetFailure(ProxyHandshakeError.httpStatus(502)))
+    #expect(!NodeManager.isTargetFailure(ProxyHandshakeError.socksRequestFailed(1)))
+    #expect(!NodeManager.isTargetFailure(ProxyHandshakeError.httpStatus(407)))
+    #expect(!NodeManager.isTargetFailure(OutboundError.refused(Endpoint(domain: "x", port: 1))))
+}
+
+@Test func directFailuresDoNotMarkDirect() {
+    let nodes = [OutboundNode(id: "a", name: "A", protocolConfig: .direct)]
+    let group = PolicyGroup(name: "Backup", mode: .fallback, nodeIDs: ["DIRECT", "a"])
+    let manager = NodeManager(nodes: nodes, groups: [group])
+    manager.reportDialFailure(member: "DIRECT", inGroup: "Backup")
+    #expect(manager.takePendingRechecks().isEmpty)
+}

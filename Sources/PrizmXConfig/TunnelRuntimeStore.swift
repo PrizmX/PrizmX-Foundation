@@ -49,11 +49,13 @@ public enum TunnelRuntimeStore: Sendable {
                 fileManager: fileManager
             )
         }
-        try copyDirectoryIfPresent(
-            from: sourceKit.appendingPathComponent("geo", isDirectory: true),
-            to: destinationKit.appendingPathComponent("geo", isDirectory: true),
-            fileManager: fileManager
-        )
+        for directory in ["geo", "providers/rules", "providers/proxies"] {
+            try copyDirectoryIfPresent(
+                from: sourceKit.appendingPathComponent(directory, isDirectory: true),
+                to: destinationKit.appendingPathComponent(directory, isDirectory: true),
+                fileManager: fileManager
+            )
+        }
         let logs = destinationKit.appendingPathComponent("logs", isDirectory: true)
         try fileManager.createDirectory(at: logs, withIntermediateDirectories: true)
         try setPOSIXPermissions(0o755, on: logs, fileManager: fileManager)
@@ -102,6 +104,11 @@ public enum TunnelRuntimeStore: Sendable {
         if fileManager.fileExists(atPath: destination.path) {
             try fileManager.removeItem(at: destination)
         }
+        // Nested sources (`providers/rules`) need their parent first.
+        try fileManager.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         try fileManager.copyItem(at: source, to: destination)
         try setPOSIXPermissions(0o755, on: destination, fileManager: fileManager)
         if let enumerator = fileManager.enumerator(at: destination, includingPropertiesForKeys: nil) {

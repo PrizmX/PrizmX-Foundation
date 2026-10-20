@@ -25,7 +25,10 @@ struct DoHNameserver: NameserverTransport {
 
     private func queryWire(domain: String, type: UInt16) async throws -> (Data, UInt16) {
         guard let host = url.host else { throw DNSError.noRecord(url.absoluteString) }
-        let port = UInt16(url.port ?? 443)
+        // `UInt16(_:)` traps on an out-of-range port from a profile.
+        guard let port = UInt16(exactly: url.port ?? 443), port != 0 else {
+            throw DNSError.noRecord(url.absoluteString)
+        }
         let addresses = try await resolveHost(host)
         guard let address = addresses.first else { throw DNSError.noRecord(host) }
 

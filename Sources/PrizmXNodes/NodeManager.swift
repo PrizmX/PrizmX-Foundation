@@ -157,6 +157,17 @@ public struct PolicyGroup: Sendable, Hashable {
         }
     }
 
+    /// An http(s) URL with a host and, when given, a port in 1…65535. A
+    /// profile's `url: http://host:99999/` must not reach the prober.
+    static func isUsableTestURL(_ raw: String) -> Bool {
+        guard let url = URL(string: raw),
+              let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty
+        else { return false }
+        guard let port = url.port else { return true }
+        return (1...65_535).contains(port)
+    }
+
     public init(
         name: String,
         mode: Mode,
@@ -173,7 +184,7 @@ public struct PolicyGroup: Sendable, Hashable {
         self.nodeIDs = nodeIDs
         self.selectedNodeID = selectedNodeID
         self.iconURL = iconURL
-        self.testURL = testURL.isEmpty ? PolicyGroup.defaultTestURL : testURL
+        self.testURL = Self.isUsableTestURL(testURL) ? testURL : PolicyGroup.defaultTestURL
         self.interval = interval
         self.tolerance = tolerance
         self.loadBalanceStrategy = loadBalanceStrategy
@@ -354,9 +365,29 @@ public final class NodeManager: Sendable {
         var selectedNodeID: String?
         var latencies: [String: Duration]
         var rrIndex: UInt64 = 0
+        /// Members whose dial failed recently. Skipped until `failureTTL`
+        /// passes or a probe succeeds, so one dead member does not stall
+        /// every new flow until the next scheduled url-test.
+        var failedAt: [String: ContinuousClock.Instant] = [:]
+
+        func hasFailed(_ member: String, now: ContinuousClock.Instant) -> Bool {
+            guard let at = failedAt[member] else { return false }
+            return now - at < NodeManager.failureTTL
+        }
     }
 
+    /// How long a failed dial keeps a member out of fallback / url-test /
+    /// load-balance picks when no probe has cleared it.
+    static let failureTTL: Duration = .seconds(60)
+    /// Least time between dial-failure rechecks of the same group.
+    static let recheckSpacing: Duration = .seconds(10)
+
     private let runtime: OSAllocatedUnfairLock<[String: GroupRuntime]>
+    /// Health-check groups a dial failure asked to re-probe early, and when
+    /// each was last forced (`recheckSpacing`).
+    private let rechecks = OSAllocatedUnfairLock(
+        initialState: (pending: Set<String>(), lastForced: [String: ContinuousClock.Instant]())
+    )
 
     public init(nodes: [OutboundNode], groups: [PolicyGroup]) {
         var nodesByID: [String: OutboundNode] = [:]
@@ -484,17 +515,84 @@ public final class NodeManager: Sendable {
         return pickNodeID(in: group, target: Endpoint(domain: group.name, port: 0), advance: false)
     }
 
-    /// Records a probe RTT used by `.urlTest` groups.
+    /// Member each url-test / fallback group routes through right now, for
+    /// hosts that show it (load-balance picks per destination, so it is
+    /// left out).
+    public func autoSelections() -> [String: String] {
+        var result: [String: String] = [:]
+        for group in groupsByName.values where group.mode == .urlTest || group.mode == .fallback {
+            if let member = selectedMemberID(inGroup: group.name) {
+                result[group.name] = member
+            }
+        }
+        return result
+    }
+
+    /// Records a probe RTT used by `.urlTest` groups. A successful probe
+    /// also clears an earlier dial failure.
     public func recordLatency(_ latency: Duration, nodeID: String, inGroup groupName: String) {
         runtime.withLock { state in
             state[groupName, default: GroupRuntime(selectedNodeID: nil, latencies: [:], rrIndex: 0)]
                 .latencies[nodeID] = latency
+            state[groupName]?.failedAt[nodeID] = nil
         }
     }
 
     public func clearLatency(nodeID: String, inGroup groupName: String) {
         runtime.withLock { state in
             state[groupName]?.latencies[nodeID] = nil
+        }
+    }
+
+    /// A node failed to open a flow: it is taken out of every
+    /// health-checked group that lists it (its latency is dropped) until a
+    /// probe succeeds or `failureTTL` passes, and those groups are queued
+    /// for an early re-probe. Nested groups and built-ins are not marked:
+    /// their own nodes report themselves, and probes never test a group.
+    public func reportDialFailure(member: String, inGroup groupName: String) {
+        guard let node = nodesByID[member] else { return }
+        // A `type: direct` node failing says nothing about it; the target was down.
+        if case .direct = node.protocolConfig { return }
+        let now = ContinuousClock.now
+        let affected = runtime.withLock { state -> Set<String> in
+            var affected: Set<String> = []
+            for group in groupsByName.values where group.usesHealthCheck && group.nodeIDs.contains(member) {
+                state[group.name]?.latencies[member] = nil
+                state[group.name]?.failedAt[member] = now
+                affected.insert(group.name)
+            }
+            return affected
+        }
+        guard !affected.isEmpty else { return }
+        rechecks.withLock { $0.pending.formUnion(affected) }
+    }
+
+    /// The node answered but the target did not: SOCKS5 "network / host
+    /// unreachable, refused, TTL expired", or an HTTP proxy's 502 / 503 / 504.
+    static func isTargetFailure(_ error: any Error) -> Bool {
+        switch error as? ProxyHandshakeError {
+        case .socksRequestFailed(let reply)?:
+            return (3...6).contains(reply)
+        case .httpStatus(let code)?:
+            return [502, 503, 504].contains(code)
+        default:
+            return false
+        }
+    }
+
+    /// Groups to re-probe now because a dial failed, at most once per
+    /// `recheckSpacing` each. The url-test loop drains this every tick.
+    public func takePendingRechecks() -> Set<String> {
+        let now = ContinuousClock.now
+        return rechecks.withLock { state in
+            var ready: Set<String> = []
+            for name in state.pending {
+                if let last = state.lastForced[name], now - last < Self.recheckSpacing { continue }
+                ready.insert(name)
+                state.lastForced[name] = now
+            }
+            state.pending.subtract(ready)
+            return ready
         }
     }
 
@@ -544,7 +642,10 @@ public final class NodeManager: Sendable {
                 try resolveConnection(name: member, target: target, command: command, visited: nextVisited)
             })
         }
-        return FailoverGroupConnection(target: target, groupName: name, makers: makers)
+        return FailoverGroupConnection(target: target, groupName: name, makers: makers) { [weak self] member, error in
+            guard !Self.isTargetFailure(error) else { return }
+            self?.reportDialFailure(member: member, inGroup: name)
+        }
     }
 
     /// Selected / first member first, then other members with a **distinct**
@@ -638,6 +739,7 @@ public final class NodeManager: Sendable {
 
     private func pickNodeID(in group: PolicyGroup, target: Endpoint, advance: Bool = true) -> String? {
         let snapshot = runtime.withLock { $0[group.name] }
+        let now = ContinuousClock.now
         switch group.mode {
         case .select:
             if let selected = snapshot?.selectedNodeID, group.nodeIDs.contains(selected) {
@@ -645,23 +747,32 @@ public final class NodeManager: Sendable {
             }
             return group.nodeIDs.first
         case .urlTest:
-            return pickURLTest(group: group, snapshot: snapshot)
+            return pickURLTest(group: group, snapshot: snapshot, now: now)
         case .fallback:
             let latencies = snapshot?.latencies ?? [:]
-            return group.nodeIDs.first { latencies[$0] != nil } ?? group.nodeIDs.first
+            let failed = { (member: String) in snapshot?.hasFailed(member, now: now) == true }
+            // Before the first probe lands, take members in order; after it,
+            // a node counts only once probed alive. Nested groups and
+            // built-ins are never probed and count unless they just failed.
+            if latencies.isEmpty {
+                return group.nodeIDs.first { !failed($0) } ?? group.nodeIDs.first
+            }
+            return group.nodeIDs.first { member in
+                !failed(member) && (nodesByID[member] == nil || latencies[member] != nil)
+            } ?? group.nodeIDs.first
         case .loadBalance:
-            return pickLoadBalance(group: group, snapshot: snapshot, target: target, advance: advance)
+            return pickLoadBalance(group: group, snapshot: snapshot, target: target, advance: advance, now: now)
         }
     }
 
-    private func pickURLTest(group: PolicyGroup, snapshot: GroupRuntime?) -> String? {
+    private func pickURLTest(group: PolicyGroup, snapshot: GroupRuntime?, now: ContinuousClock.Instant) -> String? {
         let latencies = snapshot?.latencies ?? [:]
         let ranked = group.nodeIDs.compactMap { id -> (String, Duration)? in
-            guard let latency = latencies[id] else { return nil }
+            guard let latency = latencies[id], snapshot?.hasFailed(id, now: now) != true else { return nil }
             return (id, latency)
         }
         guard let best = ranked.min(by: { $0.1 < $1.1 }) else {
-            return group.nodeIDs.first
+            return group.nodeIDs.first { snapshot?.hasFailed($0, now: now) != true } ?? group.nodeIDs.first
         }
         if let current = snapshot?.selectedNodeID,
            group.nodeIDs.contains(current),
@@ -677,11 +788,13 @@ public final class NodeManager: Sendable {
         group: PolicyGroup,
         snapshot: GroupRuntime?,
         target: Endpoint,
-        advance: Bool
+        advance: Bool,
+        now: ContinuousClock.Instant
     ) -> String? {
         let latencies = snapshot?.latencies ?? [:]
-        let alive = group.nodeIDs.filter { latencies[$0] != nil }
-        let pool = alive.isEmpty ? group.nodeIDs : alive
+        let notFailed = group.nodeIDs.filter { snapshot?.hasFailed($0, now: now) != true }
+        let alive = notFailed.filter { latencies[$0] != nil }
+        let pool = !alive.isEmpty ? alive : (!notFailed.isEmpty ? notFailed : group.nodeIDs)
         guard !pool.isEmpty else { return nil }
         switch group.loadBalanceStrategy {
         case .roundRobin:

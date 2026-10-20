@@ -76,17 +76,18 @@ import PrizmXProtocols
       - DST-PORT,443,REJECT
       - PROCESS-NAME,curl,REJECT
       - GEOIP,CN,DIRECT,src
+      - IP-ASN,13335,DIRECT
       - DOMAIN-SUFFIX,example.com,DIRECT
     """
     let result = try ConfigAdapter.parseWithWarnings(rawString: yaml)
-    #expect(result.router.rules.count == 1)
+    // Logical, port and process rules import; an undefined provider, an
+    // unknown option and an unsupported type do not.
+    #expect(result.router.rules.count == 4)
     let skipped = result.warnings.filter { $0.kind == .rule }.map(\.text)
     #expect(skipped == [
         "RULE-SET,ads,REJECT",
-        "AND,((DOMAIN,a.com),(NETWORK,UDP)),REJECT",
-        "DST-PORT,443,REJECT",
-        "PROCESS-NAME,curl,REJECT",
         "GEOIP,CN,DIRECT,src",
+        "IP-ASN,13335,DIRECT",
     ])
 }
 
@@ -128,7 +129,7 @@ import PrizmXProtocols
     // The rule stays and fails closed instead of silently disappearing.
     #expect(result.router.match(host: "b.com", port: 443) == .proxy(targetGroup: "Remote"))
     #expect(result.warnings.contains { $0.kind == .proxy && $0.text == "HK2" })
-    #expect(result.warnings.contains { $0.kind == .group && $0.text == "Remote" && $0.reason.contains("providers") })
+    #expect(result.warnings.contains { $0.kind == .group && $0.text == "Remote" && $0.reason.contains("provider1") })
     #expect(result.warnings.contains { $0.kind == .group && $0.text == "Remote" && $0.reason.contains("not defined") })
 }
 

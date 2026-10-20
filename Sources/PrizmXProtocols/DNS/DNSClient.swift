@@ -94,11 +94,26 @@ public final class DNSClient: Sendable {
     }
 
     /// Replace LAN nameservers after the physical path changes, then drop
-    /// positive cache and dial-failure marks from the old network.
+    /// positive cache, dial-failure marks and proven DIRECT addresses from
+    /// the old network (another network gets other CDN edges).
     public func applyPhysicalDNS(_ ips: [String]) {
         settingsBox.withLock { $0.applyPhysicalDNS(ips) }
         cache.withLock { $0.removeAll() }
         bad.withLock { $0.removeAll() }
+        good.withLock { map in
+            map = map.filter { $0.key.role != .direct }
+        }
+    }
+
+    /// Profile `hosts`, then `/etc/hosts`.
+    public func hostsLookup(_ name: String) -> SystemHosts.Mapping? {
+        if let mapped = settings.hosts.lookup(name) { return mapped }
+        return SystemHosts.lookup(name)
+    }
+
+    /// `hostsLookup` of the bound client, or `/etc/hosts` alone.
+    public static func hostsLookup(_ name: String) -> SystemHosts.Mapping? {
+        current?.hostsLookup(name) ?? SystemHosts.lookup(name)
     }
 
     /// All A records for `domain` on the given plane, merged across the
@@ -113,7 +128,7 @@ public final class DNSClient: Sendable {
     /// immediately — the union lookup must not block the first dial. Node
     /// hostnames that follow the profile's DNS skip proven addresses.
     public func resolveAll(_ domain: String, role: DNSRole) async throws -> [IPv4Address] {
-        if let mapped = SystemHosts.lookup(domain) {
+        if let mapped = hostsLookup(domain) {
             if !mapped.ipv4.isEmpty { return mapped.ipv4 }
             throw DNSError.noRecord(domain)
         }
@@ -157,7 +172,16 @@ public final class DNSClient: Sendable {
         // session must not outrank a fresh profile answer (the provider may
         // have moved its nodes). App pins were resolved via the profile too.
         let followsProfile = key.role == .proxyServer && settings.resolvesNodesViaProfile
-        let goodList = followsProfile ? [] : good.withLock { $0[key]?.addresses ?? [] }
+        let goodList: [IPv4Address] = followsProfile ? [] : good.withLock { map in
+            guard let entry = map[key] else { return [] }
+            // A DIRECT edge proven once is a hint, not an answer: it ages out
+            // like a DNS record so the name follows its CDN.
+            if key.role == .direct, Date().timeIntervalSince(entry.touched) > Self.directGoodLifetime {
+                map[key] = nil
+                return []
+            }
+            return entry.addresses
+        }
         let pinList = pinned[key.domain] ?? []
         return Self.mergeGoodFirst(good: goodList, answers: pinList).filter { !isBad(key, $0) }
     }
@@ -186,9 +210,7 @@ public final class DNSClient: Sendable {
         }
         do {
             let (addresses, ttl) = try await task.value
-            cache.withLock {
-                $0[key] = CachedEntry(addresses: addresses, expires: Date().addingTimeInterval(ttl))
-            }
+            store(key, CachedEntry(addresses: addresses, expires: Date().addingTimeInterval(ttl)))
             inflight.withLock { $0[key] = nil }
             return addresses
         } catch {
@@ -196,6 +218,25 @@ public final class DNSClient: Sendable {
             throw error
         }
     }
+
+    /// Bounded: expired entries go first, then the oldest half.
+    private func store(_ key: CacheKey, _ entry: CachedEntry) {
+        cache.withLock { map in
+            if map.count >= Self.cacheCapacity, map[key] == nil {
+                let now = Date()
+                map = map.filter { $0.value.expires > now }
+                if map.count >= Self.cacheCapacity {
+                    let oldest = map.sorted { $0.value.expires < $1.value.expires }.prefix(map.count / 2).map(\.key)
+                    for stale in oldest { map[stale] = nil }
+                }
+            }
+            map[key] = entry
+        }
+    }
+
+    static let cacheCapacity = 4_096
+    /// How long a proven DIRECT address keeps outranking fresh answers.
+    static let directGoodLifetime: TimeInterval = 300
 
     /// First A record for single-dial call sites.
     public func resolve(_ domain: String, role: DNSRole) async throws -> IPv4Address {
@@ -208,11 +249,16 @@ public final class DNSClient: Sendable {
     /// AAAA records for DIRECT FakeDNS when Clash `dns.ipv6` is on.
     /// Proxy names never call this — FakeIP is IPv4-only, AAAA is NODATA.
     public func resolveAAAA(_ domain: String, role: DNSRole) async throws -> [IPv6Address] {
-        if let mapped = SystemHosts.lookup(domain) {
+        if let mapped = hostsLookup(domain) {
             if !mapped.ipv6.isEmpty { return mapped.ipv6 }
             throw DNSError.noRecord(domain)
         }
-        let endpoints = settings.endpoints(for: role)
+        let endpoints: [NameserverEndpoint]
+        switch settings.profilePlan(for: domain, role: role) {
+        case .upstreams(let list)?: endpoints = list
+        case .withFallback(let main, _)?: endpoints = main
+        case nil: endpoints = settings.endpoints(for: role)
+        }
         guard !endpoints.isEmpty else { throw DNSError.noNameserver }
         var merged: [IPv6Address] = []
         var lastError: Error?
@@ -311,7 +357,7 @@ public final class DNSClient: Sendable {
         case .ipv6(let address):
             return NWEndpoint.Host(address.description)
         case .domain(let domain):
-            if let mapped = SystemHosts.lookup(domain)?.addresses.first {
+            if let mapped = hostsLookup(domain)?.addresses.first {
                 return NWEndpoint.Host(mapped.description)
             }
             guard let client = DNSClient.current else { throw DNSError.notConfigured }
@@ -326,7 +372,7 @@ public final class DNSClient: Sendable {
     /// addresses are returned even when no `DNSClient` is bound.
     public static func resolveAll(_ host: Endpoint.Host, role: DNSRole) async throws -> [IPv4Address] {
         guard case .domain(let domain) = host else { return [] }
-        if let mapped = SystemHosts.lookup(domain) {
+        if let mapped = hostsLookup(domain) {
             if !mapped.ipv4.isEmpty { return mapped.ipv4 }
             throw DNSError.noRecord(domain)
         }
@@ -360,40 +406,85 @@ public final class DNSClient: Sendable {
     }
 
     private func lookup(domain: String, role: DNSRole) async throws -> ([IPv4Address], TimeInterval) {
-        let endpoints = settings.endpoints(for: role)
-        guard !endpoints.isEmpty else { throw DNSError.noNameserver }
-        return try await query(endpoints: endpoints, domain: domain, role: role)
+        let settings = self.settings
+        switch settings.profilePlan(for: domain, role: role) {
+        case .upstreams(let endpoints)?:
+            return try await query(endpoints: endpoints, domain: domain, role: role)
+        case .withFallback(let main, let fallback)?:
+            return try await queryWithFallback(
+                main: main,
+                fallback: fallback,
+                filter: settings.fallbackFilter,
+                domain: domain,
+                role: role
+            )
+        case nil:
+            let endpoints = settings.endpoints(for: role)
+            guard !endpoints.isEmpty else { throw DNSError.noNameserver }
+            return try await query(endpoints: endpoints, domain: domain, role: role)
+        }
     }
 
+    /// Clash `fallback`: both sets are asked at once; the `nameserver`
+    /// answer stands unless `fallback-filter` rejects one of its addresses
+    /// (outside `geoip-code`, inside `ipcidr`), then `fallback`'s is used.
+    private func queryWithFallback(
+        main: [NameserverEndpoint],
+        fallback: [NameserverEndpoint],
+        filter: FallbackFilter,
+        domain: String,
+        role: DNSRole
+    ) async throws -> ([IPv4Address], TimeInterval) {
+        // Unstructured: an accepted `nameserver` answer returns at once
+        // instead of waiting out a slow or blocked fallback (an `async let`
+        // would be awaited when the scope ends).
+        let secondary = Task { try await self.query(endpoints: fallback, domain: domain, role: role) }
+        let first = await Result { try await query(endpoints: main, domain: domain, role: role) }
+        if case .success(let answer) = first,
+           !answer.0.contains(where: { filter.rejectsAddress?.matches($0) == true }) {
+            return answer
+        }
+        if let answer = try? await secondary.value { return answer }
+        return try first.get()
+    }
+
+    /// Asks every endpoint at once and merges the answers that arrive by
+    /// `mergeWindow` after the first one (a CDN name gets every edge the
+    /// fast resolvers know). Slow or dead upstreams no longer add up: the
+    /// wait is bounded by the slowest *needed* answer, not their sum.
     private func query(
         endpoints: [NameserverEndpoint],
         domain: String,
         role: DNSRole
     ) async throws -> ([IPv4Address], TimeInterval) {
-        var merged: [IPv4Address] = []
-        var minTTL: UInt32?
-        var sawTimeout = false
-        var lastError: Error?
-        for endpoint in endpoints {
-            guard let transport = makeTransport(endpoint) else { continue }
-            do {
-                let records = try await transport.query(domain)
-                for record in records {
-                    if !merged.contains(record.address) { merged.append(record.address) }
-                    minTTL = min(minTTL ?? record.ttl, record.ttl)
+        let transports = endpoints.compactMap { endpoint in makeTransport(endpoint).map { (endpoint, $0) } }
+        guard !transports.isEmpty else { throw DNSError.noNameserver }
+        let collected = await withCheckedContinuation { (continuation: CheckedContinuation<QueryCollector.Result, Never>) in
+            let collector = QueryCollector(expected: transports.count, continuation: continuation)
+            for (endpoint, transport) in transports {
+                Task {
+                    do {
+                        collector.add(.records(try await transport.query(domain)))
+                    } catch DNSError.timeout {
+                        TunnelLog.write(.debug, "dns \(role) \(domain) via \(endpoint) timeout")
+                        collector.add(.timeout)
+                    } catch {
+                        TunnelLog.write(.debug, "dns \(role) \(domain) via \(endpoint) failed: \(error.localizedDescription)")
+                        collector.add(.failure(error))
+                    }
                 }
-            } catch DNSError.timeout {
-                TunnelLog.write(.debug, "dns \(role) \(domain) via \(endpoint) timeout")
-                sawTimeout = true
-            } catch {
-                TunnelLog.write(.debug, "dns \(role) \(domain) via \(endpoint) failed: \(error.localizedDescription)")
-                lastError = error
             }
         }
-        guard !merged.isEmpty else {
-            if sawTimeout { throw DNSError.timeout }
-            if let lastError { throw lastError }
+        guard !collected.records.isEmpty else {
+            if collected.sawTimeout { throw DNSError.timeout }
+            if let error = collected.lastError { throw error }
             throw DNSError.noRecord(domain)
+        }
+        var merged: [IPv4Address] = []
+        var minTTL: UInt32?
+        for record in collected.records {
+            if !merged.contains(record.address) { merged.append(record.address) }
+            minTTL = min(minTTL ?? record.ttl, record.ttl)
         }
         // Clamp: keep entries long enough to matter, short enough to follow
         // fast-flux CDN edges.
@@ -484,8 +575,12 @@ extension DNSClient {
 
     private func persist() {
         guard let persistenceURL else { return }
+        // Node addresses only: DIRECT edges are per network and short-lived,
+        // and a file of every directly visited name is not worth keeping.
         let snapshot: [String: [String]] = good.withLock { map in
-            Dictionary(uniqueKeysWithValues: map.map { ($0.key.persistKey, $0.value.addresses.map(\.description)) })
+            Dictionary(uniqueKeysWithValues: map.filter { $0.key.role == .proxyServer }.map {
+                ($0.key.persistKey, $0.value.addresses.map(\.description))
+            })
         }
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         // May run as root (macOS system extension) inside the user kit.
@@ -498,7 +593,7 @@ extension DNSClient {
               let dict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return }
         var loaded: [CacheKey: (addresses: [IPv4Address], touched: Date)] = [:]
         for (persistKey, addresses) in dict {
-            guard let key = CacheKey.from(persistKey: persistKey) else { continue }
+            guard let key = CacheKey.from(persistKey: persistKey), key.role == .proxyServer else { continue }
             let parsed = addresses.compactMap { IPv4Address(parsing: $0) }
             if !parsed.isEmpty {
                 loaded[key] = (addresses: parsed, touched: Date())
@@ -506,5 +601,72 @@ extension DNSClient {
         }
         let final = loaded
         good.withLock { $0 = final }
+    }
+}
+
+/// Gathers one parallel query: resumes when every endpoint answered, or
+/// `mergeWindow` after the first non-empty answer, whichever comes first.
+/// Late answers are dropped.
+private final class QueryCollector: @unchecked Sendable {
+    enum Outcome {
+        case records([DNSWire.Record])
+        case timeout
+        case failure(Error)
+    }
+
+    struct Result: Sendable {
+        var records: [DNSWire.Record] = []
+        var sawTimeout = false
+        var lastError: (any Error)?
+    }
+
+    static let mergeWindow: Duration = .milliseconds(150)
+
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Result, Never>?
+    private var result = Result()
+    private var remaining: Int
+    private var windowStarted = false
+
+    init(expected: Int, continuation: CheckedContinuation<Result, Never>) {
+        self.remaining = expected
+        self.continuation = continuation
+    }
+
+    func add(_ outcome: Outcome) {
+        lock.lock()
+        remaining -= 1
+        var startWindow = false
+        switch outcome {
+        case .records(let records):
+            result.records += records
+            if !records.isEmpty, !windowStarted {
+                windowStarted = true
+                startWindow = true
+            }
+        case .timeout:
+            result.sawTimeout = true
+        case .failure(let error):
+            result.lastError = error
+        }
+        let done = remaining == 0
+        lock.unlock()
+        if done {
+            finish()
+        } else if startWindow {
+            Task {
+                try? await Task.sleep(for: Self.mergeWindow)
+                self.finish()
+            }
+        }
+    }
+
+    private func finish() {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        let snapshot = result
+        lock.unlock()
+        pending?.resume(returning: snapshot)
     }
 }

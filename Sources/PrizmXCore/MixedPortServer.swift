@@ -21,7 +21,8 @@ public final class MixedPortServer: @unchecked Sendable {
         }
     }
 
-    private let engine: Engine
+    /// Swapped on a config reload; flows already piped keep the old one.
+    private let engineBox: OSAllocatedUnfairLock<Engine>
     private let port: UInt16
     private let allowLAN: Bool
     private let accept: Accept
@@ -45,7 +46,7 @@ public final class MixedPortServer: @unchecked Sendable {
         skipAuthPrefixes: [String]? = nil,
         lanAllowedIPs: [String]? = nil
     ) {
-        self.engine = engine
+        self.engineBox = OSAllocatedUnfairLock(initialState: engine)
         self.port = port
         self.allowLAN = allowLAN
         self.accept = accept
@@ -54,6 +55,12 @@ public final class MixedPortServer: @unchecked Sendable {
             skipAuthPrefixes: skipAuthPrefixes,
             lanAllowedIPs: lanAllowedIPs
         )
+    }
+
+    /// New connections use `engine` from now on (config reload without
+    /// closing the listener).
+    public func replaceEngine(_ engine: Engine) {
+        engineBox.withLock { $0 = engine }
     }
 
     public func start() async throws {
@@ -145,7 +152,7 @@ public final class MixedPortServer: @unchecked Sendable {
             connection.cancel()
             return
         }
-        await EngineTCPRelay.pipe(stream: stream, engine: engine)
+        await EngineTCPRelay.pipe(stream: stream, engine: engineBox.withLock { $0 })
     }
 
     private func handshake(

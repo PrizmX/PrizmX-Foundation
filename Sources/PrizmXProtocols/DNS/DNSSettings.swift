@@ -108,6 +108,18 @@ public struct DNSSettings: Sendable, Hashable {
     /// the answer; public resolvers step in only after the profile's
     /// answers fail. Ignored while both lists are empty.
     public var nodeDNSFromProfile: Bool
+    /// Clash `dns.enable`: the profile's resolver (`nameserver-policy`,
+    /// `nameserver`, `fallback`) answers app traffic too: DIRECT dials,
+    /// fake-ip-filter names and the lookups IP rules need. Off: the
+    /// machine's resolver does, as before.
+    public var appDNSFromProfile: Bool
+    /// Clash `nameserver-policy`, in profile order (first match wins).
+    public var nameserverPolicies: [NameserverPolicy]
+    /// Clash `fallback` and `fallback-filter`.
+    public var fallbackNameservers: [NameserverEndpoint]
+    public var fallbackFilter: FallbackFilter
+    /// Clash top-level `hosts` (with `dns.use-hosts`).
+    public var hosts: ProfileHosts
 
     public init(
         defaultNameservers: [NameserverEndpoint],
@@ -118,7 +130,12 @@ public struct DNSSettings: Sendable, Hashable {
         fakeIPFilter: [String] = [],
         ipv6: Bool = false,
         cacheTTL: TimeInterval = 60,
-        nodeDNSFromProfile: Bool = false
+        nodeDNSFromProfile: Bool = false,
+        appDNSFromProfile: Bool = false,
+        nameserverPolicies: [NameserverPolicy] = [],
+        fallbackNameservers: [NameserverEndpoint] = [],
+        fallbackFilter: FallbackFilter = FallbackFilter(),
+        hosts: ProfileHosts = .empty
     ) {
         self.defaultNameservers = defaultNameservers
         self.nameservers = nameservers
@@ -129,6 +146,42 @@ public struct DNSSettings: Sendable, Hashable {
         self.ipv6 = ipv6
         self.cacheTTL = cacheTTL
         self.nodeDNSFromProfile = nodeDNSFromProfile
+        self.appDNSFromProfile = appDNSFromProfile
+        self.nameserverPolicies = nameserverPolicies
+        self.fallbackNameservers = fallbackNameservers
+        self.fallbackFilter = fallbackFilter
+        self.hosts = hosts
+    }
+
+    /// How the profile's resolver answers `domain`, or nil when the role
+    /// uses its fixed list (`endpoints(for:)`): an explicit
+    /// `direct-` / `proxy-server-nameserver`, or the profile's DNS is off.
+    public enum ProfilePlan: Sendable, Equatable {
+        /// One set of upstreams (a `nameserver-policy` hit, or `nameserver`).
+        case upstreams([NameserverEndpoint])
+        /// `nameserver` and `fallback` together; `fallback-filter` picks.
+        case withFallback(main: [NameserverEndpoint], fallback: [NameserverEndpoint])
+    }
+
+    public func profilePlan(for domain: String, role: DNSRole) -> ProfilePlan? {
+        switch role {
+        case .direct:
+            guard appDNSFromProfile, directNameservers.isEmpty else { return nil }
+        case .proxyServer:
+            guard resolvesNodesViaProfile, proxyServerNameservers.isEmpty else { return nil }
+        }
+        if let policy = nameserverPolicies.first(where: { $0.domains.matches(domain) }),
+           !policy.nameservers.isEmpty {
+            return .upstreams(policy.nameservers)
+        }
+        if !fallbackNameservers.isEmpty {
+            if fallbackFilter.domains?.matches(domain) == true {
+                return .upstreams(fallbackNameservers)
+            }
+            guard !nameservers.isEmpty else { return .upstreams(fallbackNameservers) }
+            return .withFallback(main: nameservers, fallback: fallbackNameservers)
+        }
+        return nameservers.isEmpty ? nil : .upstreams(nameservers)
     }
 
     /// True when node hostnames are answered by the profile's nameservers

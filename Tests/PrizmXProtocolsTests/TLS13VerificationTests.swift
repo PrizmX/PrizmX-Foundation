@@ -190,6 +190,18 @@ struct TLS13VerificationTests {
         )
         #expect(named.handshake.count > bytes.count)
     }
+
+    /// A profile's oversized SNI or ALPN list used to overflow the length
+    /// fields and trap (crashing the Packet Tunnel).
+    @Test func clientHelloSurvivesOversizedSNIAndALPN() {
+        let hello = TLS13ClientHelloBuilder.build(
+            serverName: String(repeating: "a", count: 70_000),
+            ephemeral: Curve25519.KeyAgreement.PrivateKey(),
+            alpn: Array(repeating: String(repeating: "b", count: 300), count: 400) + [""]
+        )
+        #expect(hello.handshake.count < 16_384)
+        #expect(!TLS13ClientHelloBuilder.wrapRecord(hello.handshake).isEmpty)
+    }
 }
 
 // MARK: - Record layer: KeyUpdate + close_notify

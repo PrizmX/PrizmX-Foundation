@@ -30,6 +30,8 @@ public struct ConfigWarning: Sendable, Hashable, CustomStringConvertible {
         case rule
         case proxy
         case group
+        /// A `dns:` key PrizmX does not honor.
+        case dns
     }
 
     public var kind: Kind
@@ -61,6 +63,18 @@ public struct ConfigParseResult: Sendable {
     }
 
     public var tuple: (Router, NodeManager) { (router, nodeManager) }
+
+    /// Target of the catch-all (`MATCH` / `FINAL`) rule when it names no
+    /// parsed proxy or group, e.g. a group dropped for using providers.
+    /// Every connection that reaches that rule fails closed.
+    public var unroutableCatchAllTarget: String? {
+        guard let rule = router.rules.first(where: { $0.matcher == .matchAll }),
+              case .proxy(let target) = rule.policy,
+              nodeManager.nodesByID[target] == nil,
+              nodeManager.groupsByName[target] == nil
+        else { return nil }
+        return target
+    }
 }
 
 /// Convenience entry that picks Clash YAML vs sing-box JSON from content, not

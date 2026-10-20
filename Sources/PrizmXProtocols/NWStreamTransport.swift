@@ -145,6 +145,11 @@ final class NWStreamTransport: @unchecked Sendable {
                             once.resume(with: .success(()))
                         case .failed(let error):
                             once.resume(with: .failure(self?.mapTransportError(error) ?? error))
+                        // Refused / unreachable land in `.waiting`, where NW
+                        // would retry until the timeout below. Fail now so
+                        // the group moves on to its next member.
+                        case .waiting(let error):
+                            once.resume(with: .failure(self?.mapTransportError(error) ?? error))
                         case .cancelled:
                             once.resume(with: .failure(OutboundError.alreadyClosed(peer)))
                         default:

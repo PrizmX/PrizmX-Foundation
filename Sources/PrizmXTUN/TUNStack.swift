@@ -139,8 +139,8 @@ public struct TUNUDPDatagram: Sendable {
 public actor TUNStack {
     public let fakeIP: FakeIPAllocator?
     private let mailbox: TUNMailbox
-    private let fakeIPFilter: [String]
-    private let dns: DNSClient?
+    private var fakeIPFilter: [String]
+    private var dns: DNSClient?
     /// FakeDNS: filter → real; REJECT → NODATA; anything else (nil:
     /// undecided without a lookup) → FakeIP.
     private let dnsPolicy: (@Sendable (String) async -> Policy?)?
@@ -166,6 +166,13 @@ public actor TUNStack {
         self.dnsPolicy = dnsPolicy
         self.ipv6Enabled = ipv6
         self.mailbox = TUNMailbox(fakeIP: fakeIP, onOutput: onOutput)
+    }
+
+    /// A reloaded engine's filter and resolver. The FakeIP table and every
+    /// open flow are kept.
+    public func updateResolution(fakeIPFilter: [String], dns: DNSClient?) {
+        self.fakeIPFilter = fakeIPFilter
+        self.dns = dns
     }
 
     public func start() {
@@ -380,7 +387,7 @@ public actor TUNStack {
         // libc checks /etc/hosts before querying FakeDNS. A client that
         // queries us directly still needs the real record — FakeIP would
         // hide the hosts edit.
-        if let mapping = SystemHosts.lookup(name), !mapping.isEmpty {
+        if let mapping = dns?.hostsLookup(name) ?? SystemHosts.lookup(name), !mapping.isEmpty {
             if await policyFor(name) == .reject {
                 writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
                 return

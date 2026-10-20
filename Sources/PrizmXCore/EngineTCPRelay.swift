@@ -1,6 +1,7 @@
 import Foundation
 import os
 import PrizmXProtocols
+import PrizmXRules
 
 /// Byte stream accepted by `EngineTCPRelay.pipe`.
 ///
@@ -83,7 +84,19 @@ public enum EngineTCPRelay: Sendable {
         let rule: String
         let policy: String
         do {
-            let dispatched = try await engine.resolveAndDispatch(target: target, remoteClient: !isLocalClient)
+            let context = RouteContext(
+                network: .tcp,
+                sourceHost: Self.sourceHost(inbound.clientAddress),
+                sourcePort: inbound.clientPort == 0 ? nil : inbound.clientPort,
+                inboundPort: inbound.listenPort,
+                processName: attribution?.processName,
+                processPath: attribution?.executablePath
+            )
+            let dispatched = try await engine.resolveAndDispatch(
+                target: target,
+                remoteClient: !isLocalClient,
+                context: context
+            )
             outbound = dispatched.connection
             rule = dispatched.rule
             policy = dispatched.policy
@@ -256,6 +269,18 @@ public enum EngineTCPRelay: Sendable {
     static let readChunkBytes = 64 * 1024
     /// Downlink bytes read ahead of the client while a write is pending.
     static let downlinkPipeBytes = 256 * 1024
+
+    /// Client address for SRC-IP-CIDR (scope id and IPv4-mapped prefix dropped).
+    static func sourceHost(_ address: String) -> Endpoint.Host? {
+        var host = address
+        if let percent = host.firstIndex(of: "%") { host = String(host[..<percent]) }
+        if host.lowercased().hasPrefix("::ffff:"), let v4 = IPv4Address(parsing: host.dropFirst(7)) {
+            return .ipv4(v4)
+        }
+        if let v4 = IPv4Address(parsing: host) { return .ipv4(v4) }
+        if let v6 = IPv6Address(parsing: host) { return .ipv6(v6) }
+        return nil
+    }
 
     static func isLoopbackClient(_ address: String) -> Bool {
         if address.isEmpty { return true }

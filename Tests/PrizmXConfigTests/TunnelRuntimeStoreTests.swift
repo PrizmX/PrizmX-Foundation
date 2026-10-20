@@ -54,3 +54,18 @@ import PrizmXConfig
         try String(contentsOf: dest.appendingPathComponent("tunnel/active.conf"), encoding: .utf8) == "v2"
     )
 }
+
+/// The Packet Tunnel reads rule / proxy providers from the staged kit.
+@Test func stageCopiesDownloadedProviders() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent("runtime-providers-\(UUID().uuidString)")
+    let source = root.appendingPathComponent("source", isDirectory: true)
+    let dest = root.appendingPathComponent("dest", isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let rules = source.appendingPathComponent("providers/rules", isDirectory: true)
+    try fileManager.createDirectory(at: rules, withIntermediateDirectories: true)
+    try "payload: []\n".write(to: rules.appendingPathComponent("abc"), atomically: true, encoding: .utf8)
+
+    _ = try TunnelRuntimeStore.stage(from: source, to: dest, fileManager: fileManager)
+    #expect(fileManager.fileExists(atPath: dest.appendingPathComponent("providers/rules/abc").path))
+}
