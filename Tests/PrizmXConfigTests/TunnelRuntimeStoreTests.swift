@@ -69,3 +69,19 @@ import PrizmXConfig
     _ = try TunnelRuntimeStore.stage(from: source, to: dest, fileManager: fileManager)
     #expect(fileManager.fileExists(atPath: dest.appendingPathComponent("providers/rules/abc").path))
 }
+
+/// The Packet Tunnel reads "Route All Traffic" from the staged kit.
+@Test func stageCopiesTheCapturePreference() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent("runtime-capture-\(UUID().uuidString)")
+    let source = root.appendingPathComponent("source", isDirectory: true)
+    let dest = root.appendingPathComponent("dest", isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let file = source.appendingPathComponent(CapturePreferenceStore.relativePath)
+    try fileManager.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try JSONEncoder().encode(CapturePreferenceStore.State(allTraffic: true)).write(to: file)
+
+    _ = try TunnelRuntimeStore.stage(from: source, to: dest, fileManager: fileManager)
+    let staged = try Data(contentsOf: dest.appendingPathComponent(CapturePreferenceStore.relativePath))
+    #expect(try JSONDecoder().decode(CapturePreferenceStore.State.self, from: staged).allTraffic)
+}

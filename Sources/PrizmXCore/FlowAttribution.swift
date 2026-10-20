@@ -59,6 +59,15 @@ public protocol FlowAttributing: Sendable {
         remotePort: UInt16,
         since: Date
     ) async -> FlowAttribution?
+
+    /// True when the socket behind a tunnel flow belongs to this process:
+    /// one of its own dials that routing sent back into the tunnel.
+    func ownsSocket(
+        transport: FlowTransport,
+        localPort: UInt16,
+        remoteAddress: String,
+        remotePort: UInt16
+    ) -> Bool
 }
 
 /// A local client socket of a mixed-port listener (`listenPort`), as the
@@ -84,6 +93,15 @@ extension FlowAttributing {
         since: Date
     ) async -> FlowAttribution? {
         nil
+    }
+
+    public func ownsSocket(
+        transport: FlowTransport,
+        localPort: UInt16,
+        remoteAddress: String,
+        remotePort: UInt16
+    ) -> Bool {
+        false
     }
 
     /// Flow-open lookup; the same as `attribute`.

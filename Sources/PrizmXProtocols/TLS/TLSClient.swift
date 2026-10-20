@@ -65,6 +65,7 @@ enum TLSClient {
             tcp: tcp
         )
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters)
         return parameters
     }
 

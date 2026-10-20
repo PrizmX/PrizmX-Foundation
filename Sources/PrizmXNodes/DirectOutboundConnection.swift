@@ -146,6 +146,7 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
         tcp.noDelay = true
         let parameters = NWParameters(tls: nil, tcp: tcp)
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters, to: endpoint.host)
 
         // All A records become dial candidates; a failed attempt poisons that
         // IP and the next candidate is tried immediately. A hosts-file hit is
@@ -208,7 +209,9 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
                         let result: Result<Void, Error>
                         switch state {
                         case .ready:
-                            result = .success(())
+                            result = TunnelEgress.admits(nw.currentPath, peer: "\(self.endpoint)")
+                                ? .success(())
+                                : .failure(TunnelEgress.LoopError())
                         case .failed(let error):
                             result = .failure(error)
                         case .cancelled:

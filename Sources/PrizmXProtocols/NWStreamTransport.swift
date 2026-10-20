@@ -138,6 +138,10 @@ final class NWStreamTransport: @unchecked Sendable {
                     nw.stateUpdateHandler = { [weak self] state in
                         switch state {
                         case .ready:
+                            guard TunnelEgress.admits(nw.currentPath, peer: "\(peer)") else {
+                                once.resume(with: .failure(TunnelEgress.LoopError()))
+                                return
+                            }
                             nw.stateUpdateHandler = { [weak self] later in
                                 if case .failed = later { self?.markClosed() }
                                 if case .cancelled = later { self?.markClosed() }

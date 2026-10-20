@@ -206,8 +206,22 @@ private struct UDPSessionOpener: Sendable {
     let datagram: TUNUDPDatagram
 
     func open() async -> (any UDPSession)? {
-        // Process lookup reads the socket table; do it only for PROCESS rules.
-        let process = engine.router.needsProcess ? attribution() : nil
+        // Owner of the client socket: traffic accounting, PROCESS rules.
+        let app = attribution()
+        // A UDP dial of this process that went into the tunnel: relaying it
+        // would dial again and loop (see `EngineTCPRelay`). The table read
+        // above skips this process, so only unowned flows are checked.
+        if app == nil, TunnelEgress.isActive,
+           engine.flowAttributor?.ownsSocket(
+               transport: .udp,
+               localPort: key.clientPort,
+               remoteAddress: datagram.flow.dst.description,
+               remotePort: datagram.flow.dstPort
+           ) == true {
+            TunnelEgress.noteLoop("PrizmX's own UDP to \(datagram.destination) came in through the tunnel")
+            return nil
+        }
+        let process = engine.router.needsProcess ? app : nil
         let context = RouteContext(
             network: .udp,
             sourceHost: .ipv4(key.client),
@@ -220,9 +234,9 @@ private struct UDPSessionOpener: Sendable {
             await dropUDP(onceKey: "udp-reject", reason: "UDP dropped: reject")
             return nil
         case .direct:
-            return await openDirect(route: FlowRoute([FlowRoute.direct]))
+            return await openDirect(route: FlowRoute([FlowRoute.direct]), app: app)
         case .proxy(let group):
-            return await openProxy(group: group)
+            return await openProxy(group: group, app: app)
         }
     }
 
@@ -251,9 +265,10 @@ private struct UDPSessionOpener: Sendable {
         )
     }
 
-    private func openDirect(route: FlowRoute) async -> (any UDPSession)? {
+    private func openDirect(route: FlowRoute, app: FlowAttribution?) async -> (any UDPSession)? {
         let parameters = NWParameters.udp
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters)
         guard let port = NWEndpoint.Port(rawValue: datagram.destination.port) else { return nil }
         let host: NWEndpoint.Host
         do {
@@ -275,16 +290,16 @@ private struct UDPSessionOpener: Sendable {
             flow: datagram.flow,
             stack: stack,
             traffic: engine.traffic,
-            attribution: attribution()
+            attribution: app
         )
     }
 
-    private func openProxy(group: String) async -> (any UDPSession)? {
+    private func openProxy(group: String, app: FlowAttribution?) async -> (any UDPSession)? {
         let leaf = engine.nodeManager.selectedLeaf(inGroup: group)
         let route = FlowRoute(engine.nodeManager.selectedChain(inGroup: group))
         switch leaf {
         case .direct:
-            return await openDirect(route: route)
+            return await openDirect(route: route, app: app)
         case .reject:
             await dropUDP(onceKey: "udp-reject-\(group)", reason: "UDP dropped: reject")
             return nil
@@ -299,7 +314,7 @@ private struct UDPSessionOpener: Sendable {
         }
         guard case .node(let node) = leaf else { return nil }
         if case .direct = node.protocolConfig {
-            return await openDirect(route: route)
+            return await openDirect(route: route, app: app)
         }
         do {
             // Use the leaf picked above; dispatching through the group
@@ -323,7 +338,7 @@ private struct UDPSessionOpener: Sendable {
                 flow: datagram.flow,
                 stack: stack,
                 traffic: engine.traffic,
-                attribution: attribution()
+                attribution: app
             )
         } catch {
             return nil

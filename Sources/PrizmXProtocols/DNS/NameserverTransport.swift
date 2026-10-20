@@ -34,7 +34,10 @@ enum NWReady {
                     connection.stateUpdateHandler = { state in
                         let result: Result<Void, Error>
                         switch state {
-                        case .ready: result = .success(())
+                        case .ready:
+                            result = TunnelEgress.admits(connection.currentPath, peer: "\(connection.endpoint)")
+                                ? .success(())
+                                : .failure(TunnelEgress.LoopError())
                         case .failed(let error): result = .failure(error)
                         case .cancelled: result = .failure(DNSError.timeout)
                         default: return
@@ -75,6 +78,7 @@ struct UDPNameserver: NameserverTransport {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return [] }
         let parameters = NWParameters.udp
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters)
         let connection = NWConnection(host: NWEndpoint.Host(address), port: nwPort, using: parameters)
         defer { connection.cancel() }
         try await NWReady.wait(connection, timeout: .seconds(2))
@@ -88,6 +92,7 @@ struct UDPNameserver: NameserverTransport {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return [] }
         let parameters = NWParameters.udp
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters)
         let connection = NWConnection(host: NWEndpoint.Host(address), port: nwPort, using: parameters)
         defer { connection.cancel() }
         try await NWReady.wait(connection, timeout: .seconds(2))
@@ -104,6 +109,7 @@ struct UDPNameserver: NameserverTransport {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return [] }
         let parameters = NWParameters.udp
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters)
         let connection = NWConnection(host: NWEndpoint.Host(address), port: nwPort, using: parameters)
         defer { connection.cancel() }
         try await NWReady.wait(connection, timeout: .seconds(2))

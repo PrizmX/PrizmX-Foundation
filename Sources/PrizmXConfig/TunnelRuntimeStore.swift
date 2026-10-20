@@ -16,6 +16,7 @@ public enum TunnelRuntimeStore: Sendable {
         "tunnel/selections.json",
         "tunnel/outbound-mode.json",
         "tunnel/dns.json",
+        "tunnel/capture.json",
         "dns-good.json",
     ]
 

@@ -651,7 +651,11 @@ public final class AnyTLSSession: AnyTLSSessionCore, @unchecked Sendable {
                     nw.stateUpdateHandler = { state in
                         switch state {
                         case .ready:
-                            once.resume(with: .success(()))
+                            once.resume(
+                                with: TunnelEgress.admits(nw.currentPath, peer: "\(peer)")
+                                    ? .success(())
+                                    : .failure(TunnelEgress.LoopError())
+                            )
                         case .failed(let error):
                             TunnelLog.write(.debug, "nw failed \(peer): \(error)")
                             once.resume(with: .failure(self.mapTransportError(error)))

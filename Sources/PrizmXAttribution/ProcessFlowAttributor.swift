@@ -139,6 +139,28 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
         return owner.flatMap { resolvedIdentity(for: $0.pid) }
     }
 
+    /// Matches like `attribute`, against this process's own sockets only
+    /// (which `attribute` skips).
+    public func ownsSocket(
+        transport: FlowTransport,
+        localPort: UInt16,
+        remoteAddress: String,
+        remotePort: UInt16
+    ) -> Bool {
+        guard localPort > 0 else { return false }
+        var index: [FlowTransport: [UInt16: [SocketOwner]]] = [:]
+        for owner in table.sockets(ofPID: ownPID) {
+            index[owner.transport, default: [:]][owner.localPort, default: []].append(owner)
+        }
+        let query = Query(
+            transport: transport,
+            localPort: localPort,
+            remotePort: remotePort,
+            remote: SocketAddress(remoteAddress)
+        )
+        return Self.match(query, in: index) != nil
+    }
+
     /// TCP sockets connected to a loopback `listenPorts` (the app's
     /// mixed-port listeners), with their owners. Re-reads the table. The root
     /// tunnel publishes these for the sandboxed app (`ProxyClientStore`).

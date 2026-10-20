@@ -14,6 +14,8 @@ public struct ExtensionBootstrap: Sendable {
     public var geositeURL: URL?
     public var geositeJSON: String?
     public var useFakeIP: Bool
+    /// "Route All Traffic": TUN takes the default route (`CapturePreferenceStore`).
+    public var captureAllTraffic: Bool
     public var systemProxy: Bool
     public var allowLAN: Bool
     public var mixedPort: UInt16
@@ -34,6 +36,7 @@ public struct ExtensionBootstrap: Sendable {
         geositeURL = GeoAssetStore.resolve(provider[TunnelProviderKeys.geositePath] as? String)
         geositeJSON = provider[TunnelProviderKeys.geositeJSON] as? String
         useFakeIP = (provider[TunnelProviderKeys.fakeIP] as? Bool) ?? true
+        captureAllTraffic = useFakeIP && CapturePreferenceStore.load().allTraffic
         systemProxy = (provider[TunnelProviderKeys.systemProxy] as? Bool) ?? false
         allowLAN = (provider[TunnelProviderKeys.allowLAN] as? Bool) ?? false
         let port = provider[TunnelProviderKeys.mixedPort] as? Int ?? TunnelProviderKeys.defaultMixedPort

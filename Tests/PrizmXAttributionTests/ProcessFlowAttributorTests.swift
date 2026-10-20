@@ -399,3 +399,26 @@ private final class CountingSocketTable: SocketTableReading, @unchecked Sendable
         return owners.filter { $0.pid != skipPID }
     }
 }
+
+extension ProcessFlowAttributorTests {
+    /// A tunnel flow from a dial of this process (a routing loop) is found
+    /// among its own sockets, matched like `attribute` matches others.
+    @Test func ownsSocketMatchesOnlyThisProcess() {
+        let table = FakeSocketTable(owners: [
+            owner(pid: 2, .tcp, lport: 54_000, remote: "1.1.1.1", rport: 443),
+            owner(pid: 2, .udp, lport: 54_100, remote: "8.8.8.8", rport: 443),
+            owner(pid: 1, .tcp, lport: 54_200, remote: "1.1.1.1", rport: 443),
+        ])
+        let attributor = ProcessFlowAttributor(table: table, ownPID: 2, now: { ContinuousClock.now })
+        #expect(attributor.ownsSocket(transport: .tcp, localPort: 54_000, remoteAddress: "1.1.1.1", remotePort: 443))
+        #expect(attributor.ownsSocket(transport: .udp, localPort: 54_100, remoteAddress: "8.8.8.8", remotePort: 443))
+        // Another process's socket, or ours to another peer, is no loop.
+        #expect(!attributor.ownsSocket(transport: .tcp, localPort: 54_200, remoteAddress: "1.1.1.1", remotePort: 443))
+        #expect(!attributor.ownsSocket(transport: .tcp, localPort: 54_000, remoteAddress: "1.0.0.1", remotePort: 443))
+        // `attribute` still never names this process.
+        #expect(attributor.attribute(
+            transport: .tcp, localAddress: "198.18.0.1", localPort: 54_000,
+            remoteAddress: "1.1.1.1", remotePort: 443
+        ) == nil)
+    }
+}

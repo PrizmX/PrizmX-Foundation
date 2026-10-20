@@ -68,6 +68,22 @@ public enum EngineTCPRelay: Sendable {
         } else {
             attribution = nil
         }
+        // With the default route in the tunnel, a dial of this process that
+        // still went into it arrives here. Relaying it would dial again and
+        // loop, so it is refused.
+        if attribution == nil, stream.isTunnelInbound, TunnelEgress.isActive,
+           let remote = stream.socketRemote,
+           TunnelEgress.wasRefused(localPort: stream.clientPort, remoteAddress: remote.address, remotePort: remote.port)
+               || engine.flowAttributor?.ownsSocket(
+                   transport: .tcp,
+                   localPort: stream.clientPort,
+                   remoteAddress: remote.address,
+                   remotePort: remote.port
+               ) == true {
+            TunnelEgress.noteLoop("PrizmX's own TCP to \(stream.endpoint) came in through the tunnel")
+            await stream.close()
+            return
+        }
         // A mixed-port client the local table cannot see (a root / system
         // account process, from the sandboxed app) gets a later lookup.
         let lateQuery: (clientPort: UInt16, listenPort: UInt16)?

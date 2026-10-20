@@ -155,6 +155,7 @@ final class UDPSocket: @unchecked Sendable {
         }
         let parameters = NWParameters.udp
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters, to: server.host)
         let connection = NWConnection(host: host, port: port, using: parameters)
         let attached: Bool = box.withLock { current in
             guard current == nil, !closed.withLock({ $0 }) else { return false }

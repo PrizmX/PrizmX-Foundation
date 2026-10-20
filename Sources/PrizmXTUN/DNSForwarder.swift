@@ -53,6 +53,7 @@ enum DNSForwarder {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
         let parameters = NWParameters.udp
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters)
         let connection = NWConnection(host: NWEndpoint.Host(address), port: nwPort, using: parameters)
         let result = await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
             let slot = OSAllocatedUnfairLock<CheckedContinuation<Data?, Never>?>(initialState: continuation)
@@ -69,6 +70,10 @@ enum DNSForwarder {
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
+                    guard TunnelEgress.admits(connection.currentPath, peer: "DNS \(address)") else {
+                        finish(nil)
+                        return
+                    }
                     connection.send(content: query, completion: .contentProcessed { error in
                         if error != nil { finish(nil) }
                     })

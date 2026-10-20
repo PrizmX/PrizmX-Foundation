@@ -405,6 +405,7 @@ public final class VLESSOutboundConnection: OutboundConnection, @unchecked Senda
 
         let parameters = NWParameters(tls: tlsOptions, tcp: tcp)
         parameters.preferNoProxies = true
+        TunnelEgress.prepare(parameters)
 
         let host = try await DNSClient.resolve(server.host, role: .proxyServer)
         let nw = NWConnection(host: host, port: nwPort, using: parameters)
