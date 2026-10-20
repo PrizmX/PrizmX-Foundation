@@ -239,6 +239,32 @@
           "serviceName": "/custom/path/Tun1|TunMulti1"
         }
       }
+    },
+    {
+      "tag": "socks-open",
+      "port": 10140,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true,
+        "ip": "127.0.0.1"
+      }
+    },
+    {
+      "tag": "socks-auth",
+      "port": 10141,
+      "protocol": "socks",
+      "settings": {
+        "auth": "password",
+        "accounts": [
+          {
+            "user": "u",
+            "pass": "interop"
+          }
+        ],
+        "udp": true,
+        "ip": "127.0.0.1"
+      }
     }
   ],
   "outbounds": [

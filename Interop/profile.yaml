@@ -24,8 +24,10 @@ proxies:
   - {name: ss-aes192@sing-box, type: ss, server: 127.0.0.1, port: 10003, cipher: aes-192-gcm, password: interop, udp: true, interop: {udp: true, half-close: true}}
   - {name: trojan-tls@sing-box, type: trojan, server: 127.0.0.1, port: 10010, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, udp: true, interop: {udp: true}}
   - {name: trojan-ws-tls@sing-box, type: trojan, server: 127.0.0.1, port: 10011, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, network: ws, ws-opts: {path: /trojan, headers: {Host: interop.prizmx.test}}, udp: true, interop: {udp: true}}
-  - {name: socks5-auth@sing-box, type: socks5, server: 127.0.0.1, port: 10020, username: u, password: interop, udp: true, interop: {udp: true, half-close: true}}
-  - {name: socks5@sing-box, type: socks5, server: 127.0.0.1, port: 10023, udp: true, interop: {udp: true, half-close: true}}
+  # sing-box answers UDP ASSOCIATE with its container address and a fresh
+  # port, which Docker does not publish: SOCKS5 UDP is tested on Xray.
+  - {name: socks5-auth@sing-box, type: socks5, server: 127.0.0.1, port: 10020, username: u, password: interop, interop: {half-close: true}}
+  - {name: socks5@sing-box, type: socks5, server: 127.0.0.1, port: 10023, interop: {half-close: true}}
   - {name: http-auth@sing-box, type: http, server: 127.0.0.1, port: 10021, username: u, password: interop, interop: {half-close: true}}
   - {name: https-auth@sing-box, type: http, server: 127.0.0.1, port: 10022, username: u, password: interop, tls: true, sni: interop.prizmx.test, skip-cert-verify: true, interop: {}}
   - {name: vmess-tcp@sing-box, type: vmess, server: 127.0.0.1, port: 10030, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, udp: true, interop: {udp: true, half-close: true}}
@@ -67,6 +69,9 @@ proxies:
   - {name: vless-grpc-tls@xray, type: vless, server: 127.0.0.1, port: 10130, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: interop.prizmx.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: GunService}, udp: true, interop: {udp: true, half-close: true}}
   - {name: vmess-grpc@xray, type: vmess, server: 127.0.0.1, port: 10131, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, network: grpc, grpc-opts: {grpc-service-name: GunService}, udp: true, interop: {udp: true, half-close: true}}
   - {name: trojan-grpc-tls@xray, type: trojan, server: 127.0.0.1, port: 10132, password: interop, sni: interop.prizmx.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: /custom/path/Tun1}, udp: true, interop: {udp: true, half-close: true}}
+  # Xray relays SOCKS5 UDP on the TCP port and names 127.0.0.1 in the reply.
+  - {name: socks5@xray, type: socks5, server: 127.0.0.1, port: 10140, udp: true, interop: {udp: true, half-close: true}}
+  - {name: socks5-auth@xray, type: socks5, server: 127.0.0.1, port: 10141, username: u, password: interop, udp: true, interop: {udp: true, half-close: true}}
 
   # shadowsocks-libev + SIP003 plugins -----------------------------------------
   - {name: ss-obfs-http@ss-libev, type: ss, server: 127.0.0.1, port: 10200, cipher: aes-128-gcm, password: interop, plugin: obfs, plugin-opts: {mode: http, host: cdn.prizmx.test}, udp: true, interop: {udp: true}}

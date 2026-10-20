@@ -62,14 +62,16 @@
       "server_port": 10020,
       "version": "5",
       "username": "u",
-      "password": "interop"
+      "password": "interop",
+      "network": "tcp"
     },
     {
       "type": "socks",
       "tag": "socks5@sing-box",
       "server": "127.0.0.1",
       "server_port": 10023,
-      "version": "5"
+      "version": "5",
+      "network": "tcp"
     },
     {
       "type": "http",
@@ -518,6 +520,22 @@
       }
     },
     {
+      "type": "socks",
+      "tag": "socks5@xray",
+      "server": "127.0.0.1",
+      "server_port": 10140,
+      "version": "5"
+    },
+    {
+      "type": "socks",
+      "tag": "socks5-auth@xray",
+      "server": "127.0.0.1",
+      "server_port": 10141,
+      "version": "5",
+      "username": "u",
+      "password": "interop"
+    },
+    {
       "type": "shadowsocks",
       "tag": "ss-obfs-http@ss-libev",
       "server": "127.0.0.1",
@@ -606,6 +624,8 @@
         "vless-grpc-tls@xray",
         "vmess-grpc@xray",
         "trojan-grpc-tls@xray",
+        "socks5@xray",
+        "socks5-auth@xray",
         "ss-obfs-http@ss-libev",
         "ss-obfs-tls@ss-libev",
         "ss-v2ray-ws@ss-libev",
