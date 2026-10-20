@@ -74,6 +74,72 @@ enum ICMPReply {
         return ip
     }
 
+    /// Refuses IPv6 the tunnel does not carry. TCP gets a RST: macOS takes
+    /// ICMPv6 unreachable as a soft error and retries the SYN for seconds,
+    /// while a RST fails the connect at once (apps then use IPv4).
+    /// Anything else gets ICMPv6 unreachable.
+    static func ipv6Refusal(original: Data) -> Data? {
+        guard original.count >= 40, original[0] >> 4 == 6 else { return nil }
+        if original[6] == 6 { return ipv6Reset(original: original) }
+        return ipv6Unreachable(original: original)
+    }
+
+    /// TCP RST answering `original` (RFC 9293 §3.10.7.1), from its
+    /// destination. Nil for a RST, which is never answered, or a TCP header
+    /// that is cut short.
+    static func ipv6Reset(original: Data) -> Data? {
+        let packet = Data(original)
+        guard packet.count >= 60, packet[0] >> 4 == 6, packet[6] == 6 else { return nil }
+        let flags = packet[53]
+        let rst: UInt8 = 0x04, syn: UInt8 = 0x02, fin: UInt8 = 0x01, ack: UInt8 = 0x10
+        guard flags & rst == 0 else { return nil }
+        let headerLength = Int(packet[52] >> 4) * 4
+        let payloadLength = Int(UInt16(packet[4]) << 8 | UInt16(packet[5]))
+        guard headerLength >= 20, payloadLength >= headerLength, packet.count >= 40 + payloadLength else {
+            return nil
+        }
+        func readUInt32(at offset: Int) -> UInt32 {
+            (0..<4).reduce(0) { $0 << 8 | UInt32(packet[offset + $1]) }
+        }
+
+        var tcp = Data(count: 20)
+        tcp.replaceSubrange(0..<2, with: packet[42..<44])
+        tcp.replaceSubrange(2..<4, with: packet[40..<42])
+        if flags & ack != 0 {
+            // <SEQ=SEG.ACK><CTL=RST>
+            writeUInt32(readUInt32(at: 48), into: &tcp, at: 4)
+            tcp[13] = rst
+        } else {
+            // <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
+            var length = UInt32(payloadLength - headerLength)
+            if flags & syn != 0 { length += 1 }
+            if flags & fin != 0 { length += 1 }
+            writeUInt32(readUInt32(at: 44) &+ length, into: &tcp, at: 8)
+            tcp[13] = rst | ack
+        }
+        tcp[12] = 5 << 4
+        let source = packet.subdata(in: 24..<40)
+        let destination = packet.subdata(in: 8..<24)
+        let checksum = ipv6Checksum(source: source, destination: destination, nextHeader: 6, payload: tcp)
+        writeUInt16(checksum, into: &tcp, at: 16)
+
+        var ip = Data(count: 40)
+        ip[0] = 0x60
+        writeUInt16(UInt16(tcp.count), into: &ip, at: 4)
+        ip[6] = 6
+        ip[7] = 64
+        ip.replaceSubrange(8..<24, with: source)
+        ip.replaceSubrange(24..<40, with: destination)
+        ip.append(tcp)
+        return ip
+    }
+
+    private static func writeUInt32(_ value: UInt32, into data: inout Data, at offset: Int) {
+        for index in 0..<4 {
+            data[offset + index] = UInt8(truncatingIfNeeded: value >> (24 - 8 * index))
+        }
+    }
+
     private static func writeUInt16(_ value: UInt16, into data: inout Data, at offset: Int) {
         data[offset] = UInt8(truncatingIfNeeded: value >> 8)
         data[offset + 1] = UInt8(truncatingIfNeeded: value)
@@ -92,16 +158,21 @@ enum ICMPReply {
     }
 
     private static func icmpv6Checksum(source: Data, destination: Data, icmp: Data) -> UInt16 {
+        ipv6Checksum(source: source, destination: destination, nextHeader: 58, payload: icmp)
+    }
+
+    /// Upper-layer checksum over the IPv6 pseudo-header (RFC 8200 §8.1).
+    static func ipv6Checksum(source: Data, destination: Data, nextHeader: UInt8, payload: Data) -> UInt16 {
         var sum = Data()
         sum.append(source)
         sum.append(destination)
-        let length = UInt32(icmp.count)
+        let length = UInt32(payload.count)
         sum.append(UInt8(truncatingIfNeeded: length >> 24))
         sum.append(UInt8(truncatingIfNeeded: length >> 16))
         sum.append(UInt8(truncatingIfNeeded: length >> 8))
         sum.append(UInt8(truncatingIfNeeded: length))
-        sum.append(contentsOf: [0, 0, 0, 58])
-        sum.append(icmp)
+        sum.append(contentsOf: [0, 0, 0, nextHeader])
+        sum.append(payload)
         return internetChecksum(sum)
     }
 }

@@ -322,6 +322,30 @@ public enum PhysicalDNSSnapshot: Sendable {
             TunnelLog.write(.debug, "dns snapshot State service=\(addresses)")
             if !usable.isEmpty { return usable }
         }
+        // A VPN that holds the default route (TUN "Route All Traffic") is the
+        // primary service, so every lookup above sees only its FakeDNS. The
+        // active physical services still carry their resolvers; take the
+        // first in the user's service order.
+        let order = (SCDynamicStoreCopyValue(
+            store,
+            "Setup:/Network/Global/IPv4" as CFString
+        ) as? [String: Any])?["ServiceOrder"] as? [String] ?? []
+        for service in order where service != primary {
+            guard SCDynamicStoreCopyValue(store, "State:/Network/Service/\(service)/IPv4" as CFString) != nil else {
+                continue
+            }
+            for scope in ["Setup", "State"] {
+                guard let dns = SCDynamicStoreCopyValue(
+                    store,
+                    "\(scope):/Network/Service/\(service)/DNS" as CFString
+                ) as? [String: Any],
+                    let addresses = dns["ServerAddresses"] as? [String]
+                else { continue }
+                let usable = addresses.filter { NameserverAddress.isUsableIPv4($0) }
+                TunnelLog.write(.debug, "dns snapshot \(scope) service order=\(addresses)")
+                if !usable.isEmpty { return usable }
+            }
+        }
         TunnelLog.write(.debug, "dns snapshot empty")
         return []
         #else

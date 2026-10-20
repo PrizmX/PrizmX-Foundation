@@ -275,7 +275,7 @@ public actor TUNStack {
                         continue
                     }
                     forwarded.append(packet)
-                } else if let reply = ICMPReply.ipv6Unreachable(original: packet) {
+                } else if let reply = ICMPReply.ipv6Refusal(original: packet) {
                     mailbox.write(bytes: reply, protocolFamily: 30)
                 }
                 continue
