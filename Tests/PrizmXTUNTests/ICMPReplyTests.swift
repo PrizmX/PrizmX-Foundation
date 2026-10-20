@@ -92,3 +92,25 @@ private func uint32(_ data: Data, at offset: Int) -> UInt32 {
     let unreachable = try #require(ICMPReply.ipv6Refusal(original: udp))
     #expect(unreachable[6] == 58)
 }
+
+/// A dropped IPv6 UDP flow (QUIC to a node without UDP) fails at once.
+@Test func ipv6PortUnreachableQuotesTheDroppedDatagram() {
+    let client = FakeIPAllocator.gateway6
+    let server = IPv6Address(high: 0x2606_4700_4700_0000, low: 0x1111)
+    let reply = ICMPReply.ipv6PortUnreachable(client: client, destination: server, sourcePort: 50_000, destinationPort: 443)
+    #expect(reply[6] == 58)
+    #expect(reply[40] == 1)
+    #expect(reply[41] == 4)
+    // Quoted datagram: client → server, UDP 50000 → 443.
+    #expect(reply.subdata(in: 24..<40) == reply.subdata(in: 48 + 8..<48 + 24))
+    #expect(reply[48 + 6] == 17)
+    #expect(UInt16(reply[88]) << 8 | UInt16(reply[89]) == 50_000)
+    #expect(UInt16(reply[90]) << 8 | UInt16(reply[91]) == 443)
+    let checksum = ICMPReply.ipv6Checksum(
+        source: reply.subdata(in: 8..<24),
+        destination: reply.subdata(in: 24..<40),
+        nextHeader: 58,
+        payload: reply.subdata(in: 40..<reply.count)
+    )
+    #expect(checksum == 0)
+}

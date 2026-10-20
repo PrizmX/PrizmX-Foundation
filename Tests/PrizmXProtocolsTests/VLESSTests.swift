@@ -201,3 +201,18 @@ struct VLESSResponseHeaderTests {
         #expect(parsed == nil)
     }
 }
+
+/// VLESS address type 3 with a full IPv6 target in network order.
+@Test func vlessEncodesAFullIPv6Target() throws {
+    let address = try #require(IPv6Address(parsing: "2606:4700:4700::1111"))
+    var buffer = [UInt8](repeating: 0, count: 2 + 1 + 16)
+    let written = try buffer.withUnsafeMutableBytes {
+        try VLESSHeader.encodeAddressPort(Endpoint(host: .ipv6(address), port: 443), into: $0)
+    }
+    #expect(written == 19)
+    #expect(buffer == [
+        0x01, 0xBB, 0x03,
+        0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x11,
+    ])
+}

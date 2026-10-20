@@ -72,9 +72,9 @@ Full YAML 1.1 through libyaml ([Yams](https://github.com/jpsim/Yams)): anchors, 
 | `sniffer` | Ignored: HTTP Host / TLS SNI sniffing is built in and always on. |
 | `geox-url`, `geodata-mode`, `geo-auto-update` | Ignored: `geoip.metadb` and `geosite.dat` come from MetaCubeX/meta-rules-dat (jsDelivr as a fallback) and refresh weekly. |
 | `sub-rules`, `listeners`, `tunnels`, `ntp`, `experimental`, `profile` | Ignored. |
-| `unified-delay`, `tcp-concurrent`, `global-client-fingerprint`, `keep-alive-interval`, `find-process-mode`, `interface-name`, `routing-mark`, `ipv6` | Ignored. |
+| `unified-delay`, `tcp-concurrent`, `global-client-fingerprint`, `keep-alive-interval`, `find-process-mode`, `interface-name`, `routing-mark` | Ignored. |
 
-`mixed-port`, `port`, `socks-port`, `authentication`, `skip-auth-prefixes`, `hosts` and the sections below are read.
+`mixed-port`, `port`, `socks-port`, `authentication`, `skip-auth-prefixes`, `hosts`, `ipv6` and the sections below are read. `ipv6` defaults to `true`, as in mihomo; `false` turns IPv6 off: the TUN refuses the IPv6 that reaches it (TCP gets a RST), FakeDNS returns no AAAA answers whatever `dns.ipv6` says, and IPv6 targets are rejected.
 
 ### `proxies`
 

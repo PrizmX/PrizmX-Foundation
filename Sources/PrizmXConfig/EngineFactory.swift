@@ -25,6 +25,7 @@ public enum EngineFactory: Sendable {
         traffic: TrafficCounter? = nil
     ) throws -> Engine {
         let parsed: (Router, NodeManager)
+        var allowsIPv6 = true
         if let configText {
             let trimmed = configText.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
@@ -32,6 +33,7 @@ public enum EngineFactory: Sendable {
             } else {
                 let result = try ConfigAdapter.parseWithWarnings(rawString: trimmed, overlay: overlay)
                 parsed = result.tuple
+                allowsIPv6 = result.allowsIPv6
                 if !result.warnings.isEmpty {
                     TunnelLog.write(.warn, "config import skipped \(result.warnings.count) item(s)")
                     for warning in result.warnings.prefix(50) {
@@ -66,6 +68,8 @@ public enum EngineFactory: Sendable {
             overrideDNS: overrideDNS,
             matchers: DNSMatchers(geoIP: geoIP, geosite: geosite, ruleSets: dnsRuleSets)
         )
+        // `ipv6: false` turns AAAA answers off whatever `dns.ipv6` says.
+        if !allowsIPv6 { dnsSettings.ipv6 = false }
         Self.logNodeDNS(section: dnsSection, settings: dnsSettings, overrideDNS: overrideDNS)
         // Node server domains never receive fake IPs: an app-side lookup
         // (node ping, subscription refresh) must not loop into the tunnel.
@@ -108,7 +112,8 @@ public enum EngineFactory: Sendable {
             traffic: traffic ?? TrafficCounter(),
             outboundMode: mode,
             globalGroup: group,
-            flowAttributor: flowAttributor
+            flowAttributor: flowAttributor,
+            allowsIPv6: allowsIPv6
         )
     }
 

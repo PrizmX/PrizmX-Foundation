@@ -21,6 +21,9 @@ public final class Engine: Sendable {
     public let traffic: TrafficCounter
     /// Optional; nil on iOS and in tests. macOS Packet Tunnel injects process lookup.
     public let flowAttributor: (any FlowAttributing)?
+    /// Clash `ipv6` (default true). False: IPv6 targets are refused, and the
+    /// tunnel refuses the IPv6 that reaches it.
+    public let allowsIPv6: Bool
 
     private struct Runtime: Sendable {
         var mode: OutboundMode
@@ -37,13 +40,15 @@ public final class Engine: Sendable {
         traffic: TrafficCounter = TrafficCounter(),
         outboundMode: OutboundMode = .rule,
         globalGroup: String? = nil,
-        flowAttributor: (any FlowAttributing)? = nil
+        flowAttributor: (any FlowAttributing)? = nil,
+        allowsIPv6: Bool = true
     ) {
         self.router = router
         self.nodeManager = nodeManager
         self.dns = dns
         self.traffic = traffic
         self.flowAttributor = flowAttributor
+        self.allowsIPv6 = allowsIPv6
         self.runtime = OSAllocatedUnfairLock(
             initialState: Runtime(
                 mode: outboundMode,
@@ -205,6 +210,10 @@ public final class Engine: Sendable {
         hosts: SystemHosts.Mapping?,
         remoteClient: Bool = false
     ) throws -> (connection: any OutboundConnection, rule: String, policy: String) {
+        if !allowsIPv6, case .ipv6 = target.host {
+            TunnelLog.writeOnce("ipv6-off", .info, "IPv6 targets refused: the profile sets ipv6: false")
+            throw EngineError.rejected(target)
+        }
         // Hosts-file hit. IP rules already saw the mapped address, and
         // REJECT still wins. A local binding (loopback / LAN / 0.0.0.0) is
         // dialed here even when the rule would proxy: a remote node would

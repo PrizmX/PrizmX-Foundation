@@ -9,6 +9,7 @@ import PrizmXRules
 import SwiftTCP
 
 private typealias IPv4Address = PrizmXProtocols.IPv4Address
+private typealias IPv6Address = PrizmXProtocols.IPv6Address
 
 /// Consumes `TUNStack.udpDatagrams()` and forwards DIRECT or through the
 /// node's `DatagramOutbound` (SS / VLESS / Trojan UDP).
@@ -71,12 +72,11 @@ private actor UDPRelayState {
     }
 
     func ingest(_ datagram: TUNUDPDatagram) {
-        guard case .ipv4(let clientIP) = datagram.source.host else { return }
         // Keyed by the full 4-tuple (destination host included): FakeIP gives
         // each domain its own address, so this uniquely identifies the target
         // and prevents same-port multi-destination (QUIC/443) misdelivery.
         let key = UDPFlowKey(
-            client: clientIP,
+            client: datagram.source.host,
             clientPort: datagram.source.port,
             destinationHost: datagram.destination.host.description,
             destinationPort: datagram.destination.port
@@ -224,7 +224,7 @@ private struct UDPSessionOpener: Sendable {
         let process = engine.router.needsProcess ? app : nil
         let context = RouteContext(
             network: .udp,
-            sourceHost: .ipv4(key.client),
+            sourceHost: key.client,
             sourcePort: key.clientPort,
             processName: process?.processName,
             processPath: process?.executablePath
@@ -255,14 +255,25 @@ private struct UDPSessionOpener: Sendable {
         // Use the wire addresses: a FakeIP destination is already rewritten
         // to its domain, and without the ICMP the app never falls back
         // (e.g. QUIC → TCP).
-        guard case .v4(let client) = datagram.flow.src.kind,
-              case .v4(let destination) = datagram.flow.dst.kind else { return }
-        await stack.sendICMPPortUnreachable(
-            client: IPv4Address(rawValue: client),
-            destination: IPv4Address(rawValue: destination),
-            sourcePort: datagram.flow.srcPort,
-            destinationPort: datagram.flow.dstPort
-        )
+        let flow = datagram.flow
+        switch (flow.src.kind, flow.dst.kind) {
+        case (.v4(let client), .v4(let destination)):
+            await stack.sendICMPPortUnreachable(
+                client: IPv4Address(rawValue: client),
+                destination: IPv4Address(rawValue: destination),
+                sourcePort: flow.srcPort,
+                destinationPort: flow.dstPort
+            )
+        case (.v6(let clientHigh, let clientLow), .v6(let destinationHigh, let destinationLow)):
+            await stack.sendICMPv6PortUnreachable(
+                client: IPv6Address(high: clientHigh, low: clientLow),
+                destination: IPv6Address(high: destinationHigh, low: destinationLow),
+                sourcePort: flow.srcPort,
+                destinationPort: flow.dstPort
+            )
+        default:
+            break
+        }
     }
 
     private func openDirect(route: FlowRoute, app: FlowAttribution?) async -> (any UDPSession)? {
@@ -347,7 +358,7 @@ private struct UDPSessionOpener: Sendable {
 }
 
 private struct UDPFlowKey: Hashable, Sendable {
-    var client: IPv4Address
+    var client: Endpoint.Host
     var clientPort: UInt16
     /// Destination host (domain restored from FakeIP, or IP literal).
     var destinationHost: String

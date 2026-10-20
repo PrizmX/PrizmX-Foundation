@@ -326,3 +326,16 @@ struct ShadowsocksUDPTests {
         #expect(decoded.payload == payload)
     }
 }
+
+/// A full IPv6 target (high and low halves both set), in the SOCKS address
+/// form Shadowsocks, SOCKS5, Trojan and AnyTLS send: `2606:4700:4700::1111`.
+@Test func encodesAFullIPv6TargetInNetworkOrder() throws {
+    let address = try #require(IPv6Address(parsing: "2606:4700:4700::1111"))
+    let encoded = try ShadowsocksAddress.encode(Endpoint(host: .ipv6(address), port: 443))
+    #expect(encoded == [
+        0x04,
+        0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x11,
+        0x01, 0xBB,
+    ])
+}

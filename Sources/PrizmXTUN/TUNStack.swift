@@ -144,8 +144,12 @@ public actor TUNStack {
     /// FakeDNS: filter → real; REJECT → NODATA; anything else (nil:
     /// undecided without a lookup) → FakeIP.
     private let dnsPolicy: (@Sendable (String) async -> Policy?)?
-    /// Clash `dns.ipv6`: FakeIPv6 pool + pass IPv6 into SwiftTCP.
-    private let ipv6Enabled: Bool
+    /// Clash `dns.ipv6`: AAAA queries get FakeIPv6 answers.
+    private let answersAAAA: Bool
+    /// IPv6 that reaches the tunnel is relayed like IPv4 (TCP, UDP, DNS to
+    /// any server). Off (Clash `ipv6: false`), it is refused: TCP gets a
+    /// RST, anything else ICMPv6 unreachable.
+    private var carriesIPv6: Bool
     /// TCP SYN/FIN hooks; nil on iOS.
     private var stack: SwiftStack?
     private var started = false
@@ -158,21 +162,26 @@ public actor TUNStack {
         dns: DNSClient? = nil,
         dnsPolicy: (@Sendable (String) async -> Policy?)? = nil,
         ipv6: Bool = false,
+        carriesIPv6: Bool? = nil,
         onOutput: @escaping @Sendable ([Data]) -> Void
     ) {
         self.fakeIP = fakeIP
         self.fakeIPFilter = fakeIPFilter
         self.dns = dns
         self.dnsPolicy = dnsPolicy
-        self.ipv6Enabled = ipv6
+        self.answersAAAA = ipv6
+        // Without a say from the caller, IPv6 is carried exactly when it is
+        // routed here for FakeIPv6 answers.
+        self.carriesIPv6 = carriesIPv6 ?? ipv6
         self.mailbox = TUNMailbox(fakeIP: fakeIP, onOutput: onOutput)
     }
 
-    /// A reloaded engine's filter and resolver. The FakeIP table and every
-    /// open flow are kept.
-    public func updateResolution(fakeIPFilter: [String], dns: DNSClient?) {
+    /// A reloaded engine's filter, resolver and Clash `ipv6`. The FakeIP
+    /// table and every open flow are kept.
+    public func updateResolution(fakeIPFilter: [String], dns: DNSClient?, carriesIPv6: Bool? = nil) {
         self.fakeIPFilter = fakeIPFilter
         self.dns = dns
+        if let carriesIPv6 { self.carriesIPv6 = carriesIPv6 }
     }
 
     public func start() {
@@ -251,6 +260,24 @@ public actor TUNStack {
         )
     }
 
+    /// ICMPv6 port-unreachable for a dropped IPv6 UDP datagram.
+    public func sendICMPv6PortUnreachable(
+        client: IPv6Address,
+        destination: IPv6Address,
+        sourcePort: UInt16,
+        destinationPort: UInt16
+    ) {
+        mailbox.write(
+            bytes: ICMPReply.ipv6PortUnreachable(
+                client: client,
+                destination: destination,
+                sourcePort: sourcePort,
+                destinationPort: destinationPort
+            ),
+            protocolFamily: 30
+        )
+    }
+
     /// Send a UDP payload back toward the TUN client on the original flow.
     public func sendUDP(flow: FlowKey, payload: Data) async {
         guard !payload.isEmpty else { return }
@@ -264,16 +291,8 @@ public actor TUNStack {
         forwarded.reserveCapacity(packets.count)
         for packet in packets {
             if packet.first.map({ $0 >> 4 }) == 6 {
-                if ipv6Enabled {
+                if carriesIPv6 {
                     if await handleDNSIPv6IfNeeded(packet) { continue }
-                    if packet.count > 6, packet[6] == 17 {
-                        // No IPv6 UDP relay: fail fast (QUIC falls back to TCP)
-                        // instead of letting SwiftTCP sessions hang.
-                        if let reply = ICMPReply.ipv6Unreachable(original: packet) {
-                            mailbox.write(bytes: reply, protocolFamily: 30)
-                        }
-                        continue
-                    }
                     forwarded.append(packet)
                 } else if let reply = ICMPReply.ipv6Refusal(original: packet) {
                     mailbox.write(bytes: reply, protocolFamily: 30)
@@ -350,12 +369,13 @@ public actor TUNStack {
         return true
     }
 
+    /// Any IPv6 UDP :53, like IPv4: the FakeIPv6 resolver, or a server an
+    /// app picked when the tunnel carries all IPv6.
     private func handleDNSIPv6IfNeeded(_ packet: Data) async -> Bool {
         guard let fakeIP, packet.count >= 48, packet[0] >> 4 == 6, packet[6] == 17 else {
             return false
         }
         let dest = ipv6(packet, at: 24)
-        guard dest == FakeIPAllocator.dns6 else { return false }
         let destPort = UInt16(packet[42]) << 8 | UInt16(packet[43])
         guard destPort == 53 else { return false }
         let srcPort = UInt16(packet[40]) << 8 | UInt16(packet[41])
@@ -410,7 +430,7 @@ public actor TUNStack {
             return
         }
         if FakeIPFilter.matches(name, patterns: fakeIPFilter), let dns {
-            if isAAAA, !ipv6Enabled {
+            if isAAAA, !answersAAAA {
                 writeDNSReply(DNSMessage.response(id: query.id, question: query.question), to: query)
                 return
             }
@@ -429,7 +449,7 @@ public actor TUNStack {
             )
             return
         }
-        if ipv6Enabled {
+        if answersAAAA {
             let address = fakeIP.allocateIPv6(domain: query.question.name)
             writeDNSReply(
                 DNSMessage.response(id: query.id, question: query.question, ipv6: address),

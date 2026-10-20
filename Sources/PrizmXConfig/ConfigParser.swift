@@ -55,6 +55,9 @@ public struct ConfigParseResult: Sendable {
     public var router: Router
     public var nodeManager: NodeManager
     public var warnings: [ConfigWarning]
+    /// Clash top-level `ipv6` (mihomo default `true`). False: no IPv6 at
+    /// all — IPv6 traffic is refused and AAAA answers stay off.
+    public var allowsIPv6 = true
 
     public init(router: Router, nodeManager: NodeManager, warnings: [ConfigWarning] = []) {
         self.router = router

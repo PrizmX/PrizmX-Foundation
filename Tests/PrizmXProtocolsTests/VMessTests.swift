@@ -163,3 +163,13 @@ struct VMessTests {
         }
     }
 }
+
+/// An IPv6 target goes to the server as address type 3 with all 16 bytes.
+@Test func vmessAddressCarriesAnIPv6Target() throws {
+    let target = Endpoint(host: .ipv6(IPv6Address(high: 0x2001_0b28_f23d_f001, low: 0xa)), port: 443)
+    let bytes = try VMessRequestHeader.address(target)
+    #expect(bytes.count == 2 + 1 + 16)
+    #expect(Array(bytes[0..<3]) == [0x01, 0xBB, 0x03])
+    #expect(Array(bytes[3..<5]) == [0x20, 0x01])
+    #expect(bytes.last == 0x0a)
+}

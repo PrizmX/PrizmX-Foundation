@@ -92,11 +92,13 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         groups = ConfigMapping.pruningUndefinedMembers(groups, nodes: nodes, warnings: &warnings)
         let manager = NodeManager(nodes: nodes, groups: groups)
         warnings += ConfigMapping.missingTargetWarnings(rules: rules, manager: manager)
-        return ConfigParseResult(
+        var result = ConfigParseResult(
             router: Router(rules: rules, default: .direct),
             nodeManager: manager,
             warnings: warnings
         )
+        result.allowsIPv6 = root.bool(for: "ipv6", default: true)
+        return result
     }
 
     /// One `proxies` entry, or nil (reported) when it cannot be imported.

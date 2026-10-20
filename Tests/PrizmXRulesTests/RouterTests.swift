@@ -191,3 +191,15 @@ import PrizmXProtocols
     #expect(router.match(host: "google.com", port: 443) == .proxy(targetGroup: "PROXY"))
     #expect(router.match(host: "anything.example", port: 80) == .proxy(targetGroup: "PROXY"))
 }
+
+/// An IPv6 destination the tunnel now carries (Telegram's data centers)
+/// matches `IP-CIDR6`.
+@Test func ipCIDR6MatchesAnIPv6Target() {
+    let network = IPv6Address(parsing: "2001:b28:f23d::")!
+    let router = Router(
+        rules: [RouteRule(.ipv6CIDR(network, prefixLength: 48), policy: .proxy(targetGroup: "Telegram"))],
+        default: .direct
+    )
+    #expect(router.match(host: "2001:b28:f23d:f001::a", port: 443) == .proxy(targetGroup: "Telegram"))
+    #expect(router.match(host: "2001:b28:f23e::1", port: 443) == .direct)
+}
