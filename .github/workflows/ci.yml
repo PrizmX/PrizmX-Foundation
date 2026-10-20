@@ -1,0 +1,49 @@
+# Runs the PrizmX-Foundation test suite on pull requests and pushes to main.
+# No secrets.
+#
+# Package.swift depends on ../SwiftTCP, so SwiftTCP is checked out as a
+# sibling. This is dev CI: it tracks SwiftTCP's default branch. App CI and
+# releases pin siblings via PrizmX/dependencies.lock instead.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # Same image and Xcode pin as the PrizmX release workflow.
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      # Actions are pinned to full commit SHAs; the comment names the tag.
+      - name: Checkout PrizmX-Foundation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: PrizmX-Foundation
+          persist-credentials: false
+
+      - name: Checkout SwiftTCP (default branch)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: PrizmX/SwiftTCP
+          path: SwiftTCP
+          persist-credentials: false
+
+      - name: Test
+        working-directory: PrizmX-Foundation
+        run: |
+          # Interop node / load suites need Docker and real servers
+          # (Interop/run.sh); the rest of PrizmXInteropTests still runs.
+          swift test --skip 'PrizmXInteropTests\.(NodeTests|LoadTests)'
