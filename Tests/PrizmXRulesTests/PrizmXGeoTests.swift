@@ -66,7 +66,7 @@ private func sampleGeoIPData() -> Data {
     )
 }
 
-@Test func geoIPMatchesDomainWhenResolvedIPv4Provided() throws {
+@Test func geoIPMatchesDomainWhenResolvedIPv4Provided() async throws {
     let matcher = try GeoIPMatcher(data: sampleGeoIPData())
     let router = Router(
         rules: [
@@ -90,10 +90,14 @@ private func sampleGeoIPData() -> Data {
         default: .direct,
         geoIP: matcher
     )
-    #expect(
-        skipped.match(endpoint: baidu, resolvedIPv4: IPv4Address(parsing: "220.181.38.148")!)
-            == .proxy(targetGroup: "PROXY")
-    )
+    // `no-resolve` never looks the name up, but an address known otherwise
+    // (a hosts entry) still matches, as in mihomo.
+    let lazy = await skipped.matchResult(endpoint: baidu) {
+        ResolvedAddresses(ipv4: IPv4Address(parsing: "220.181.38.148")!)
+    }
+    #expect(lazy.policy == .proxy(targetGroup: "PROXY"))
+    #expect(lazy.resolved == nil)
+    #expect(skipped.match(endpoint: baidu, resolvedIPv4: IPv4Address(parsing: "220.181.38.148")!) == .direct)
 }
 
 // MARK: - Geosite trie

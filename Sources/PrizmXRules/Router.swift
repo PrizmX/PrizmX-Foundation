@@ -135,7 +135,9 @@ public struct RouteRule: Hashable, Sendable {
     public let port: UInt16?
     /// The policy applied when matched.
     public let policy: Policy
-    /// Clash `no-resolve`: skip IP lookup for GEOIP / IP-CIDR.
+    /// Clash `no-resolve`: the rule never starts a lookup of a domain
+    /// destination. As in mihomo, an address known otherwise (dialed,
+    /// `hosts`, looked up for an earlier rule) still matches.
     public let noResolve: Bool
 
     public init(
@@ -469,20 +471,22 @@ public final class Router: Sendable {
             }
         }
 
-        /// Some rule of the run matches a domain destination by its lookup.
+        /// A rule of the run looks a domain destination up.
         var needsResolution: Bool {
             guard case .addresses(let run) = self else { return false }
             return run.needsResolution
         }
 
-        /// The earliest rule of the run that matches.
-        func firstMatch(_ endpoint: Endpoint, _ destination: Destination) -> Int? {
+        /// The earliest rule of the run that matches. `lookedUpHere`: the
+        /// address was looked up on reaching the run, so the rules before
+        /// its first resolving one went without it.
+        func firstMatch(_ endpoint: Endpoint, _ destination: Destination, lookedUpHere: Bool) -> Int? {
             switch self {
             case .domains(let run):
                 guard case .domain(let host) = endpoint.host else { return nil }
                 return run.firstMatch(host)
             case .addresses(let run):
-                return run.firstMatch(destination)
+                return run.firstMatch(destination, lookedUpHere: lookedUpHere)
             }
         }
     }
@@ -515,23 +519,25 @@ public final class Router: Sendable {
     /// Consecutive IP-CIDR / IP-CIDR6 rules `start..<end`, keyed by prefix
     /// length and network to the earliest rule index.
     private struct AddressRun: Sendable {
-        /// The earliest rule for a network, and the earliest one without
-        /// `no-resolve`: the only kind a looked-up address can match.
+        /// The earliest rule for a network, and the earliest one from
+        /// `trigger` on: all that an address looked up there can match.
         struct Hit: Sendable {
             var first: Int
-            var resolvable: Int?
+            var fromTrigger: Int?
         }
 
         var end: Int
         var ipv4: [UInt8: [UInt32: Hit]] = [:]
         var ipv6: [UInt8: [RuleSet.IPv6Key: Hit]] = [:]
-        /// Some rule lacks `no-resolve`.
-        var needsResolution = false
+        /// The first rule without `no-resolve`, where a name is looked up.
+        var trigger: Int?
 
-        func firstMatch(_ destination: Destination) -> Int? {
+        var needsResolution: Bool { trigger != nil }
+
+        func firstMatch(_ destination: Destination, lookedUpHere: Bool) -> Int? {
             var best: Int?
             func consider(_ hit: Hit?) {
-                guard let hit, let index = destination.dialed ? hit.first : hit.resolvable else { return }
+                guard let hit, let index = lookedUpHere ? hit.fromTrigger : hit.first else { return }
                 best = min(best ?? index, index)
             }
             if let address = destination.ipv4 {
@@ -548,14 +554,15 @@ public final class Router: Sendable {
         }
     }
 
-    /// The addresses IP rules compare for a destination.
+    /// The addresses IP rules compare for a destination: its own (an IP
+    /// endpoint, or the one a sniffed client dialed), a `hosts` entry's, or
+    /// a lookup's. As in mihomo, every IP rule matches a known address,
+    /// `no-resolve` or not.
     private struct Destination {
         var ipv4: IPv4Address?
         var ipv6: IPv6Address?
-        /// The destination's own address (an IP endpoint, or the one a
-        /// sniffed client dialed), which `no-resolve` rules match too.
-        /// Otherwise the addresses come from a lookup of the name.
-        var dialed: Bool
+
+        var isKnown: Bool { ipv4 != nil || ipv6 != nil }
     }
 
     /// Shorter runs are cheaper to walk than to look up.
@@ -675,11 +682,11 @@ public final class Router: Sendable {
     private static func addressRun(_ compiled: [CompiledRule], _ range: Range<Int>) -> AddressRun {
         var run = AddressRun(end: range.upperBound)
         for index in range {
-            let resolvable = !compiled[index].rule.noResolve
-            run.needsResolution = run.needsResolution || resolvable
+            if run.trigger == nil, !compiled[index].rule.noResolve { run.trigger = index }
+            let fromTrigger = run.trigger != nil
             func record(_ hit: inout AddressRun.Hit?) {
-                if hit == nil { hit = AddressRun.Hit(first: index, resolvable: nil) }
-                if resolvable, hit?.resolvable == nil { hit?.resolvable = index }
+                if hit == nil { hit = AddressRun.Hit(first: index, fromTrigger: nil) }
+                if fromTrigger, hit?.fromTrigger == nil { hit?.fromTrigger = index }
             }
             switch compiled[index].matcher {
             case .ipv4(let address):
@@ -705,15 +712,17 @@ public final class Router: Sendable {
     ) -> Destination {
         switch (endpoint.host, context.destinationAddress) {
         case (.ipv4(let address), _), (.domain, .ipv4(let address)?):
-            return Destination(ipv4: address, ipv6: nil, dialed: true)
+            return Destination(ipv4: address, ipv6: nil)
         case (.ipv6(let address), _), (.domain, .ipv6(let address)?):
-            return Destination(ipv4: nil, ipv6: address, dialed: true)
+            return Destination(ipv4: nil, ipv6: address)
         default:
-            return Destination(ipv4: resolvedIPv4, ipv6: resolvedIPv6, dialed: false)
+            return Destination(ipv4: resolvedIPv4, ipv6: resolvedIPv6)
         }
     }
 
-    /// Primary API: policy for a destination endpoint.
+    /// Primary API: policy for a destination endpoint. `resolvedIPv4` /
+    /// `resolvedIPv6`: addresses known for a domain destination (a `hosts`
+    /// entry), which every IP rule matches.
     public func match(
         endpoint: Endpoint,
         resolvedIPv4: IPv4Address? = nil,
@@ -738,7 +747,7 @@ public final class Router: Sendable {
         var index = 0
         while index < compiled.count {
             if let run = runs[index] {
-                if let hit = run.firstMatch(endpoint, destination) {
+                if let hit = run.firstMatch(endpoint, destination, lookedUpHere: false) {
                     return (compiled[hit].rule.policy, compiled[hit].rule)
                 }
                 index = run.end
@@ -755,9 +764,11 @@ public final class Router: Sendable {
 
     /// Lazy variant: rules run in order and `resolve` is called at most once,
     /// only when a domain destination first reaches a rule that needs a real
-    /// IP (GEOIP / IP-CIDR without `no-resolve`). A domain rule that matches
-    /// earlier never triggers a lookup, and neither does a sniffed name
-    /// whose dialed address is known. Returns the addresses if one happened.
+    /// IP (GEOIP / IP-CIDR without `no-resolve`). From there on every IP rule
+    /// matches the answer, `no-resolve` ones too, as in mihomo. A domain rule
+    /// that matches earlier never triggers a lookup, and neither does a
+    /// sniffed name whose dialed address is known. Returns the addresses if
+    /// one happened.
     public func matchResult(
         endpoint: Endpoint,
         context: RouteContext = .none,
@@ -765,7 +776,7 @@ public final class Router: Sendable {
     ) async -> (policy: Policy, rule: RouteRule?, resolved: ResolvedAddresses?) {
         var resolved: ResolvedAddresses?
         var destination = Self.destination(of: endpoint, resolvedIPv4: nil, resolvedIPv6: nil, context: context)
-        let canResolve = !destination.dialed
+        let canResolve = !destination.isKnown
         func lookUp() async {
             guard canResolve, resolved == nil else { return }
             let addresses = await resolve()
@@ -780,8 +791,9 @@ public final class Router: Sendable {
         var index = 0
         while index < compiled.count {
             if let run = runs[index] {
+                let knownBefore = destination.isKnown
                 if run.needsResolution { await lookUp() }
-                if let hit = run.firstMatch(endpoint, destination) {
+                if let hit = run.firstMatch(endpoint, destination, lookedUpHere: !knownBefore) {
                     return (compiled[hit].rule.policy, compiled[hit].rule, resolved)
                 }
                 index = run.end
@@ -803,7 +815,7 @@ public final class Router: Sendable {
     /// needing the connection (process, network, ports), returns `nil`,
     /// since the outcome depends on what the dial will know.
     /// `resolvedIPv4` / `resolvedIPv6`: addresses already known without a
-    /// lookup (a hosts entry), so IP rules can decide.
+    /// lookup (a hosts entry), so IP rules, `no-resolve` ones too, can decide.
     public func matchWithoutResolving(
         endpoint: Endpoint,
         resolvedIPv4: IPv4Address? = nil,
@@ -822,7 +834,7 @@ public final class Router: Sendable {
         while index < compiled.count {
             if let run = runs[index] {
                 if isDomain, run.needsResolution, !haveAddresses { return nil }
-                if let hit = run.firstMatch(endpoint, destination) {
+                if let hit = run.firstMatch(endpoint, destination, lookedUpHere: false) {
                     return (compiled[hit].rule.policy, compiled[hit].rule)
                 }
                 index = run.end
@@ -873,39 +885,24 @@ public final class Router: Sendable {
             guard case .domain(let host) = endpoint.host, !key.isEmpty else { return false }
             return host == key || host.hasSuffix(entry.dottedSuffix)
         default:
-            return evaluate(
-                entry.matcher,
-                noResolve: rule.noResolve,
-                endpoint: endpoint,
-                destination: destination,
-                context: context
-            )
+            return evaluate(entry.matcher, endpoint: endpoint, destination: destination, context: context)
         }
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
     private func evaluate(
         _ matcher: RouteRule.HostMatcher,
-        noResolve: Bool,
         endpoint: Endpoint,
         destination: Destination,
         context: RouteContext
     ) -> Bool? {
         func sub(_ condition: RuleCondition) -> Bool? {
-            evaluate(
-                condition.matcher,
-                noResolve: noResolve || condition.noResolve,
-                endpoint: endpoint,
-                destination: destination,
-                context: context
-            )
+            evaluate(condition.matcher, endpoint: endpoint, destination: destination, context: context)
         }
         /// Context rules are undecided until the connection is known.
         func known<T>(_ value: T?) -> T?? {
             context.isComplete ? .some(value) : nil
         }
-        /// `no-resolve` hides looked-up addresses only.
-        let addressVisible = destination.dialed || !noResolve
         switch matcher {
         case .domain(let domain):
             guard case .domain(let host) = endpoint.host else { return false }
@@ -921,27 +918,26 @@ public final class Router: Sendable {
             guard case .domain(let host) = endpoint.host else { return false }
             return pattern.matches(host)
         case .ipv4(let address):
-            return addressVisible && destination.ipv4 == address
+            return destination.ipv4 == address
         case .ipv4CIDR(let network, let prefixLength):
-            guard addressVisible, let host = destination.ipv4 else { return false }
+            guard let host = destination.ipv4 else { return false }
             return Self.ipv4(host, in: network, prefix: prefixLength)
         case .ipv6(let address):
-            return addressVisible && destination.ipv6 == address
+            return destination.ipv6 == address
         case .ipv6CIDR(let network, let prefixLength):
-            guard addressVisible, let host = destination.ipv6 else { return false }
+            guard let host = destination.ipv6 else { return false }
             return Self.ipv6(host, in: network, prefix: prefixLength)
         case .geoIP(code: let code):
-            guard addressVisible, let geoIP else { return false }
+            guard let geoIP else { return false }
             if let address = destination.ipv4, geoIP.matches(ipv4: address, code: code) { return true }
             if let address = destination.ipv6, geoIP.matches(ipv6: address, code: code) { return true }
             return false
         case .ipASN(let number):
-            guard addressVisible, let asn else { return false }
+            guard let asn else { return false }
             if let address = destination.ipv4, asn.lookup(ipv4: address) == number { return true }
             if let address = destination.ipv6, asn.lookup(ipv6: address) == number { return true }
             return false
         case .ipSuffix(let suffix):
-            guard addressVisible else { return false }
             if let address = destination.ipv4, suffix.matches(.ipv4(address)) { return true }
             if let address = destination.ipv6, suffix.matches(.ipv6(address)) { return true }
             return false
@@ -1030,7 +1026,6 @@ public final class Router: Sendable {
                 guard case .domain(let host) = endpoint.host else { return false }
                 return set.contains(domain: host)
             case .ipcidr:
-                guard addressVisible else { return false }
                 if let address = destination.ipv4, set.contains(ipv4: address) { return true }
                 if let address = destination.ipv6, set.contains(ipv6: address) { return true }
                 return false

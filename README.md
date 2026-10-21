@@ -136,7 +136,7 @@ Supported:
 
 At FakeDNS time only the name is known. A rule that needs the connection (process, network, ports, source) therefore leaves the decision to the dial, and the name gets a fake IP.
 
-IP rules (`IP-CIDR`, `IP-CIDR6`, `IP-SUFFIX`, `IP-ASN`, `GEOIP`, `ipcidr` rule sets) match a domain destination by an address. When the name was sniffed from the connection's first bytes (TLS SNI, HTTP Host), that is the address the client dialed, `no-resolve` or not, as in mihomo, unless `hosts` maps the name. Otherwise the name is looked up once, at the first such rule without `no-resolve`.
+IP rules (`IP-CIDR`, `IP-CIDR6`, `IP-SUFFIX`, `IP-ASN`, `GEOIP`, `ipcidr` rule sets) match a domain destination by an address, as in mihomo: the `hosts` entry for the name, or else the address the client dialed when the name was sniffed from the connection's first bytes (TLS SNI, HTTP Host). Otherwise the name is looked up once, at the first such rule without `no-resolve`. Every IP rule matches an address known this way: `no-resolve` only keeps a rule from starting the lookup.
 
 ### `dns`
 

@@ -111,15 +111,49 @@ private func fillers(_ count: Int, noResolve: Bool = false) -> [RouteRule] {
     let router = Router(rules: rules)
     let address = IPv4Address(10, 1, 2, 3)
     let name = Endpoint(domain: "a.example", port: 443)
-    // The earliest match wins, `no-resolve` or not, for an IP destination
-    // and for the address a sniffed client dialed.
+    // The earliest match wins, `no-resolve` or not, for an IP destination,
+    // the address a sniffed client dialed and a hosts address.
     #expect(router.match(endpoint: Endpoint(host: .ipv4(address), port: 443)) == .proxy(targetGroup: "Wide"))
     #expect(router.match(endpoint: name, context: sniffed(.ipv4(address))) == .proxy(targetGroup: "Wide"))
-    // A looked-up address skips the `no-resolve` rule.
-    #expect(router.match(endpoint: name, resolvedIPv4: address) == .proxy(targetGroup: "Narrow"))
+    #expect(router.match(endpoint: name, resolvedIPv4: address) == .proxy(targetGroup: "Wide"))
     #expect(router.match(host: "172.16.39.9", port: 443) == .reject)
     #expect(router.match(host: "2001:db8::1", port: 443) == .proxy(targetGroup: "V6"))
     #expect(router.match(host: "192.0.2.1", port: 443) == .proxy(targetGroup: "Final"))
+}
+
+/// The run's first rule without `no-resolve` looks the name up: the
+/// `no-resolve` rules before it go without the answer, the ones after
+/// match it, as in mihomo.
+@Test func indexedRunLooksTheNameUpAtItsFirstResolvingRule() async {
+    var rules = [RouteRule(.ipv4CIDR(IPv4Address(10, 0, 0, 0), prefixLength: 8), policy: .proxy(targetGroup: "Before"), noResolve: true)]
+    rules += fillers(40, noResolve: true)
+    rules.append(RouteRule(.ipv4CIDR(IPv4Address(192, 0, 2, 0), prefixLength: 24), policy: .reject))
+    rules.append(RouteRule(.ipv4CIDR(IPv4Address(10, 1, 0, 0), prefixLength: 16), policy: .proxy(targetGroup: "After"), noResolve: true))
+    rules.append(RouteRule(.matchAll, policy: proxy))
+    let router = Router(rules: rules)
+    let name = Endpoint(domain: "a.example", port: 443)
+    let lookups = LookupCounter()
+    let result = await router.matchResult(endpoint: name) {
+        lookups.bump()
+        return ResolvedAddresses(ipv4: IPv4Address(10, 1, 2, 3))
+    }
+    #expect(result.policy == .proxy(targetGroup: "After"))
+    #expect(lookups.count == 1)
+    // Known from the start (a hosts entry), the address meets "Before" first.
+    #expect(router.match(endpoint: name, resolvedIPv4: IPv4Address(10, 1, 2, 3)) == .proxy(targetGroup: "Before"))
+}
+
+@Test func noResolveRulesMatchAnAddressLookedUpEarlier() async {
+    let router = Router(rules: [
+        RouteRule(.ipv4CIDR(IPv4Address(10, 0, 0, 0), prefixLength: 8), policy: .proxy(targetGroup: "Before"), noResolve: true),
+        RouteRule(.ipv4CIDR(IPv4Address(192, 0, 2, 0), prefixLength: 24), policy: .reject),
+        RouteRule(.ipv4CIDR(IPv4Address(10, 1, 0, 0), prefixLength: 16), policy: .proxy(targetGroup: "After"), noResolve: true),
+        RouteRule(.matchAll, policy: proxy),
+    ])
+    let name = Endpoint(domain: "a.example", port: 443)
+    let result = await router.matchResult(endpoint: name) { ResolvedAddresses(ipv4: IPv4Address(10, 1, 2, 3)) }
+    #expect(result.policy == .proxy(targetGroup: "After"))
+    #expect(router.match(endpoint: name, resolvedIPv4: IPv4Address(10, 1, 2, 3)) == .proxy(targetGroup: "Before"))
 }
 
 @Test func dnsTimeMatchPassesARunOfNoResolveRules() {

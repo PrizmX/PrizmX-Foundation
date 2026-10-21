@@ -67,6 +67,20 @@ private let upstream = NameserverEndpoint.udp(address: "10.0.0.1", port: 53)
     }
 }
 
+/// A hosts address is known from the start, so `no-resolve` rules match it
+/// too (as in mihomo), at FakeDNS time as well.
+@Test func noResolveRulesMatchAHostsAddress() async {
+    let engine = engine(
+        rules: [
+            RouteRule(.ipv4CIDR(IPv4Address(149, 154, 160, 0), prefixLength: 20), policy: .reject, noResolve: true),
+            RouteRule(.matchAll, policy: .direct),
+        ],
+        dns: DNSSettings(defaultNameservers: [upstream], hosts: ProfileHosts(["tg.example": ["149.154.167.50"]]))
+    )
+    #expect(await engine.resolvePolicy(for: Endpoint(domain: "tg.example", port: 443)) == .reject)
+    #expect(await engine.dnsPolicy(host: "tg.example") == .reject)
+}
+
 /// The hosts entry decides where the name goes, so IP rules see its
 /// address instead of the one the client dialed (as in mihomo).
 @Test func hostsEntryOutranksTheDialedAddress() async throws {
