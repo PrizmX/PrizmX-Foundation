@@ -66,7 +66,10 @@ actor InteropHarness {
         }
     }
 
-    /// An unused 127.0.0.1 TCP port (bind to 0, read it back, release).
+    /// An unused TCP port for the 127.0.0.1 mixed-port (bind to 0, read it
+    /// back, release). Bound on the wildcard address: NWListener refuses a
+    /// port that a connection holds on any local address (a tunnel flow from
+    /// 198.18.0.1, say), which a probe on 127.0.0.1 does not see.
     private static func freeLoopbackPort() throws -> UInt16 {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw POSIXError(.EMFILE) }
@@ -74,7 +77,7 @@ actor InteropHarness {
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        address.sin_addr.s_addr = INADDR_ANY
         address.sin_port = 0
         var length = socklen_t(MemoryLayout<sockaddr_in>.size)
         let bound = withUnsafeMutablePointer(to: &address) { pointer in
