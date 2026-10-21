@@ -139,8 +139,13 @@ public final class Engine: Sendable {
         let result = await router.matchResult(endpoint: endpoint, context: context) {
             guard case .domain(let domain) = endpoint.host else { return ResolvedAddresses() }
             // The answer lands in DNSClient's cache, so a DIRECT dial of the
-            // same name reuses it instead of querying again.
-            return ResolvedAddresses(ipv4: try? await dns.resolve(domain, role: .direct))
+            // same name reuses it instead of querying again. As in mihomo,
+            // IP rules see one address: IPv6 only for a name without IPv4.
+            switch try? await dns.resolvePreferringIPv4(domain, role: .direct).first {
+            case .ipv4(let address)?: return ResolvedAddresses(ipv4: address)
+            case .ipv6(let address)?: return ResolvedAddresses(ipv6: address)
+            default: return ResolvedAddresses()
+            }
         }
         return (result.policy, result.rule?.inspectorLabel ?? "FINAL")
     }
@@ -152,7 +157,7 @@ public final class Engine: Sendable {
                 endpoint,
                 resolvedIPv4: hosts.ipv4.first,
                 resolvedIPv6: hosts.ipv6.first,
-                context: context
+                context: Self.hostsContext(context)
             ).policy
             if hosts.isLocalBinding, case .proxy = policy { return .direct }
             return policy
@@ -180,7 +185,7 @@ public final class Engine: Sendable {
                 target,
                 resolvedIPv4: hosts.ipv4.first,
                 resolvedIPv6: hosts.ipv6.first,
-                context: context
+                context: Self.hostsContext(context)
             )
             return try connection(for: target, command: command, matched: matched, hosts: hosts, remoteClient: remoteClient)
         }
@@ -272,6 +277,14 @@ public final class Engine: Sendable {
         guard case .domain(let domain) = endpoint.host else { return nil }
         guard let mapping = dns.hostsLookup(domain), !mapping.isEmpty else { return nil }
         return mapping
+    }
+
+    /// A hosts entry decides where a name goes, so IP rules see its
+    /// addresses rather than the one a sniffed client dialed (as in mihomo).
+    private static func hostsContext(_ context: RouteContext) -> RouteContext {
+        var context = context
+        context.destinationAddress = nil
+        return context
     }
 
     /// FakeDNS-time policy. REJECT → NODATA. DIRECT (including nested

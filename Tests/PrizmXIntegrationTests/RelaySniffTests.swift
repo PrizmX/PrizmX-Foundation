@@ -106,6 +106,17 @@ private let ipTarget = Endpoint(host: .ipv4(IPv4Address(93, 184, 216, 34)), port
     inbound.feed(Data("GET / HTTP/1.1\r\nHost: Example.COM:80\r\n\r\n".utf8))
     let prepared = await EngineTCPRelay.prepare(stream: inbound, budget: .seconds(2))
     #expect(prepared.endpoint == Endpoint(domain: "example.com", port: 80))
+    // IP rules still see the address the client dialed.
+    #expect(prepared.dialedAddress == .ipv4(IPv4Address(1, 2, 3, 4)))
+}
+
+/// A FakeIP the tunnel no longer maps (it restarted) is no address to match.
+@Test func sniffDropsAForgottenFakeIP() async throws {
+    let inbound = ScriptedInbound(endpoint: Endpoint(host: .ipv4(IPv4Address(198, 18, 3, 7)), port: 80))
+    inbound.feed(Data("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".utf8))
+    let prepared = await EngineTCPRelay.prepare(stream: inbound, budget: .seconds(2))
+    #expect(prepared.endpoint == Endpoint(domain: "example.com", port: 80))
+    #expect(prepared.dialedAddress == nil)
 }
 
 @Test func sniffPreservesEOFSeenDuringSniff() async throws {

@@ -3,11 +3,43 @@ import Network
 import os
 import Testing
 import PrizmXNodes
-import PrizmXProtocols
+@testable import PrizmXProtocols
 
 /// DIRECT dials an IPv6 literal (what the tunnel relays once it carries
 /// IPv6). A TCP echo server on ::1 stands in for the destination.
 @Test func directDialsAnIPv6Literal() async throws {
+    let (listener, port) = try await startEchoListener()
+    defer { listener.cancel() }
+
+    let connection = DirectOutboundConnection(endpoint: Endpoint(host: .ipv6(.loopback), port: port))
+    try await connection.open()
+    #expect(try await roundTrip(connection) == Data("hello over IPv6".utf8))
+    await connection.close()
+}
+
+/// A name without an A record is dialed at its AAAA address.
+@Test func directDialsANameWithoutIPv4OverIPv6() async throws {
+    let (listener, port) = try await startEchoListener()
+    defer { listener.cancel() }
+    let dns = DNSClient(settings: DNSSettings(defaultNameservers: [.udp(address: "10.0.0.1", port: 53)]))
+    dns.transportFactory = { _ in LoopbackAAAA() }
+
+    let connection = DirectOutboundConnection(endpoint: Endpoint(domain: "v6only.example", port: port))
+    try await DNSClient.$current.withValue(dns) { try await connection.open() }
+    #expect(try await roundTrip(connection) == Data("hello over IPv6".utf8))
+    await connection.close()
+}
+
+/// No A record; `::1` as the AAAA record.
+private struct LoopbackAAAA: NameserverTransport {
+    func query(_ domain: String) async throws -> [DNSWire.Record] { [] }
+
+    func queryAAAA(_ domain: String) async throws -> [DNSWire.AAAARecord] {
+        [DNSWire.AAAARecord(address: .loopback, ttl: 60)]
+    }
+}
+
+private func startEchoListener() async throws -> (NWListener, UInt16) {
     let listener = try NWListener(using: .tcp)
     listener.newConnectionHandler = { connection in
         connection.start(queue: .global())
@@ -30,10 +62,10 @@ import PrizmXProtocols
         }
         listener.start(queue: .global())
     }
-    defer { listener.cancel() }
+    return (listener, port)
+}
 
-    let connection = DirectOutboundConnection(endpoint: Endpoint(host: .ipv6(.loopback), port: port))
-    try await connection.open()
+private func roundTrip(_ connection: DirectOutboundConnection) async throws -> Data {
     try await connection.writeAll(Data("hello over IPv6".utf8))
     var received = Data()
     while received.count < 15 {
@@ -41,8 +73,7 @@ import PrizmXProtocols
         guard !chunk.isEmpty else { break }
         received += chunk
     }
-    #expect(received == Data("hello over IPv6".utf8))
-    await connection.close()
+    return received
 }
 
 private func echo(_ connection: NWConnection) {

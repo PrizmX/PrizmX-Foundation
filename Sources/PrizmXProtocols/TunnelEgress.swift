@@ -186,7 +186,7 @@ public enum TunnelEgress {
     }
 
     /// The FakeIP ranges the tunnel answers for (`FakeIPAllocator`).
-    static func isTunnelRange(_ host: Endpoint.Host) -> Bool {
+    public static func isTunnelRange(_ host: Endpoint.Host) -> Bool {
         switch host {
         case .ipv4(let address):
             address.rawValue & 0xFFFF_0000 == tunnelAddress.rawValue & 0xFFFF_0000

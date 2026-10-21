@@ -39,7 +39,8 @@ public final class RuleSet: Sendable, Hashable, CustomStringConvertible {
     /// Classical sets: full conditions, evaluated by `Router`.
     public let conditions: [RuleCondition]
 
-    private struct IPv6Key: Hashable, Sendable {
+    /// An IPv6 network with its host bits cleared (`masked6`).
+    struct IPv6Key: Hashable, Sendable {
         var high: UInt64
         var low: UInt64
     }
@@ -149,12 +150,12 @@ public final class RuleSet: Sendable, Hashable, CustomStringConvertible {
         return false
     }
 
-    private static func mask4(_ prefix: UInt8) -> UInt32 {
+    static func mask4(_ prefix: UInt8) -> UInt32 {
         let length = min(prefix, 32)
         return length == 0 ? 0 : ~UInt32(0) << (32 - UInt32(length))
     }
 
-    private static func masked6(_ address: IPv6Address, _ prefix: UInt8) -> IPv6Key {
+    static func masked6(_ address: IPv6Address, _ prefix: UInt8) -> IPv6Key {
         let bits = Int(min(prefix, 128))
         if bits <= 64 {
             let mask: UInt64 = bits == 0 ? 0 : ~UInt64(0) << (64 - UInt64(bits))

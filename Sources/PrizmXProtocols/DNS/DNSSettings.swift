@@ -100,6 +100,9 @@ public struct DNSSettings: Sendable, Hashable {
     /// get FakeIPv6 (`fd11:4514:1919:6472::/64`); filter / node hosts still
     /// get a real AAAA.
     public var ipv6: Bool
+    /// Clash top-level `ipv6` (default true). A DIRECT name without an A
+    /// record then resolves to its AAAA records, for IP rules and the dial.
+    public var allowsIPv6: Bool
     /// Fallback positive-cache lifetime when the answer carries no TTL.
     public var cacheTTL: TimeInterval
     /// Node hostnames resolve through the profile's own
@@ -129,6 +132,7 @@ public struct DNSSettings: Sendable, Hashable {
         systemNameservers: [NameserverEndpoint] = [],
         fakeIPFilter: [String] = [],
         ipv6: Bool = false,
+        allowsIPv6: Bool = true,
         cacheTTL: TimeInterval = 60,
         nodeDNSFromProfile: Bool = false,
         appDNSFromProfile: Bool = false,
@@ -144,6 +148,7 @@ public struct DNSSettings: Sendable, Hashable {
         self.systemNameservers = systemNameservers
         self.fakeIPFilter = fakeIPFilter
         self.ipv6 = ipv6
+        self.allowsIPv6 = allowsIPv6
         self.cacheTTL = cacheTTL
         self.nodeDNSFromProfile = nodeDNSFromProfile
         self.appDNSFromProfile = appDNSFromProfile

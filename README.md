@@ -74,7 +74,7 @@ Full YAML 1.1 through libyaml ([Yams](https://github.com/jpsim/Yams)): anchors, 
 | `sub-rules`, `listeners`, `tunnels`, `ntp`, `experimental`, `profile` | Ignored. |
 | `unified-delay`, `tcp-concurrent`, `global-client-fingerprint`, `keep-alive-interval`, `find-process-mode`, `interface-name`, `routing-mark` | Ignored. |
 
-`mixed-port`, `port`, `socks-port`, `authentication`, `skip-auth-prefixes`, `hosts`, `ipv6` and the sections below are read. `ipv6` defaults to `true`, as in mihomo; `false` turns IPv6 off: the TUN refuses the IPv6 that reaches it (TCP gets a RST), FakeDNS returns no AAAA answers whatever `dns.ipv6` says, and IPv6 targets are rejected.
+`mixed-port`, `port`, `socks-port`, `authentication`, `skip-auth-prefixes`, `hosts`, `ipv6` and the sections below are read. `ipv6` defaults to `true`, as in mihomo. A name with no IPv4 address then resolves to its IPv6 address, for IP rules and DIRECT dials; a name that has both uses IPv4. `false` turns IPv6 off: the TUN refuses the IPv6 that reaches it (TCP gets a RST), FakeDNS returns no AAAA answers whatever `dns.ipv6` says, and IPv6 targets are rejected.
 
 ### `proxies`
 
@@ -134,6 +134,8 @@ Supported:
 
 At FakeDNS time only the name is known. A rule that needs the connection (process, network, ports, source) therefore leaves the decision to the dial, and the name gets a fake IP.
 
+IP rules (`IP-CIDR`, `IP-CIDR6`, `GEOIP`, `ipcidr` rule sets) match a domain destination by an address. When the name was sniffed from the connection's first bytes (TLS SNI, HTTP Host), that is the address the client dialed, `no-resolve` or not, as in mihomo, unless `hosts` maps the name. Otherwise the name is looked up once, at the first such rule without `no-resolve`.
+
 ### `dns`
 
 With `enable: true`, the profile's resolver answers **app traffic** too: DIRECT dials, `fake-ip-filter` names and the lookups that `GEOIP` / `IP-CIDR` rules need. It works in this order:
@@ -145,7 +147,7 @@ With `enable: true`, the profile's resolver answers **app traffic** too: DIRECT 
 
 With `enable: false`, the machine's resolver answers. `hosts` applies either way.
 
-Node hostnames follow `proxy-server-nameserver` when it is set, otherwise the same order, unless the app's Override DNS switch is on. For A lookups, the upstreams within a set are queried in parallel. Answers that arrive within 150 ms of the first are merged.
+Node hostnames follow `proxy-server-nameserver` when it is set, otherwise the same order, unless the app's Override DNS switch is on. For A and AAAA lookups, the upstreams within a set are queried in parallel. Answers that arrive within 150 ms of the first are merged.
 
 | Key / value | What happens |
 | --- | --- |
@@ -156,6 +158,7 @@ Node hostnames follow `proxy-server-nameserver` when it is set, otherwise the sa
 | `respect-rules` | Ignored (warning): DNS queries do not go through proxy rules. |
 | `use-system-hosts: false` | Ignored (warning): `/etc/hosts` always applies. |
 | `listen`, `cache-algorithm`, `prefer-h3`, `direct-nameserver-follow-policy` | Ignored. |
+| `ipv6-timeout` | Ignored: rule lookups and DIRECT dials ask for AAAA only when a name has no A record, so there is no wait to bound. |
 | `nameserver-policy` order | YAML mappings carry no order. Name patterns are tried before `geosite:` / `rule-set:` keys, then alphabetically. |
 | `nameserver-policy` `rule-set:` with a `classical` or `ipcidr` provider | That key matches nothing; only `domain` providers apply. |
 | DoH URL fragments (`#PROXY`, `#h3=true`) | Ignored: DoH always connects directly. |

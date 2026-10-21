@@ -37,14 +37,16 @@ public final class DNSClient: Sendable {
         }
     }
 
-    private struct CachedEntry: Sendable {
-        var addresses: [IPv4Address]
+    private struct CachedEntry<Address: Sendable>: Sendable {
+        var addresses: [Address]
         var expires: Date
     }
 
-    private let cache = OSAllocatedUnfairLock<[CacheKey: CachedEntry]>(initialState: [:])
+    private let cache = OSAllocatedUnfairLock<[CacheKey: CachedEntry<IPv4Address>]>(initialState: [:])
+    /// AAAA answers, kept like `cache`.
+    private let cache6 = OSAllocatedUnfairLock<[CacheKey: CachedEntry<IPv6Address>]>(initialState: [:])
     private let inflight = OSAllocatedUnfairLock<[CacheKey: Task<([IPv4Address], TimeInterval), Error>]>(initialState: [:])
-    private let bootstrapCache = OSAllocatedUnfairLock<[String: CachedEntry]>(initialState: [:])
+    private let bootstrapCache = OSAllocatedUnfairLock<[String: CachedEntry<IPv4Address>]>(initialState: [:])
     /// Last-known-good addresses per key, most-recent first. Set only on a
     /// *successful dial*, so forged/poisoned answers can never get in.
     private let good = OSAllocatedUnfairLock<[CacheKey: (addresses: [IPv4Address], touched: Date)]>(initialState: [:])
@@ -99,6 +101,7 @@ public final class DNSClient: Sendable {
     public func applyPhysicalDNS(_ ips: [String]) {
         settingsBox.withLock { $0.applyPhysicalDNS(ips) }
         cache.withLock { $0.removeAll() }
+        cache6.withLock { $0.removeAll() }
         bad.withLock { $0.removeAll() }
         good.withLock { map in
             map = map.filter { $0.key.role != .direct }
@@ -210,7 +213,7 @@ public final class DNSClient: Sendable {
         }
         do {
             let (addresses, ttl) = try await task.value
-            store(key, CachedEntry(addresses: addresses, expires: Date().addingTimeInterval(ttl)))
+            store(key, CachedEntry(addresses: addresses, expires: Date().addingTimeInterval(ttl)), in: cache)
             inflight.withLock { $0[key] = nil }
             return addresses
         } catch {
@@ -220,8 +223,12 @@ public final class DNSClient: Sendable {
     }
 
     /// Bounded: expired entries go first, then the oldest half.
-    private func store(_ key: CacheKey, _ entry: CachedEntry) {
-        cache.withLock { map in
+    private func store<Address>(
+        _ key: CacheKey,
+        _ entry: CachedEntry<Address>,
+        in table: OSAllocatedUnfairLock<[CacheKey: CachedEntry<Address>]>
+    ) {
+        table.withLock { map in
             if map.count >= Self.cacheCapacity, map[key] == nil {
                 let now = Date()
                 map = map.filter { $0.value.expires > now }
@@ -246,12 +253,18 @@ public final class DNSClient: Sendable {
         return first
     }
 
-    /// AAAA records for DIRECT FakeDNS when Clash `dns.ipv6` is on.
-    /// Proxy names never call this — FakeIP is IPv4-only, AAAA is NODATA.
+    /// All AAAA records for `domain`, merged across the role's nameservers
+    /// like `resolveAll` and cached per answer TTL. Asked for
+    /// `fake-ip-filter` names when Clash `dns.ipv6` is on, and for names
+    /// without an A record (`resolvePreferringIPv4`).
     public func resolveAAAA(_ domain: String, role: DNSRole) async throws -> [IPv6Address] {
         if let mapped = hostsLookup(domain) {
             if !mapped.ipv6.isEmpty { return mapped.ipv6 }
             throw DNSError.noRecord(domain)
+        }
+        let key = CacheKey(domain: domain.lowercased(), role: role)
+        if let hit = cache6.withLock({ $0[key] }), hit.expires > .now, !hit.addresses.isEmpty {
+            return hit.addresses
         }
         let endpoints: [NameserverEndpoint]
         switch settings.profilePlan(for: domain, role: role) {
@@ -260,23 +273,22 @@ public final class DNSClient: Sendable {
         case nil: endpoints = settings.endpoints(for: role)
         }
         guard !endpoints.isEmpty else { throw DNSError.noNameserver }
-        var merged: [IPv6Address] = []
-        var lastError: Error?
-        for endpoint in endpoints {
-            guard let transport = makeTransport(endpoint) else { continue }
-            do {
-                for record in try await transport.queryAAAA(domain) where !merged.contains(record.address) {
-                    merged.append(record.address)
-                }
-            } catch {
-                lastError = error
-            }
+        let (addresses, ttl) = try await collect(endpoints: endpoints, domain: domain, role: role) {
+            try await $0.queryAAAA(domain)
         }
-        guard !merged.isEmpty else {
-            if let lastError { throw lastError }
-            throw DNSError.noRecord(domain)
+        store(key, CachedEntry(addresses: addresses, expires: Date().addingTimeInterval(ttl)), in: cache6)
+        return addresses
+    }
+
+    /// Addresses for `domain`, IPv4 first as in mihomo: its A records, or,
+    /// for a DIRECT name that has none, its AAAA records while the profile
+    /// allows IPv6 (Clash top-level `ipv6`). Node names stay IPv4-only.
+    public func resolvePreferringIPv4(_ domain: String, role: DNSRole) async throws -> [Endpoint.Host] {
+        do {
+            return try await resolveAll(domain, role: role).map { .ipv4($0) }
+        } catch DNSError.noRecord(_) where role == .direct && settings.allowsIPv6 {
+            return try await resolveAAAA(domain, role: role).map { .ipv6($0) }
         }
-        return merged
     }
 
     /// Good addresses for a key (test seam + fake-ip-filter callers).
@@ -361,7 +373,9 @@ public final class DNSClient: Sendable {
                 return NWEndpoint.Host(mapped.description)
             }
             guard let client = DNSClient.current else { throw DNSError.notConfigured }
-            let address = try await client.resolve(domain, role: role)
+            guard let address = try await client.resolvePreferringIPv4(domain, role: role).first else {
+                throw DNSError.noRecord(domain)
+            }
             TunnelLog.write(.debug, "dns \(role) \(domain) → \(address)")
             return NWEndpoint.Host(address.description)
         }
@@ -448,23 +462,32 @@ public final class DNSClient: Sendable {
         return try first.get()
     }
 
-    /// Asks every endpoint at once and merges the answers that arrive by
-    /// `mergeWindow` after the first one (a CDN name gets every edge the
-    /// fast resolvers know). Slow or dead upstreams no longer add up: the
-    /// wait is bounded by the slowest *needed* answer, not their sum.
     private func query(
         endpoints: [NameserverEndpoint],
         domain: String,
         role: DNSRole
     ) async throws -> ([IPv4Address], TimeInterval) {
+        try await collect(endpoints: endpoints, domain: domain, role: role) { try await $0.query(domain) }
+    }
+
+    /// Asks every endpoint at once and merges the answers that arrive by
+    /// `mergeWindow` after the first one (a CDN name gets every edge the
+    /// fast resolvers know). Slow or dead upstreams no longer add up: the
+    /// wait is bounded by the slowest *needed* answer, not their sum.
+    private func collect<Record: DNSAnswer>(
+        endpoints: [NameserverEndpoint],
+        domain: String,
+        role: DNSRole,
+        ask: @escaping @Sendable (any NameserverTransport) async throws -> [Record]
+    ) async throws -> ([Record.Address], TimeInterval) {
         let transports = endpoints.compactMap { endpoint in makeTransport(endpoint).map { (endpoint, $0) } }
         guard !transports.isEmpty else { throw DNSError.noNameserver }
-        let collected = await withCheckedContinuation { (continuation: CheckedContinuation<QueryCollector.Result, Never>) in
+        let collected = await withCheckedContinuation { (continuation: CheckedContinuation<QueryCollector<Record>.Result, Never>) in
             let collector = QueryCollector(expected: transports.count, continuation: continuation)
             for (endpoint, transport) in transports {
                 Task {
                     do {
-                        collector.add(.records(try await transport.query(domain)))
+                        collector.add(.records(try await ask(transport)))
                     } catch DNSError.timeout {
                         TunnelLog.write(.debug, "dns \(role) \(domain) via \(endpoint) timeout")
                         collector.add(.timeout)
@@ -480,7 +503,7 @@ public final class DNSClient: Sendable {
             if let error = collected.lastError { throw error }
             throw DNSError.noRecord(domain)
         }
-        var merged: [IPv4Address] = []
+        var merged: [Record.Address] = []
         var minTTL: UInt32?
         for record in collected.records {
             if !merged.contains(record.address) { merged.append(record.address) }
@@ -604,23 +627,33 @@ extension DNSClient {
     }
 }
 
+/// An A or AAAA answer, as `DNSClient.collect` merges them.
+private protocol DNSAnswer: Sendable {
+    associatedtype Address: Equatable & Sendable
+    var address: Address { get }
+    var ttl: UInt32 { get }
+}
+
+extension DNSWire.Record: DNSAnswer {}
+extension DNSWire.AAAARecord: DNSAnswer {}
+
 /// Gathers one parallel query: resumes when every endpoint answered, or
 /// `mergeWindow` after the first non-empty answer, whichever comes first.
 /// Late answers are dropped.
-private final class QueryCollector: @unchecked Sendable {
+private final class QueryCollector<Record: Sendable>: @unchecked Sendable {
     enum Outcome {
-        case records([DNSWire.Record])
+        case records([Record])
         case timeout
         case failure(Error)
     }
 
     struct Result: Sendable {
-        var records: [DNSWire.Record] = []
+        var records: [Record] = []
         var sawTimeout = false
         var lastError: (any Error)?
     }
 
-    static let mergeWindow: Duration = .milliseconds(150)
+    static var mergeWindow: Duration { .milliseconds(150) }
 
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Result, Never>?

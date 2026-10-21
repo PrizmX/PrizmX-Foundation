@@ -70,6 +70,7 @@ public enum EngineFactory: Sendable {
         )
         // `ipv6: false` turns AAAA answers off whatever `dns.ipv6` says.
         if !allowsIPv6 { dnsSettings.ipv6 = false }
+        dnsSettings.allowsIPv6 = allowsIPv6
         Self.logNodeDNS(section: dnsSection, settings: dnsSettings, overrideDNS: overrideDNS)
         // Node server domains never receive fake IPs: an app-side lookup
         // (node ping, subscription refresh) must not loop into the tunnel.

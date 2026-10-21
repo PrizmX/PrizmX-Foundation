@@ -106,7 +106,8 @@ public enum EngineTCPRelay: Sendable {
                 sourcePort: inbound.clientPort == 0 ? nil : inbound.clientPort,
                 inboundPort: inbound.listenPort,
                 processName: attribution?.processName,
-                processPath: attribution?.executablePath
+                processPath: attribution?.executablePath,
+                destinationAddress: prepared.dialedAddress
             )
             let dispatched = try await engine.resolveAndDispatch(
                 target: target,
@@ -354,7 +355,10 @@ public enum EngineTCPRelay: Sendable {
         let wrapped = PrefixedInboundStream(inner: stream, prefix: prefix, pending: pending)
         if case .hostname(let name) = TrafficSniffer.sniff(prefix),
            let endpoint = sniffedEndpoint(name, port: stream.endpoint.port) {
-            return PreparedStream(stream: wrapped, endpoint: endpoint)
+            // A FakeIP whose name was forgotten (the tunnel restarted) is
+            // no address to match IP rules against.
+            let dialed = TunnelEgress.isTunnelRange(stream.endpoint.host) ? nil : stream.endpoint.host
+            return PreparedStream(stream: wrapped, endpoint: endpoint, dialedAddress: dialed)
         }
         return PreparedStream(stream: wrapped, endpoint: stream.endpoint)
     }
@@ -401,6 +405,8 @@ public enum EngineTCPRelay: Sendable {
 struct PreparedStream: Sendable {
     var stream: any InboundStream
     var endpoint: Endpoint
+    /// The IP the client dialed, when `endpoint` is the name sniffed for it.
+    var dialedAddress: Endpoint.Host?
 }
 
 /// Replays the sniffed prefix, then the read still in flight from sniffing

@@ -19,6 +19,10 @@ public struct RouteContext: Sendable, Equatable {
     public var inboundPort: UInt16?
     public var processName: String?
     public var processPath: String?
+    /// The IP the client dialed when the destination is a name sniffed from
+    /// its first bytes (TLS SNI, HTTP Host). As in mihomo, IP rules match
+    /// this address, `no-resolve` or not, and the name is not looked up.
+    public var destinationAddress: Endpoint.Host?
     /// False while only the destination name is known (FakeDNS).
     public var isComplete: Bool
 
@@ -29,6 +33,7 @@ public struct RouteContext: Sendable, Equatable {
         inboundPort: UInt16? = nil,
         processName: String? = nil,
         processPath: String? = nil,
+        destinationAddress: Endpoint.Host? = nil,
         isComplete: Bool = true
     ) {
         self.network = network
@@ -37,6 +42,7 @@ public struct RouteContext: Sendable, Equatable {
         self.inboundPort = inboundPort
         self.processName = processName
         self.processPath = processPath
+        self.destinationAddress = destinationAddress
         self.isComplete = isComplete
     }
 

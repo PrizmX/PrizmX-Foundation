@@ -148,17 +148,21 @@ public final class DirectOutboundConnection: OutboundConnection, @unchecked Send
         parameters.preferNoProxies = true
         TunnelEgress.prepare(parameters, to: endpoint.host)
 
-        // All A records become dial candidates; a failed attempt poisons that
-        // IP and the next candidate is tried immediately. A hosts-file hit is
-        // dialed as written and does not fall through to upstream DNS.
+        // All A records become dial candidates (AAAA records for a name
+        // without any); a failed attempt poisons that IPv4 address and the
+        // next candidate is tried immediately. A hosts-file hit is dialed as
+        // written and does not fall through to upstream DNS.
         var candidates: [(host: NWEndpoint.Host, address: PrizmXProtocols.IPv4Address?)]
         if case .domain(let domain) = endpoint.host, let mapped = DNSClient.hostsLookup(domain) {
             candidates = mapped.addresses.filter(permits).prefix(8).map { (NWEndpoint.Host($0.description), nil) }
-        } else if case .domain = endpoint.host {
-            guard DNSClient.current != nil else { throw DNSError.notConfigured }
-            let addresses = try await DNSClient.resolveAll(endpoint.host, role: role)
-                .filter { permits(.ipv4($0)) }
-            candidates = addresses.prefix(3).map { (NWEndpoint.Host($0.description), $0) }
+        } else if case .domain(let domain) = endpoint.host {
+            guard let dns = DNSClient.current else { throw DNSError.notConfigured }
+            let addresses = try await dns.resolvePreferringIPv4(domain, role: role).filter(permits)
+            TunnelLog.write(.debug, "dns \(role) \(domain) → \(addresses.map(\.description))")
+            candidates = addresses.prefix(3).map { host in
+                guard case .ipv4(let address) = host else { return (NWEndpoint.Host(host.description), nil) }
+                return (NWEndpoint.Host(address.description), address)
+            }
         } else {
             candidates = permits(endpoint.host) ? [(NWEndpoint.Host(endpoint.host.description), nil)] : []
         }
