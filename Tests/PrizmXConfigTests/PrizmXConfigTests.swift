@@ -361,6 +361,21 @@ private let expectedNodeCount = 2
     #expect(direct.policy(for: Endpoint(domain: "google.com", port: 443)) == .direct)
 }
 
+@Test func globalModeWithoutAPickUsesTheFirstGroup() throws {
+    // By name, "Ⓜ️ Microsoft" sorts before "🚀 Proxy".
+    let yaml = """
+    proxies:
+      - {name: HK01, type: ss, server: 1.1.1.1, port: 8388, cipher: aes-256-gcm, password: x}
+    proxy-groups:
+      - {name: "🚀 Proxy", type: select, proxies: [HK01, DIRECT]}
+      - {name: "Ⓜ️ Microsoft", type: select, proxies: [DIRECT, "🚀 Proxy"]}
+    rules:
+      - MATCH,DIRECT
+    """
+    let engine = try EngineFactory.make(configText: yaml, outboundMode: .global)
+    #expect(engine.policy(for: Endpoint(domain: "baidu.com", port: 443)) == .proxy(targetGroup: "🚀 Proxy"))
+}
+
 @Test func geositeAndGeoIPArePreservedOnRouter() throws {
     let (clashRouter, _) = try ClashConfigParser().parse(rawString: clashYAML)
     #expect(clashRouter.rules.contains { $0.matcher == .geoIP(code: "CN") })

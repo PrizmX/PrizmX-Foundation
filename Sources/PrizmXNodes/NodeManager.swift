@@ -360,6 +360,8 @@ public final class NodeManager: Sendable {
 
     public let nodesByID: [String: OutboundNode]
     public let groupsByName: [String: PolicyGroup]
+    /// The groups in profile order, which `groupsByName` loses.
+    public let groups: [PolicyGroup]
 
     private struct GroupRuntime: Sendable {
         var selectedNodeID: String?
@@ -395,9 +397,12 @@ public final class NodeManager: Sendable {
             nodesByID[node.id] = node
         }
         var groupsByName: [String: PolicyGroup] = [:]
+        var order: [String] = []
         var runtime: [String: GroupRuntime] = [:]
         for group in groups {
-            groupsByName[group.name] = group
+            if groupsByName.updateValue(group, forKey: group.name) == nil {
+                order.append(group.name)
+            }
             runtime[group.name] = GroupRuntime(
                 selectedNodeID: group.selectedNodeID,
                 latencies: [:],
@@ -406,6 +411,7 @@ public final class NodeManager: Sendable {
         }
         self.nodesByID = nodesByID
         self.groupsByName = groupsByName
+        self.groups = order.compactMap { groupsByName[$0] }
         self.runtime = OSAllocatedUnfairLock(initialState: runtime)
     }
 

@@ -33,7 +33,7 @@ public struct ProfileOverlay: Sendable, Hashable, Codable, Equatable {
         guard !isEmpty else { return parsed }
         let compiledRules = try rules.map { try $0.compile() }
         let nodes = Array(parsed.1.nodesByID.values)
-        var groups = Array(parsed.1.groupsByName.values)
+        var groups = parsed.1.groups
         for item in self.groups {
             let compiled = item.compile()
             guard !compiled.name.isEmpty, !compiled.nodeIDs.isEmpty else { continue }

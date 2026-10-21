@@ -47,6 +47,29 @@ rules:
     #expect(parsed.1.group(named: "Home")?.nodeIDs == ["DIRECT", "ss-us"])
 }
 
+@Test func groupsKeepTheProfileOrder() throws {
+    let yaml = """
+    proxies:
+      - {name: ss-us, type: ss, server: us.ss.example, port: 8388, cipher: aes-256-gcm, password: x}
+    proxy-groups:
+      - {name: PROXY, type: select, proxies: [Auto, ss-us]}
+      - {name: Auto, type: url-test, proxies: [ss-us], url: "http://www.gstatic.com/generate_204", interval: 300}
+      - {name: Media, type: select, proxies: [PROXY, DIRECT]}
+    rules:
+      - MATCH,PROXY
+    """
+    // Per-node groups come first.
+    #expect(try ConfigAdapter.parse(rawString: yaml).1.groups.map(\.name) == ["ss-us", "PROXY", "Auto", "Media"])
+    // An overlay group replaces its namesake in place; a new one goes last.
+    let overlay = ProfileOverlay(groups: [
+        OverlayGroup(name: "Home", members: ["DIRECT", "ss-us"]),
+        OverlayGroup(name: "Auto", mode: "fallback", members: ["ss-us", "DIRECT"]),
+    ])
+    let parsed = try ConfigAdapter.parse(rawString: yaml, overlay: overlay)
+    #expect(parsed.1.groups.map(\.name) == ["ss-us", "PROXY", "Auto", "Media", "Home"])
+    #expect(parsed.1.group(named: "Auto")?.mode == .fallback)
+}
+
 @Test func emptyOverlayIsIdentity() throws {
     let base = try ConfigAdapter.parse(rawString: body)
     let overlaid = try ConfigAdapter.parse(rawString: body, overlay: .empty)

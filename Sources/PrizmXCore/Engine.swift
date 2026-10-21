@@ -333,14 +333,12 @@ public final class Engine: Sendable {
         }
     }
 
-    /// Prefer `GLOBAL`, then a multi-member group that is not a per-node alias.
+    /// Prefer `GLOBAL`, then the first group in profile order that is not a
+    /// per-node alias: usually the profile's main selector.
     public static func inferredGlobalGroup(in manager: NodeManager) -> String? {
         if manager.group(named: "GLOBAL") != nil { return "GLOBAL" }
         let implicit = Set(manager.nodesByID.keys)
-        if let named = manager.groupsByName.keys.sorted().first(where: { !implicit.contains($0) }) {
-            return named
-        }
-        return manager.groupsByName.keys.sorted().first
+        return (manager.groups.first { !implicit.contains($0.name) } ?? manager.groups.first)?.name
     }
 
     /// Probes url-test / fallback / load-balance groups on each group's
