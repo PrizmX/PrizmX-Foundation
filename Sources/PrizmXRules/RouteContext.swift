@@ -82,6 +82,39 @@ public struct PortSet: Sendable, Hashable, CustomStringConvertible {
     }
 }
 
+/// `IP-SUFFIX` as mihomo reads it: `8.8.8.8/24` matches every address whose
+/// last 24 bits are those of 8.8.8.8 (`*.8.8.8`). An address of the other
+/// family never matches.
+public struct IPSuffix: Sendable, Hashable, CustomStringConvertible {
+    /// `.ipv4` or `.ipv6`.
+    public let address: Endpoint.Host
+    /// Trailing bits compared, up to the family's width.
+    public let bits: UInt8
+
+    init(address: Endpoint.Host, bits: UInt8) {
+        self.address = address
+        self.bits = bits
+    }
+
+    public func matches(_ host: Endpoint.Host) -> Bool {
+        func low<T: FixedWidthInteger & UnsignedInteger>(_ count: Int) -> T {
+            count >= T.bitWidth ? ~0 : (1 << count) - 1
+        }
+        switch (address, host) {
+        case (.ipv4(let suffix), .ipv4(let candidate)):
+            return (suffix.rawValue ^ candidate.rawValue) & low(Int(bits)) == 0
+        case (.ipv6(let suffix), .ipv6(let candidate)):
+            let lowBits = min(Int(bits), 64)
+            return (suffix.low ^ candidate.low) & low(lowBits) == 0
+                && (suffix.high ^ candidate.high) & low(Int(bits) - lowBits) == 0
+        default:
+            return false
+        }
+    }
+
+    public var description: String { "\(address)/\(bits)" }
+}
+
 /// A compiled `NSRegularExpression` that can live in Sendable rule values.
 /// The regex is immutable after compilation and safe to use concurrently.
 public struct RulePattern: @unchecked Sendable, Hashable, CustomStringConvertible {

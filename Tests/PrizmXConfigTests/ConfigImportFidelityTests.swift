@@ -75,8 +75,8 @@ import PrizmXProtocols
       - AND,((DOMAIN,a.com),(NETWORK,UDP)),REJECT
       - DST-PORT,443,REJECT
       - PROCESS-NAME,curl,REJECT
-      - GEOIP,CN,DIRECT,src
-      - IP-ASN,13335,DIRECT
+      - GEOIP,CN,DIRECT,extra
+      - IN-TYPE,SOCKS,DIRECT
       - DOMAIN-SUFFIX,example.com,DIRECT
     """
     let result = try ConfigAdapter.parseWithWarnings(rawString: yaml)
@@ -86,8 +86,8 @@ import PrizmXProtocols
     let skipped = result.warnings.filter { $0.kind == .rule }.map(\.text)
     #expect(skipped == [
         "RULE-SET,ads,REJECT",
-        "GEOIP,CN,DIRECT,src",
-        "IP-ASN,13335,DIRECT",
+        "GEOIP,CN,DIRECT,extra",
+        "IN-TYPE,SOCKS,DIRECT",
     ])
 }
 

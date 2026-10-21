@@ -39,7 +39,7 @@ private func temporaryRoot() throws -> URL {
             payload:
               - PROCESS-NAME,Telegram
               - DOMAIN-SUFFIX,t.me
-              - IP-ASN,62041
+              - UID,501
           missing: {type: http, behavior: domain, url: "https://p.example/none.yaml"}
           binary: {type: http, behavior: domain, format: mrs, url: "https://p.example/x.mrs"}
         rules:

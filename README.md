@@ -70,7 +70,7 @@ Full YAML 1.1 through libyaml ([Yams](https://github.com/jpsim/Yams)): anchors, 
 | `mode`, `allow-lan`, `tun` | Ignored: the app's Rule / Global / Direct, Allow LAN and TUN switches decide. |
 | `bind-address`, `lan-allowed-ips`, `external-controller`, `secret`, `external-ui` | Ignored. With Allow LAN on, the listener accepts loopback, private and CGNAT sources. |
 | `sniffer` | Ignored: HTTP Host / TLS SNI sniffing is built in and always on. |
-| `geox-url`, `geodata-mode`, `geo-auto-update` | Ignored: `geoip.metadb` and `geosite.dat` come from MetaCubeX/meta-rules-dat (jsDelivr as a fallback) and refresh weekly. |
+| `geox-url`, `geodata-mode`, `geo-auto-update` | Ignored: `geoip.metadb`, `geosite.dat` and `GeoLite2-ASN.mmdb` come from MetaCubeX/meta-rules-dat (jsDelivr as a fallback) when the rules use them, and refresh weekly. |
 | `sub-rules`, `listeners`, `tunnels`, `ntp`, `experimental`, `profile` | Ignored. |
 | `unified-delay`, `tcp-concurrent`, `global-client-fingerprint`, `keep-alive-interval`, `find-process-mode`, `interface-name`, `routing-mark` | Ignored. |
 
@@ -119,22 +119,24 @@ Full YAML 1.1 through libyaml ([Yams](https://github.com/jpsim/Yams)): anchors, 
 Supported:
 
 - **Domain:** `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `DOMAIN-REGEX`, `DOMAIN-WILDCARD`, `GEOSITE`.
-- **Address:** `IP-CIDR`, `IP-CIDR6`, `GEOIP` (`LAN` expands to the private ranges), `SRC-IP-CIDR`.
+- **Address:** `IP-CIDR`, `IP-CIDR6`, `IP-SUFFIX`, `IP-ASN`, `GEOIP` (`LAN` expands to the private ranges), and the client-address forms `SRC-IP-CIDR`, `SRC-IP-SUFFIX`, `SRC-IP-ASN`, `SRC-GEOIP`.
 - **Port and network:** `DST-PORT`, `SRC-PORT`, `IN-PORT`, `NETWORK`.
 - **Process:** `PROCESS-NAME`, `PROCESS-PATH`, and their `-REGEX` forms.
 - **Composite and terminal:** `AND`, `OR`, `NOT` (nested), `RULE-SET`, `MATCH`, `FINAL`.
-- **Options:** `no-resolve`. `PASS` rules are dropped, which has the same effect.
+- **Options:** `no-resolve`, and `src`, which turns `IP-CIDR`, `IP-CIDR6`, `IP-SUFFIX`, `IP-ASN` and `GEOIP` into their `SRC-` forms (other rules but `RULE-SET` ignore it, as in mihomo). `PASS` rules are dropped, which has the same effect.
 
 | Rule / option | What happens |
 | --- | --- |
-| `IP-ASN`, `SRC-IP-ASN`, `IP-SUFFIX`, `SRC-IP-SUFFIX`, `SRC-GEOIP`, `IN-TYPE`, `IN-USER`, `IN-NAME`, `UID`, `DSCP`, `SUB-RULE` | Rule skipped (warning). |
-| Any option other than `no-resolve` (e.g. `GEOIP,CN,DIRECT,src`) | Rule skipped (warning). |
+| `IN-TYPE`, `IN-USER`, `IN-NAME`, `UID`, `DSCP`, `SUB-RULE` | Rule skipped (warning). |
+| Any option other than `no-resolve` and `src` | Rule skipped (warning). |
+| `src` on a `RULE-SET` | Rule skipped (warning). mihomo matches the set with source and destination swapped. |
+| `IP-ASN` payload that is not a number (`AS13335`) | Rule skipped (warning). mihomo keeps such a rule, and it never matches. |
 | A `RULE-SET` naming an undefined provider | Rule skipped (warning). |
 | An entry of a `classical` rule provider that is not supported | That entry skipped (warning with the count). |
 
 At FakeDNS time only the name is known. A rule that needs the connection (process, network, ports, source) therefore leaves the decision to the dial, and the name gets a fake IP.
 
-IP rules (`IP-CIDR`, `IP-CIDR6`, `GEOIP`, `ipcidr` rule sets) match a domain destination by an address. When the name was sniffed from the connection's first bytes (TLS SNI, HTTP Host), that is the address the client dialed, `no-resolve` or not, as in mihomo, unless `hosts` maps the name. Otherwise the name is looked up once, at the first such rule without `no-resolve`.
+IP rules (`IP-CIDR`, `IP-CIDR6`, `IP-SUFFIX`, `IP-ASN`, `GEOIP`, `ipcidr` rule sets) match a domain destination by an address. When the name was sniffed from the connection's first bytes (TLS SNI, HTTP Host), that is the address the client dialed, `no-resolve` or not, as in mihomo, unless `hosts` maps the name. Otherwise the name is looked up once, at the first such rule without `no-resolve`.
 
 ### `dns`
 

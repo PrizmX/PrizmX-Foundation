@@ -13,6 +13,7 @@ public enum EngineFactory: Sendable {
         configText: String?,
         geoIPURL: URL? = nil,
         geositeURL: URL? = nil,
+        asnURL: URL? = nil,
         geositeJSON: String? = nil,
         systemDNS: [String] = [],
         pinnedNodeAddresses: [String: [IPv4Address]] = [:],
@@ -92,7 +93,8 @@ public enum EngineFactory: Sendable {
             rules: parsed.0.rules,
             default: parsed.0.defaultPolicy,
             geoIP: geoIP,
-            geosite: geosite
+            geosite: geosite,
+            asn: Self.loadASN(asnURL)
         )
         let nodeManager = parsed.1
         let selections = PolicySelectionStore.load()
@@ -182,6 +184,18 @@ public enum EngineFactory: Sendable {
             return matcher
         } catch {
             TunnelLog.write(.error, "geoip load failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private static func loadASN(_ url: URL?) -> ASNMatcher? {
+        guard let url else { return nil }
+        do {
+            let matcher = try ASNMatcher(contentsOf: url)
+            TunnelLog.write(.info, "asn loaded \(url.lastPathComponent)")
+            return matcher
+        } catch {
+            TunnelLog.write(.error, "asn load failed: \(error.localizedDescription)")
             return nil
         }
     }

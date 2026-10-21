@@ -43,6 +43,17 @@ public enum RuleType: Hashable, Sendable {
     case inPort(String)
     /// `SRC-IP-CIDR`: the client's address.
     case srcIPCIDR(String)
+    /// `SRC-GEOIP`: the country of the client's address.
+    case srcGeoIP(code: String)
+    /// `IP-ASN` / `SRC-IP-ASN`: the autonomous system number (`13335`) of
+    /// the destination or client address. Evaluated when an `ASNMatcher`
+    /// is supplied.
+    case ipASN(String)
+    case srcIPASN(String)
+    /// `IP-SUFFIX` / `SRC-IP-SUFFIX`: `8.8.8.8/24` matches addresses that
+    /// end in the same 24 bits.
+    case ipSuffix(String)
+    case srcIPSuffix(String)
     /// `NETWORK`: `tcp` or `udp`.
     case network(String)
     /// `PROCESS-NAME` / `PROCESS-PATH` and their `-REGEX` forms.
@@ -94,6 +105,13 @@ public struct RouteRule: Hashable, Sendable {
         case inPort(PortSet)
         case srcIPv4CIDR(IPv4Address, prefixLength: UInt8)
         case srcIPv6CIDR(IPv6Address, prefixLength: UInt8)
+        /// GeoIP country code of the client's address.
+        case srcGeoIP(code: String)
+        /// Autonomous system number. Evaluated when `Router` is given an `ASNMatcher`.
+        case ipASN(UInt32)
+        case srcIPASN(UInt32)
+        case ipSuffix(IPSuffix)
+        case srcIPSuffix(IPSuffix)
         case network(RouteContext.Network)
         /// Executable name, case-insensitive (`Telegram`, `curl`).
         case processName(String)
@@ -167,6 +185,12 @@ public struct RouteRule: Hashable, Sendable {
             }
             return pattern
         }
+        func asn(_ text: String) throws -> UInt32 {
+            guard let number = UInt32(text.trimmingCharacters(in: .whitespaces)) else {
+                throw RuleCompileError.invalidPayload(text)
+            }
+            return number
+        }
         switch type {
         case .domainRegex(let pattern):
             return .domainRegex(try regex(pattern, caseInsensitive: true))
@@ -189,6 +213,16 @@ public struct RouteRule: Hashable, Sendable {
             case .ipv6CIDR(let network, let prefix): return .srcIPv6CIDR(network, prefixLength: prefix)
             default: throw RuleCompileError.invalidCIDR(text)
             }
+        case .srcGeoIP(code: let code):
+            return .srcGeoIP(code: code.uppercased())
+        case .ipASN(let text):
+            return .ipASN(try asn(text))
+        case .srcIPASN(let text):
+            return .srcIPASN(try asn(text))
+        case .ipSuffix(let text):
+            return .ipSuffix(try parseSuffix(text))
+        case .srcIPSuffix(let text):
+            return .srcIPSuffix(try parseSuffix(text))
         case .network(let text):
             guard let network = RouteContext.Network(rawValue: text.lowercased()) else {
                 throw RuleCompileError.invalidPayload(text)
@@ -247,6 +281,17 @@ public struct RouteRule: Hashable, Sendable {
         throw RuleCompileError.invalidCIDR(text)
     }
 
+    /// `IP-SUFFIX` payloads are written like CIDRs, host bits kept.
+    private static func parseSuffix(_ text: String) throws -> IPSuffix {
+        switch try parseCIDR(text) {
+        case .ipv4(let address): return IPSuffix(address: .ipv4(address), bits: 32)
+        case .ipv4CIDR(let address, let bits): return IPSuffix(address: .ipv4(address), bits: bits)
+        case .ipv6(let address): return IPSuffix(address: .ipv6(address), bits: 128)
+        case .ipv6CIDR(let address, let bits): return IPSuffix(address: .ipv6(address), bits: bits)
+        default: throw RuleCompileError.invalidCIDR(text)
+        }
+    }
+
     fileprivate static func normalizeSuffix(_ suffix: String) -> String {
         var key = suffix.lowercased()
         if key.hasPrefix("*.") { key.removeFirst(2) }
@@ -274,6 +319,11 @@ extension RouteRule.HostMatcher {
         case .srcPort: "SRC-PORT"
         case .inPort: "IN-PORT"
         case .srcIPv4CIDR, .srcIPv6CIDR: "SRC-IP-CIDR"
+        case .srcGeoIP: "SRC-GEOIP"
+        case .ipASN: "IP-ASN"
+        case .srcIPASN: "SRC-IP-ASN"
+        case .ipSuffix: "IP-SUFFIX"
+        case .srcIPSuffix: "SRC-IP-SUFFIX"
         case .network: "NETWORK"
         case .processName: "PROCESS-NAME"
         case .processPath: "PROCESS-PATH"
@@ -298,8 +348,12 @@ extension RouteRule.HostMatcher {
             return address.description
         case .ipv6CIDR(let address, let prefix), .srcIPv6CIDR(let address, let prefix):
             return "\(address)/\(prefix)"
-        case .geoIP(let code):
+        case .geoIP(let code), .srcGeoIP(let code):
             return code
+        case .ipASN(let number), .srcIPASN(let number):
+            return String(number)
+        case .ipSuffix(let suffix), .srcIPSuffix(let suffix):
+            return suffix.description
         case .geosite(let tag):
             return tag
         case .matchAll:
@@ -341,7 +395,7 @@ extension RouteRule.HostMatcher {
     func needsResolution(noResolve: Bool) -> Bool {
         if noResolve { return false }
         switch self {
-        case .geoIP, .ipv4, .ipv4CIDR, .ipv6, .ipv6CIDR:
+        case .geoIP, .ipv4, .ipv4CIDR, .ipv6, .ipv6CIDR, .ipASN, .ipSuffix:
             return true
         case .and(let conditions), .or(let conditions):
             return conditions.contains { $0.matcher.needsResolution(noResolve: $0.noResolve) }
@@ -387,6 +441,7 @@ public final class Router: Sendable {
     public let needsProcess: Bool
     private let geoIP: GeoIPMatcher?
     private let geosite: GeositeMatcher?
+    private let asn: ASNMatcher?
     /// `rules` with host payloads normalized once (not per match).
     private let compiled: [CompiledRule]
     /// Index of the run starting at each rule (nil elsewhere).
@@ -513,12 +568,14 @@ public final class Router: Sendable {
         rules: [RouteRule] = [],
         default defaultPolicy: Policy = .direct,
         geoIP: GeoIPMatcher? = nil,
-        geosite: GeositeMatcher? = nil
+        geosite: GeositeMatcher? = nil,
+        asn: ASNMatcher? = nil
     ) {
         self.rules = rules
         self.defaultPolicy = defaultPolicy
         self.geoIP = geoIP
         self.geosite = geosite
+        self.asn = asn
         let compiled = rules.map(Self.compile)
         self.compiled = compiled
         self.runs = Self.indexRuns(compiled)
@@ -547,6 +604,8 @@ public final class Router: Sendable {
             matcher = .domainKeyword(value.lowercased())
         case .geoIP(let code):
             matcher = .geoIP(code: code.uppercased())
+        case .srcGeoIP(let code):
+            matcher = .srcGeoIP(code: code.uppercased())
         default:
             break
         }
@@ -876,6 +935,16 @@ public final class Router: Sendable {
             if let address = destination.ipv4, geoIP.matches(ipv4: address, code: code) { return true }
             if let address = destination.ipv6, geoIP.matches(ipv6: address, code: code) { return true }
             return false
+        case .ipASN(let number):
+            guard addressVisible, let asn else { return false }
+            if let address = destination.ipv4, asn.lookup(ipv4: address) == number { return true }
+            if let address = destination.ipv6, asn.lookup(ipv6: address) == number { return true }
+            return false
+        case .ipSuffix(let suffix):
+            guard addressVisible else { return false }
+            if let address = destination.ipv4, suffix.matches(.ipv4(address)) { return true }
+            if let address = destination.ipv6, suffix.matches(.ipv6(address)) { return true }
+            return false
         case .geosite(tag: let tag):
             guard case .domain(let host) = endpoint.host, let geosite else { return false }
             return geosite.match(domain: host, group: tag)
@@ -899,6 +968,23 @@ public final class Router: Sendable {
             guard let source = known(context.sourceHost) else { return nil }
             guard case .ipv6(let address)? = source else { return false }
             return Self.ipv6(address, in: network, prefix: prefix)
+        case .srcGeoIP(code: let code):
+            guard let source = known(context.sourceHost) else { return nil }
+            switch source {
+            case .ipv4(let address)?: return geoIP?.matches(ipv4: address, code: code) ?? false
+            case .ipv6(let address)?: return geoIP?.matches(ipv6: address, code: code) ?? false
+            default: return false
+            }
+        case .srcIPASN(let number):
+            guard let source = known(context.sourceHost) else { return nil }
+            switch source {
+            case .ipv4(let address)?: return asn?.lookup(ipv4: address) == number
+            case .ipv6(let address)?: return asn?.lookup(ipv6: address) == number
+            default: return false
+            }
+        case .srcIPSuffix(let suffix):
+            guard let source = known(context.sourceHost) else { return nil }
+            return source.map(suffix.matches) ?? false
         case .network(let network):
             guard let actual = known(context.network) else { return nil }
             return actual == network

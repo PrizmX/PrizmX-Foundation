@@ -56,6 +56,8 @@ public final class GeoIPMatcher: Sendable {
     private let ipVersion: Int
     /// Node to start IPv4 lookups from (0 for IPv4 DBs; after `::/96` for IPv6 DBs).
     private let ipv4StartNode: UInt32
+    /// Metadata `database_type` (`GeoLite2-Country`, `GeoLite2-ASN`, …).
+    let databaseType: String?
 
     public convenience init(contentsOf url: URL) throws {
         let mapped = try Data(contentsOf: url, options: [.mappedIfSafe])
@@ -82,6 +84,7 @@ public final class GeoIPMatcher: Sendable {
         self.nodeByteCount = recordSize * 2 / 8
         self.treeByteCount = Int(nodeCount) * nodeByteCount
         self.ipVersion = ipVersion
+        self.databaseType = metadata["database_type"]?.string
 
         guard treeByteCount + 16 < data.count else { throw GeoIPError.truncated }
 
@@ -118,19 +121,33 @@ public final class GeoIPMatcher: Sendable {
     /// All codes for the address. MetaCubeX `geoip.metadb` records can be an
     /// array of codes (an IP in several lists); MaxMind records yield one.
     public func lookupCodes(ipv4 address: IPv4Address) -> [String] {
+        record(ipv4: address, decode: Self.uppercasedCountryCodes) ?? []
+    }
+
+    public func lookupCodes(ipv6 address: IPv6Address) -> [String] {
+        record(ipv6: address, decode: Self.uppercasedCountryCodes) ?? []
+    }
+
+    /// The data record for `address`, read by `decode`; nil when the
+    /// database has none.
+    func record<T>(ipv4 address: IPv4Address, decode: (inout MMDBCursor) -> T?) -> T? {
         let start = ipVersion == 4 ? 0 : ipv4StartNode
-        return walk(startNode: start, bitCount: 32) { index in
+        return walk(startNode: start, bitCount: 32, decode: decode) { index in
             UInt8(truncatingIfNeeded: (address.rawValue >> (31 - index)) & 1)
         }
     }
 
-    public func lookupCodes(ipv6 address: IPv6Address) -> [String] {
-        walk(startNode: 0, bitCount: 128) { index in
+    func record<T>(ipv6 address: IPv6Address, decode: (inout MMDBCursor) -> T?) -> T? {
+        walk(startNode: 0, bitCount: 128, decode: decode) { index in
             if index < 64 {
                 return UInt8(truncatingIfNeeded: (address.high >> (63 - index)) & 1)
             }
             return UInt8(truncatingIfNeeded: (address.low >> (63 - (index - 64))) & 1)
         }
+    }
+
+    private static func uppercasedCountryCodes(_ cursor: inout MMDBCursor) -> [String]? {
+        readCountryCodes(&cursor, depth: 0)?.map { $0.uppercased() }
     }
 
     /// `code` must be uppercase (rules normalize at compile time).
@@ -142,8 +159,13 @@ public final class GeoIPMatcher: Sendable {
         lookupCodes(ipv6: address).contains(code)
     }
 
-    private func walk(startNode: UInt32, bitCount: Int, bitAt: (Int) -> UInt8) -> [String] {
-        data.withUnsafeBytes { buffer -> [String] in
+    private func walk<T>(
+        startNode: UInt32,
+        bitCount: Int,
+        decode: (inout MMDBCursor) -> T?,
+        bitAt: (Int) -> UInt8
+    ) -> T? {
+        data.withUnsafeBytes { buffer -> T? in
             var node = startNode
             for index in 0..<bitCount {
                 let record = Self.readRecord(
@@ -157,12 +179,12 @@ public final class GeoIPMatcher: Sendable {
                     node = record
                     continue
                 }
-                if record == nodeCount { return [] }
+                if record == nodeCount { return nil }
                 let fileOffset = Int(record - nodeCount) + treeByteCount
                 var cursor = MMDBCursor(buffer: buffer, offset: fileOffset, sectionStart: treeByteCount + 16)
-                return (Self.readCountryCodes(&cursor, depth: 0) ?? []).map { $0.uppercased() }
+                return decode(&cursor)
             }
-            return []
+            return nil
         }
     }
 
@@ -290,6 +312,27 @@ public final class GeoIPMatcher: Sendable {
             default:
                 return cursor.skipPayload(type: type, size: size) ? [] : nil
             }
+        }
+    }
+
+    /// `autonomous_system_number` of a GeoLite2-ASN record.
+    static func readASNumber(_ cursor: inout MMDBCursor, depth: Int = 0) -> UInt32? {
+        guard depth < maxDepth, let field = cursor.control() else { return nil }
+        switch field {
+        case .pointer(let target):
+            var nested = cursor.at(target)
+            return readASNumber(&nested, depth: depth + 1)
+        case .value(7, let size):
+            for _ in 0..<size {
+                guard let key = readStringField(&cursor, depth: depth + 1) else { return nil }
+                if key == "autonomous_system_number" {
+                    return decodeField(&cursor, depth: depth + 1)?.uint.flatMap { UInt32(exactly: $0) }
+                }
+                guard skipValue(&cursor, depth: depth + 1) else { return nil }
+            }
+            return nil
+        default:
+            return nil
         }
     }
 
@@ -513,12 +556,28 @@ private extension MMDBValue {
 
 // MARK: - Test / fixture writer (IPv4, 24-bit records)
 
-/// Builds a tiny IPv4 GeoIP MMDB for tests and fixtures.
+/// Builds a tiny IPv4 GeoIP or ASN MMDB for tests and fixtures.
 enum MMDBWriter {
     static func build(records: [(address: IPv4Address, prefix: UInt8, country: String)]) -> Data {
+        build(records.map { ($0.address, $0.prefix, $0.country) }, databaseType: "PrizmX-Test", encode: encodeCountry)
+    }
+
+    /// GeoLite2-ASN layout.
+    static func buildASN(records: [(address: IPv4Address, prefix: UInt8, asn: UInt32)]) -> Data {
+        build(records.map { ($0.address, $0.prefix, String($0.asn)) }, databaseType: "GeoLite2-ASN") {
+            encodeASN(UInt32($0) ?? 0)
+        }
+    }
+
+    /// `key` names each record's payload, which `encode` writes once.
+    private static func build(
+        _ records: [(address: IPv4Address, prefix: UInt8, key: String)],
+        databaseType: String,
+        encode: (String) -> Data
+    ) -> Data {
         let root = TreeNode()
         for record in records {
-            insert(root: root, address: record.address, prefix: record.prefix, country: record.country)
+            insert(root: root, address: record.address, prefix: record.prefix, country: record.key)
         }
 
         var nodes: [TreeNode] = []
@@ -528,9 +587,9 @@ enum MMDBWriter {
         var payloads: [String: Int] = [:]
         var dataSection = Data()
         for record in records {
-            if payloads[record.country] == nil {
-                payloads[record.country] = dataSection.count
-                dataSection.append(encodeCountry(record.country))
+            if payloads[record.key] == nil {
+                payloads[record.key] = dataSection.count
+                dataSection.append(encode(record.key))
             }
         }
 
@@ -547,7 +606,7 @@ enum MMDBWriter {
         file.append(dataSection)
         file.append(contentsOf: [0xAB, 0xCD, 0xEF])
         file.append(contentsOf: Array("MaxMind.com".utf8))
-        file.append(encodeMetadata(nodeCount: nodeCount))
+        file.append(encodeMetadata(nodeCount: nodeCount, databaseType: databaseType))
         return file
     }
 
@@ -636,7 +695,17 @@ enum MMDBWriter {
         return data
     }
 
-    private static func encodeMetadata(nodeCount: UInt32) -> Data {
+    private static func encodeASN(_ number: UInt32) -> Data {
+        var data = Data()
+        appendMapCount(2, into: &data)
+        appendString("autonomous_system_number", into: &data)
+        appendUInt(UInt64(number), type: 6, into: &data)
+        appendString("autonomous_system_organization", into: &data)
+        appendString("AS\(number)", into: &data)
+        return data
+    }
+
+    private static func encodeMetadata(nodeCount: UInt32, databaseType: String) -> Data {
         var data = Data()
         appendMapCount(8, into: &data)
         appendString("node_count", into: &data)
@@ -646,7 +715,7 @@ enum MMDBWriter {
         appendString("ip_version", into: &data)
         appendUInt(4, type: 5, into: &data)
         appendString("database_type", into: &data)
-        appendString("PrizmX-Test", into: &data)
+        appendString(databaseType, into: &data)
         appendString("binary_format_major_version", into: &data)
         appendUInt(2, type: 5, into: &data)
         appendString("binary_format_minor_version", into: &data)

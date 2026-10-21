@@ -12,6 +12,7 @@ public struct ExtensionBootstrap: Sendable {
     public var configText: String?
     public var geoIPURL: URL?
     public var geositeURL: URL?
+    public var asnURL: URL?
     public var geositeJSON: String?
     public var useFakeIP: Bool
     /// "Route All Traffic": TUN takes the default route (`CapturePreferenceStore`).
@@ -34,6 +35,7 @@ public struct ExtensionBootstrap: Sendable {
         configText = TunnelConfigStorage.configText(from: provider)
         geoIPURL = GeoAssetStore.resolve(provider[TunnelProviderKeys.geoIPPath] as? String)
         geositeURL = GeoAssetStore.resolve(provider[TunnelProviderKeys.geositePath] as? String)
+        asnURL = GeoAssetStore.resolve(provider[TunnelProviderKeys.asnPath] as? String)
         geositeJSON = provider[TunnelProviderKeys.geositeJSON] as? String
         useFakeIP = (provider[TunnelProviderKeys.fakeIP] as? Bool) ?? true
         captureAllTraffic = useFakeIP && CapturePreferenceStore.load().allTraffic
@@ -57,6 +59,7 @@ public struct ExtensionBootstrap: Sendable {
             configText: configText,
             geoIPURL: geoIPURL,
             geositeURL: geositeURL,
+            asnURL: asnURL,
             geositeJSON: geositeJSON,
             systemDNS: systemDNS,
             pinnedNodeAddresses: pinnedNodeAddresses,

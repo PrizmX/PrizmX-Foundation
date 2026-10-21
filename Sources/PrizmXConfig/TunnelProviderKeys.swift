@@ -14,6 +14,8 @@ public enum TunnelProviderKeys: Sendable {
     public static let geoIPPath = "geoIPPath"
     /// `geosite.dat` (or a small JSON fixture) path: App Group-relative, or absolute.
     public static let geositePath = "geositePath"
+    /// GeoLite2-ASN `.mmdb` path for `IP-ASN` rules: App Group-relative, or absolute.
+    public static let asnPath = "asnPath"
     /// Tiny JSON fixture for tests. Production uses `geositePath` — a full
     /// geosite dump exceeds the Network Extension profile size cap.
     public static let geositeJSON = "geositeJSON"

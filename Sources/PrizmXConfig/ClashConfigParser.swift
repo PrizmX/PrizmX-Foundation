@@ -851,7 +851,7 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         }
     }
 
-    /// `TYPE,payload,target[,no-resolve]`, `MATCH,target` / `FINAL,target`,
+    /// `TYPE,payload,target[,no-resolve|src]`, `MATCH,target` / `FINAL,target`,
     /// or a logical rule (`AND,((DOMAIN,a),(NETWORK,UDP)),target`).
     /// `providers` resolves `RULE-SET` names (Clash YAML only).
     /// Throws `RuleSkip` for anything that cannot be imported exactly.
@@ -874,16 +874,18 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         // the rule out does.
         if parts[2].uppercased() == "PASS" { return [] }
         let policy = ConfigMapping.policy(named: parts[2])
-        let noResolve = try Self.noResolve(parts.dropFirst(3))
+        let options = try Self.options(parts.dropFirst(3))
+        let ruleKind = try options.source ? Self.sourceKind(kind) : kind
 
         // mihomo's `LAN` pseudo-country is not in the MMDB.
-        if kind == "GEOIP", payload.uppercased() == "LAN" {
+        if ruleKind == "GEOIP" || ruleKind == "SRC-GEOIP", payload.uppercased() == "LAN" {
             return try ConfigMapping.privateCIDRs.map {
-                try RouteRule(type: .ipCIDR($0), policy: policy, noResolve: noResolve)
+                let type: RuleType = ruleKind == "GEOIP" ? .ipCIDR($0) : .srcIPCIDR($0)
+                return try RouteRule(type: type, policy: policy, noResolve: options.noResolve)
             }
         }
-        let matcher = try compileCondition(kind: kind, payload: payload, providers: providers)
-        return [RouteRule(matcher, policy: policy, noResolve: noResolve)]
+        let matcher = try compileCondition(kind: ruleKind, payload: payload, providers: providers)
+        return [RouteRule(matcher, policy: policy, noResolve: options.noResolve)]
     }
 
     /// One condition without a target: a rule's matcher, a part of AND /
@@ -915,6 +917,8 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             return .ruleSet(try providers.ruleSet(named: payload))
         case "GEOIP" where payload.uppercased() == "LAN":
             return .or(try ConfigMapping.privateCIDRs.map { RuleCondition(try RouteRule.compile(.ipCIDR($0))) })
+        case "SRC-GEOIP" where payload.uppercased() == "LAN":
+            return .or(try ConfigMapping.privateCIDRs.map { RuleCondition(try RouteRule.compile(.srcIPCIDR($0))) })
         default:
             break
         }
@@ -928,14 +932,16 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         }
     }
 
-    /// `TYPE,payload[,no-resolve]` (a logical operand or a classical line).
+    /// `TYPE,payload[,no-resolve|src]` (a logical operand or a classical line).
     func parseCondition(_ body: String, providers: RuleProviderResolver?) throws -> RuleCondition {
         let parts = Self.splitTopLevel(body)
         guard parts.count >= 2, let kind = parts.first, !kind.isEmpty else {
             throw RuleSkip("malformed condition \(body)")
         }
-        let matcher = try compileCondition(kind: kind, payload: parts[1], providers: providers)
-        return RuleCondition(matcher, noResolve: try Self.noResolve(parts.dropFirst(2)))
+        let options = try Self.options(parts.dropFirst(2))
+        let conditionKind = try options.source ? Self.sourceKind(kind.uppercased()) : kind
+        let matcher = try compileCondition(kind: conditionKind, payload: parts[1], providers: providers)
+        return RuleCondition(matcher, noResolve: options.noResolve)
     }
 
     private static func ruleType(kind: String, payload: String) -> RuleType? {
@@ -948,6 +954,11 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         case "IP-CIDR", "IP-CIDR6", "IPCIDR": .ipCIDR(payload)
         case "SRC-IP-CIDR": .srcIPCIDR(payload)
         case "GEOIP": .geoIP(code: payload)
+        case "SRC-GEOIP": .srcGeoIP(code: payload)
+        case "IP-ASN": .ipASN(payload)
+        case "SRC-IP-ASN": .srcIPASN(payload)
+        case "IP-SUFFIX": .ipSuffix(payload)
+        case "SRC-IP-SUFFIX": .srcIPSuffix(payload)
         case "GEOSITE": .geosite(tag: payload)
         case "DST-PORT": .dstPort(payload)
         case "SRC-PORT": .srcPort(payload)
@@ -961,17 +972,34 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
         }
     }
 
-    /// Only `no-resolve` is honored; other options (e.g. `src`) change what
-    /// is matched.
-    private static func noResolve(_ options: some Collection<String>) throws -> Bool {
+    /// `no-resolve`, and `src`, which matches the client's address instead
+    /// (`sourceKind`). A rule with any other option is skipped.
+    private static func options(_ options: some Collection<String>) throws -> (noResolve: Bool, source: Bool) {
         var noResolve = false
+        var source = false
         for option in options where !option.isEmpty {
-            guard option.lowercased() == "no-resolve" else {
-                throw RuleSkip("unsupported rule option \(option)")
+            switch option.lowercased() {
+            case "no-resolve": noResolve = true
+            case "src": source = true
+            default: throw RuleSkip("unsupported rule option \(option)")
             }
-            noResolve = true
         }
-        return noResolve
+        return (noResolve, source)
+    }
+
+    /// The SRC- rule that `src` makes of `kind`, which never looks anything
+    /// up (mihomo's `ParseParams` adds `no-resolve`). Other kinds ignore
+    /// `src`, as in mihomo, except `RULE-SET`: mihomo then matches the set
+    /// with source and destination swapped, ports too, which PrizmX does not.
+    private static func sourceKind(_ kind: String) throws -> String {
+        switch kind {
+        case "IP-CIDR", "IP-CIDR6", "IPCIDR": "SRC-IP-CIDR"
+        case "GEOIP": "SRC-GEOIP"
+        case "IP-ASN": "SRC-IP-ASN"
+        case "IP-SUFFIX": "SRC-IP-SUFFIX"
+        case "RULE-SET": throw RuleSkip("unsupported rule option src for RULE-SET")
+        default: kind
+        }
     }
 
     /// Splits on commas outside parentheses: `AND,((A,b),(C,d)),P` →

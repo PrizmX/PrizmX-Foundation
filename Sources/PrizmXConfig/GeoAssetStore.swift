@@ -2,31 +2,36 @@ import Foundation
 import PrizmXProtocols
 import PrizmXRules
 
-/// App Group copies of Clash/Mihomo `geoip.metadb` and `geosite.dat`.
+/// App Group copies of Clash/Mihomo `geoip.metadb`, `geosite.dat` and
+/// `GeoLite2-ASN.mmdb`.
 ///
 /// The Network Extension profile is capped at 512 KB, so the databases live
 /// as files (same pattern as the active config). `prepare` downloads them
-/// when a profile actually uses `GEOIP` / `GEOSITE` rules. Downloads are
-/// validated before they replace a file (a captive-portal page must never be
-/// persisted), and a valid file older than `refreshAge` is refreshed in the
-/// background without delaying the caller.
+/// when a profile actually uses `GEOIP` / `GEOSITE` / `IP-ASN` rules.
+/// Downloads are validated before they replace a file (a captive-portal page
+/// must never be persisted), and a valid file older than `refreshAge` is
+/// refreshed in the background without delaying the caller.
 public enum GeoAssetStore: Sendable {
     public static let geoIPRelativePath = "geo/geoip.metadb"
     public static let geositeRelativePath = "geo/geosite.dat"
+    public static let asnRelativePath = "geo/GeoLite2-ASN.mmdb"
     public static let refreshAge: TimeInterval = 7 * 24 * 3_600
 
     enum Kind: Sendable {
         case geoIP
         case geosite
+        case asn
     }
 
     public struct Sources: Sendable {
         public var geoIP: [URL]
         public var geosite: [URL]
+        public var asn: [URL]
 
-        public init(geoIP: [URL], geosite: [URL]) {
+        public init(geoIP: [URL], geosite: [URL], asn: [URL] = []) {
             self.geoIP = geoIP
             self.geosite = geosite
+            self.asn = asn
         }
 
         public static let none = Sources(geoIP: [], geosite: [])
@@ -40,6 +45,10 @@ public enum GeoAssetStore: Sendable {
             geosite: [
                 URL(string: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat")!,
                 URL(string: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat")!,
+            ],
+            asn: [
+                URL(string: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb")!,
+                URL(string: "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb")!,
             ]
         )
     }
@@ -47,10 +56,12 @@ public enum GeoAssetStore: Sendable {
     public struct Prepared: Sendable, Equatable {
         public var geoIPPath: String?
         public var geositePath: String?
+        public var asnPath: String?
 
-        public init(geoIPPath: String? = nil, geositePath: String? = nil) {
+        public init(geoIPPath: String? = nil, geositePath: String? = nil, asnPath: String? = nil) {
             self.geoIPPath = geoIPPath
             self.geositePath = geositePath
+            self.asnPath = asnPath
         }
     }
 
@@ -61,6 +72,7 @@ public enum GeoAssetStore: Sendable {
         root: URL? = TunnelConfigStorage.containerURL(),
         geoIP: Bool,
         geosite: Bool,
+        asn: Bool = false,
         sources: Sources = .default,
         fileManager: FileManager = .default,
         session: URLSession = .shared
@@ -77,6 +89,12 @@ public enum GeoAssetStore: Sendable {
             let url = root.appendingPathComponent(geositeRelativePath)
             if await ensureFile(at: url, kind: .geosite, sources: sources.geosite, session: session) {
                 prepared.geositePath = geositeRelativePath
+            }
+        }
+        if asn {
+            let url = root.appendingPathComponent(asnRelativePath)
+            if await ensureFile(at: url, kind: .asn, sources: sources.asn, session: session) {
+                prepared.asnPath = asnRelativePath
             }
         }
         return prepared
@@ -154,9 +172,10 @@ public enum GeoAssetStore: Sendable {
 
     static func isValid(_ data: Data, kind: Kind) -> Bool {
         switch kind {
-        case .geoIP:
+        case .geoIP, .asn:
             let marker = Data([0xAB, 0xCD, 0xEF] + Array("MaxMind.com".utf8))
             guard data.range(of: marker, options: .backwards) != nil else { return false }
+            if kind == .asn { return (try? ASNMatcher(data: data)) != nil }
             return (try? GeoIPMatcher(data: data)) != nil
         case .geosite:
             // `GeoSiteList` starts with field 1 (length-delimited); walking it
