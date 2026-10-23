@@ -127,7 +127,8 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
         }
     }
 
-    /// TCP only: SwiftTCP routes UDP closes to `onUDPSessionClosed`.
+    /// TCP only: SwiftTCP routes UDP closes to `onUDPSessionClosed`. After
+    /// the client's FIN this is a plain close; before it, a reset.
     func onClosed(flow: FlowKey) {
         lock.lock()
         let stream = tcpStreams.removeValue(forKey: flow)
@@ -135,7 +136,7 @@ final class TUNMailbox: PacketSink, TCPStreamHandler, UDPDatagramHandler, @unche
         guard let stream else { return }
         Self.pin(flow: flow, fakeIP: fakeIP, by: -1)
         deliverQueue.async {
-            stream.finish()
+            stream.abort()
         }
     }
 

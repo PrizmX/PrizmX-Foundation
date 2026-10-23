@@ -21,8 +21,10 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
     private let byteStream: any TCPByteStream
     private let lock = NSLock()
     private var buffer = Data()
-    private var waiter: CheckedContinuation<Data?, Never>?
+    private var waiter: CheckedContinuation<Data?, Error>?
     private var closed = false
+    /// Ended without the app's FIN: reads fail instead of reaching EOF.
+    private var reset = false
     private var finSent = false
 
     init(endpoint: Endpoint, flow: FlowKey, byteStream: any TCPByteStream) {
@@ -31,8 +33,10 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
         self.byteStream = byteStream
     }
 
-    public func read() async -> Data? {
-        await withCheckedContinuation { continuation in
+    /// The buffered bytes, then nil after the app's FIN, or
+    /// `TUNStreamError.closed` once the flow was reset.
+    public func read() async throws -> Data? {
+        try await withCheckedThrowingContinuation { continuation in
             takeForRead(continuation)
         }
     }
@@ -94,7 +98,20 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
         waiter?.resume(returning: nil)
     }
 
-    private func takeForRead(_ continuation: CheckedContinuation<Data?, Never>) {
+    /// The flow is gone before the app's FIN (a RST either way, a timeout, a
+    /// network reset): once the buffered bytes are read, reads fail, so the
+    /// relay drops the outbound instead of half-closing it and lingering.
+    func abort() {
+        lock.lock()
+        if !closed { reset = true }
+        closed = true
+        let waiter = self.waiter
+        self.waiter = nil
+        lock.unlock()
+        waiter?.resume(throwing: TUNStreamError.closed)
+    }
+
+    private func takeForRead(_ continuation: CheckedContinuation<Data?, Error>) {
         lock.lock()
         if !buffer.isEmpty {
             let data = buffer
@@ -105,8 +122,13 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
             return
         }
         if closed {
+            let reset = self.reset
             lock.unlock()
-            continuation.resume(returning: nil)
+            if reset {
+                continuation.resume(throwing: TUNStreamError.closed)
+            } else {
+                continuation.resume(returning: nil)
+            }
             return
         }
         waiter = continuation
@@ -187,14 +209,19 @@ public actor TUNStack {
     public func start() {
         guard !started else { return }
         started = true
+        // No absolute lifetime: a flow lasts as long as the app keeps it (an
+        // SSH session, a long download). Idle, keepalive and close timers
+        // still reap dead ones.
         let tcp = TCPStackConfig(
             loopCount: max(1, min(2, ProcessInfo.processInfo.activeProcessorCount)),
             receiveWindow: MemoryWatchdog.maxBufferPerSession,
+            timers: TCPTimerConfig(maxLifetime: .zero),
             maxConnections: MemoryWatchdog.maxTCPSessions,
             sendBufferLimit: MemoryWatchdog.sendBufferLimit
         )
         let config = SwiftStackConfig(
             tcp: tcp,
+            udpMaxLifetime: .zero,
             udpMaxSessions: MemoryWatchdog.maxUDPSessions
         )
         let swift = SwiftStack(
@@ -212,6 +239,15 @@ public actor TUNStack {
         await stack?.shutdown()
         stack = nil
         started = false
+    }
+
+    /// Resets every open flow and keeps the stack: TCP flows get a RST
+    /// toward the app, UDP sessions are dropped, and the relay closes the
+    /// outbound of each. After a network change the outbounds sit on the
+    /// old path; apps reconnect over the new one instead of waiting on them.
+    @discardableResult
+    public func resetFlows() async -> (tcp: Int, udp: Int) {
+        await stack?.resetAllFlows() ?? (0, 0)
     }
 
     /// Async sequence of accepted TCP connections (already reassembled).

@@ -155,6 +155,70 @@ struct SwiftTCPStackTests {
         #expect(received.payload == payload)
         await stack.stop()
     }
+
+    @Test func resetFlowsResetsOpenFlowsAndKeepsTheStack() async throws {
+        let output = OutputLog()
+        let stack = TUNStack(fakeIP: nil) { output.append($0) }
+        await stack.start()
+        let connections = await stack.tcpConnections()
+        let datagrams = await stack.udpDatagrams()
+        let app = IPv4Address(198, 18, 0, 1)
+        let server = IPv4Address(1, 1, 1, 1)
+
+        await stack.input(packets: [
+            TCPSegment(
+                sourcePort: 12_345, destinationPort: 80, sequence: 1, acknowledgement: 0,
+                flags: .syn, window: 65_535, payload: Data()
+            ).encode(source: app, destination: server),
+        ])
+        let synAck = try #require(await output.waitForSegment { $0.flags.contains(.syn) })
+        await stack.input(packets: [
+            TCPSegment(
+                sourcePort: 12_345, destinationPort: 80, sequence: 2, acknowledgement: synAck.sequence &+ 1,
+                flags: .ack, window: 65_535, payload: Data()
+            ).encode(source: app, destination: server),
+            UDPDatagram(sourcePort: 50_000, destinationPort: 443, payload: Data([1]))
+                .encode(source: app, destination: server),
+        ])
+        var tcp = connections.makeAsyncIterator()
+        let stream = try #require(await tcp.next())
+        var udp = datagrams.makeAsyncIterator()
+        _ = try #require(await udp.next())
+
+        let reset = await stack.resetFlows()
+        #expect(reset.tcp == 1)
+        #expect(reset.udp == 1)
+        // The app gets a RST; the relay's read fails instead of reaching EOF.
+        #expect(await output.waitForSegment { $0.flags.contains(.rst) && $0.destinationPort == 12_345 } != nil)
+        await #expect(throws: TUNStreamError.closed) { try await stream.read() }
+        await stack.stop()
+    }
+}
+
+/// Packets the stack wrote toward the app, appended from any thread.
+private final class OutputLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var packets: [Data] = []
+
+    func append(_ batch: [Data]) {
+        lock.withLock { packets += batch }
+    }
+
+    /// The first TCP segment that matches, waiting up to 2 s for it.
+    func waitForSegment(_ match: (TCPSegment) -> Bool) async -> TCPSegment? {
+        let deadline = ContinuousClock.now + .seconds(2)
+        repeat {
+            let segments = lock.withLock { packets }.compactMap { packet in
+                packet.withUnsafeBytes { bytes -> TCPSegment? in
+                    guard let raw = try? RawIPPacket(bytes), case .tcp = raw.transport else { return nil }
+                    return raw.payload.flatMap { TCPSegment.parse(ipPayload: $0) }
+                }
+            }
+            if let hit = segments.first(where: match) { return hit }
+            try? await Task.sleep(for: .milliseconds(10))
+        } while ContinuousClock.now < deadline
+        return nil
+    }
 }
 
 /// Builds a UDP-encapsulated A-record query from a fake client to FakeDNS.

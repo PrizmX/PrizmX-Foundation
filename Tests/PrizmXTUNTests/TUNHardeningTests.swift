@@ -76,9 +76,28 @@ private func makeFlow() -> FlowKey {
     let stream = try #require(await iterator.next())
     mailbox.onData(flow: flow, data: Data("tail".utf8))
     mailbox.onPeerFinished(flow: flow)
-    #expect(await stream.read() == Data("tail".utf8))
-    #expect(await stream.read() == nil)
+    #expect(try await stream.read() == Data("tail".utf8))
+    #expect(try await stream.read() == nil)
     #expect(stream.supportsHalfClose)
+    // Closing after the FIN stays a plain end of stream.
+    mailbox.onClosed(flow: flow)
+    #expect(try await stream.read() == nil)
+}
+
+@Test func resetFlowFailsReadsAfterBufferedData() async throws {
+    let mailbox = TUNMailbox(fakeIP: nil) { _ in }
+    mailbox.attach(byteStream: NullByteStream())
+    let (streams, continuation) = AsyncStream.makeStream(of: TUNTCPStream.self)
+    mailbox.setTCPContinuation(continuation)
+    let flow = makeFlow()
+    mailbox.onEstablished(flow: flow)
+    var iterator = streams.makeAsyncIterator()
+    let stream = try #require(await iterator.next())
+    mailbox.onData(flow: flow, data: Data("tail".utf8))
+    // Closed without the app's FIN: a RST, or a reset after a network change.
+    mailbox.onClosed(flow: flow)
+    #expect(try await stream.read() == Data("tail".utf8))
+    await #expect(throws: TUNStreamError.closed) { try await stream.read() }
 }
 
 @Test func udpSessionCloseDoesNotFinishTCPFlowOnSameTuple() async throws {
@@ -97,7 +116,7 @@ private func makeFlow() -> FlowKey {
     #expect(closed.values == [flow])
     // The TCP stream is still open: data still arrives.
     mailbox.onData(flow: flow, data: Data("still".utf8))
-    #expect(await stream.read() == Data("still".utf8))
+    #expect(try await stream.read() == Data("still".utf8))
 }
 
 private final class LockedFlows: @unchecked Sendable {
