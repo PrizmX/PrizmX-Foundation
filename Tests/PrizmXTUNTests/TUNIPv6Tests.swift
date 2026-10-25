@@ -88,13 +88,19 @@ struct TUNIPv6Tests {
         )
         let relay = Task { await TUNUDPRelay.run(stack: stack, engine: engine) }
         let payload = Data("ping over IPv6".utf8)
-        await stack.input(packets: [
-            UDPDatagram(sourcePort: 50_001, destinationPort: echo.port, payload: payload)
-                .encode(source: client6, destination: IPv6Address.loopback),
-        ])
-        let reply = try #require(await output.first { packet in
+        let datagram = UDPDatagram(sourcePort: 50_001, destinationPort: echo.port, payload: payload)
+            .encode(source: client6, destination: IPv6Address.loopback)
+        let isEcho: (Data) -> Bool = { packet in
             packet.count > 48 && packet[0] >> 4 == 6 && packet[6] == 17 && packet.suffix(payload.count) == payload
-        })
+        }
+        // The relay subscribes to the stack's datagrams on its own task; one
+        // sent before that is dropped, as UDP may be. Send until one returns.
+        var echoed: Data?
+        for _ in 0..<15 where echoed == nil {
+            await stack.input(packets: [datagram])
+            echoed = await output.first(within: .milliseconds(200), where: isEcho)
+        }
+        let reply = try #require(echoed)
         #expect(reply.subdata(in: 8..<24) == bytes(IPv6Address.loopback))
         #expect(reply.subdata(in: 24..<40) == bytes(client6))
         relay.cancel()
