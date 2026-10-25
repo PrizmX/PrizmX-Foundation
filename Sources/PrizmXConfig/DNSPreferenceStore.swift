@@ -32,8 +32,7 @@ public enum DNSPreferenceStore: Sendable {
         return state
     }
 
-    /// Always writes the file (also when off) so staging replaces a stale
-    /// runtime-kit copy.
+    /// Always writes the file, also when off.
     public static func save(
         _ state: State,
         appGroupIdentifier: String = TunnelConfigStorage.defaultAppGroupIdentifier,

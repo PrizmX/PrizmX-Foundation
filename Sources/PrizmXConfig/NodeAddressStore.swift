@@ -58,13 +58,11 @@ public enum NodeAddressStore: Sendable {
         try data.write(to: url, options: .atomic)
     }
 
-    /// Forgets node hostname pins and proven addresses (`dns-good.json`) in
-    /// the App Group and in the staged runtime kit — staging skips missing
-    /// sources, so a stale runtime copy would otherwise survive. Run while
-    /// the tunnel is down: a live extension re-persists what it holds.
+    /// Forgets node hostname pins and proven addresses (`dns-good.json`).
+    /// Run while the tunnel is down: a live extension re-persists what it
+    /// holds.
     public static func clearCache(
-        kitRoots: [URL] = [TunnelConfigStorage.containerURL(), TunnelRuntimeStore.runtimeKitRoot()]
-            .compactMap { $0 }
+        kitRoots: [URL] = [TunnelConfigStorage.containerURL()].compactMap { $0 }
     ) {
         for root in kitRoots {
             for name in [relativePath, "dns-good.json"] {
