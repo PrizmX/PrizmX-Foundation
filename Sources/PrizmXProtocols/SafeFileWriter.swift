@@ -18,9 +18,7 @@ import Foundation
 ///   never written through;
 /// - existing files open with `O_NOFOLLOW | O_NONBLOCK` (a planted FIFO
 ///   cannot block) and anything that is not a single-link regular file owned
-///   by the directory owner is replaced, never written through;
-/// - a root-owned target directory whose parent belongs to a regular user
-///   (left by an older root extension) is `fchown`ed back to that user.
+///   by the directory owner is replaced, never written through.
 public enum SafeFileWriter: Sendable {
 
     public enum Failure: Error, Equatable, Sendable {
@@ -75,19 +73,6 @@ public enum SafeFileWriter: Sendable {
         return (url.deletingLastPathComponent(), name)
     }
 
-    /// Ownership a root-owned target directory is migrated to, or nil to
-    /// refuse: only when we run as root and the parent belongs to a regular
-    /// user (a root-owned parent means the path points into the system).
-    static func migratedOwner(
-        directoryUID: uid_t,
-        parentUID: uid_t,
-        parentGID: gid_t,
-        effectiveUID: uid_t
-    ) -> (uid: uid_t, gid: gid_t)? {
-        guard directoryUID == 0, effectiveUID == 0, parentUID != 0 else { return nil }
-        return (parentUID, parentGID)
-    }
-
     /// Opens an existing entry without blocking (a FIFO planted at the target
     /// would otherwise hang `open`), then restores blocking I/O. The caller
     /// still validates the file type.
@@ -133,31 +118,12 @@ public enum SafeFileWriter: Sendable {
                 Darwin.close(fd)
                 throw error
             }
-            var owner = info.st_uid
-            var group = info.st_gid
-            if owner == 0 {
-                // Earlier versions (root extension) left root-owned kit
-                // subdirectories behind. Hand such a directory back to its
-                // parent's non-root owner instead of silently refusing.
-                var parent = stat()
-                let parentFD = openat(fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-                let parentOK = parentFD >= 0 && fstat(parentFD, &parent) == 0
-                if parentFD >= 0 { Darwin.close(parentFD) }
-                guard parentOK,
-                      let adopted = SafeFileWriter.migratedOwner(
-                          directoryUID: info.st_uid,
-                          parentUID: parent.st_uid,
-                          parentGID: parent.st_gid,
-                          effectiveUID: geteuid()
-                      ),
-                      fchown(fd, adopted.uid, adopted.gid) == 0
-                else {
-                    Darwin.close(fd)
-                    throw Failure.rootOwnedDirectory(url.path)
-                }
-                owner = adopted.uid
-                group = adopted.gid
+            guard info.st_uid != 0 else {
+                Darwin.close(fd)
+                throw Failure.rootOwnedDirectory(url.path)
             }
+            let owner = info.st_uid
+            let group = info.st_gid
             self.fd = fd
             self.owner = owner
             self.group = group

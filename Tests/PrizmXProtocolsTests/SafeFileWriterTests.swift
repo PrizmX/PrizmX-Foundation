@@ -119,17 +119,4 @@ struct SafeFileWriterTests {
         #expect(attrs[.type] as? FileAttributeType == .typeRegular)
         #expect(try Data(contentsOf: log) == Data("line\n".utf8))
     }
-
-    @Test func rootOwnedDirectoryMigrationDecision() {
-        // Running as root, root-owned kit subdir under a user-owned parent: adopt.
-        let adopted = SafeFileWriter.migratedOwner(directoryUID: 0, parentUID: 501, parentGID: 20, effectiveUID: 0)
-        #expect(adopted?.uid == 501)
-        #expect(adopted?.gid == 20)
-        // Root-owned parent: the path points into the system — refuse.
-        #expect(SafeFileWriter.migratedOwner(directoryUID: 0, parentUID: 0, parentGID: 0, effectiveUID: 0) == nil)
-        // Not root: cannot chown anyway — refuse.
-        #expect(SafeFileWriter.migratedOwner(directoryUID: 0, parentUID: 501, parentGID: 20, effectiveUID: 501) == nil)
-        // Directory already user-owned: nothing to migrate.
-        #expect(SafeFileWriter.migratedOwner(directoryUID: 501, parentUID: 501, parentGID: 20, effectiveUID: 0) == nil)
-    }
 }
