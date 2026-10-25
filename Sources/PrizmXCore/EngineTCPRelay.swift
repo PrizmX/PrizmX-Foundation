@@ -85,7 +85,7 @@ public enum EngineTCPRelay: Sendable {
             return
         }
         // A mixed-port client the local table cannot see (a root / system
-        // account process, from the sandboxed app) gets a later lookup.
+        // account process, from the app) gets a later lookup.
         let lateQuery: (clientPort: UInt16, listenPort: UInt16)?
         if attribution == nil, isLocalClient, !stream.isTunnelInbound,
            stream.clientPort > 0, let listenPort = stream.listenPort {

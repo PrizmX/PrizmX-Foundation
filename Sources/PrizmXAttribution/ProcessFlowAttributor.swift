@@ -163,7 +163,7 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
 
     /// TCP sockets connected to a loopback `listenPorts` (the app's
     /// mixed-port listeners), with their owners. Re-reads the table. The root
-    /// tunnel publishes these for the sandboxed app (`ProxyClientStore`).
+    /// tunnel publishes these for the app (`ProxyClientStore`).
     public func loopbackClients(listenPorts: Set<UInt16>) -> [LoopbackClient] {
         guard !listenPorts.isEmpty else { return [] }
         let owners = lock.withLock { state -> [SocketOwner] in
@@ -191,7 +191,7 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
         let started = now()
         var owners = table.snapshot(skipPID: ownPID)
         if includesOwnProcess {
-            // Read separately: a sandboxed caller's pcblist_n holds only its
+            // Read separately: a non-root caller's pcblist_n holds at most its
             // own sockets, and keeping them out of the table read keeps that
             // filtered-table check (and the libproc fallback) working.
             owners += table.sockets(ofPID: ownPID)

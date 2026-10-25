@@ -5,7 +5,7 @@ import PrizmXProtocols
 /// Clients of the in-app mixed-port listeners, as the Packet Tunnel
 /// extension sees them.
 ///
-/// The sandboxed app attributes mixed-port flows from its own socket table
+/// The app attributes mixed-port flows from its own socket table
 /// read, which cannot see root / system-account processes (cloudd, apsd,
 /// trustd …). The extension runs as root and sees every socket, so it writes
 /// the listeners' loopback clients here each second (next to

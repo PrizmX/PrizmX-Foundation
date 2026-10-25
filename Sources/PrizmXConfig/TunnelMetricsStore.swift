@@ -6,7 +6,7 @@ import PrizmXProtocols
 ///
 /// `NETunnelProviderSession.sendProviderMessage` is unreliable for a
 /// Developer ID Packet Tunnel *system* extension: the extension can be
-/// forwarding traffic while the sandboxed host gets an empty reply, so
+/// forwarding traffic while the host gets an empty reply, so
 /// Upload/Download stay at zero. The extension already writes logs under
 /// `containerPath` as root; this file uses the same kit so the app can
 /// read snapshots without that IPC.

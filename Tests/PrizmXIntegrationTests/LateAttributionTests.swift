@@ -87,7 +87,7 @@ private let cloudd = FlowAttribution(pid: 745, processName: "cloudd")
     #expect(attributor.queries.withLock { $0 } == [LateOnlyAttributor.Query(clientPort: 50_000, listenPort: 7_890)])
 }
 
-/// Nothing locally (a root client, as the sandboxed app sees it); the
+/// Nothing locally (a root client, as the app sees it); the
 /// tunnel's view answers.
 private final class LateOnlyAttributor: FlowAttributing, Sendable {
     struct Query: Equatable {
