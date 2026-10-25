@@ -453,7 +453,14 @@ public final class DNSClient: Sendable {
         // instead of waiting out a slow or blocked fallback (an `async let`
         // would be awaited when the scope ends).
         let secondary = Task { try await self.query(endpoints: fallback, domain: domain, role: role) }
-        let first = await Result { try await query(endpoints: main, domain: domain, role: role) }
+        // A do/catch, not `Result { try await … }`: the async Result
+        // initializer is missing from the toolchain CI builds with.
+        let first: Result<([IPv4Address], TimeInterval), Error>
+        do {
+            first = .success(try await query(endpoints: main, domain: domain, role: role))
+        } catch {
+            first = .failure(error)
+        }
         if case .success(let answer) = first,
            !answer.0.contains(where: { filter.rejectsAddress?.matches($0) == true }) {
             return answer
