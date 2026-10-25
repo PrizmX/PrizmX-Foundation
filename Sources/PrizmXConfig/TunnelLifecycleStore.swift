@@ -12,8 +12,8 @@ import PrizmXProtocols
 /// Where the record lives: an app extension shares the App Group defaults
 /// with the app. The open-core *system* extension runs as root, whose
 /// defaults land in root's own domain the app never sees, so once it is bound
-/// to the user's kit (`containerPath`) it writes `relativePath` there instead
-/// (as `TunnelMetricsStore` does), and the app reads that file first.
+/// to the user's kit (`containerPath`) it writes `relativePath` there instead,
+/// and the app reads that file first.
 public enum TunnelLifecycleStore {
     public static let relativePath = "tunnel/lifecycle.json"
 

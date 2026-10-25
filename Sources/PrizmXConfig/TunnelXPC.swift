@@ -14,6 +14,12 @@ import PrizmXProtocols
 @objc public protocol TunnelXPCService {
     /// JSON `TrafficSnapshot` of the last second, or nil until the engine is up.
     func fetchMetrics(reply: @escaping (Data?) -> Void)
+
+    /// JSON `[LoopbackClient]`: the local clients of the app's mixed-port
+    /// listeners, read from the socket table when asked. Root sees the
+    /// sockets of every process; the app does not. nil until the tunnel
+    /// is up.
+    func fetchProxyClients(reply: @escaping (Data?) -> Void)
 }
 
 public enum TunnelXPC: Sendable {

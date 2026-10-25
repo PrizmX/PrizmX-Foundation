@@ -163,7 +163,7 @@ public final class ProcessFlowAttributor: FlowAttributing, @unchecked Sendable {
 
     /// TCP sockets connected to a loopback `listenPorts` (the app's
     /// mixed-port listeners), with their owners. Re-reads the table. The root
-    /// tunnel publishes these for the app (`ProxyClientStore`).
+    /// tunnel answers for the app over XPC (`TunnelXPCService`).
     public func loopbackClients(listenPorts: Set<UInt16>) -> [LoopbackClient] {
         guard !listenPorts.isEmpty else { return [] }
         let owners = lock.withLock { state -> [SocketOwner] in
