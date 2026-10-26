@@ -110,7 +110,8 @@ private func anytlsNode(id: String, host: String, port: UInt16) -> OutboundNode 
     #expect(parsed?.endpoint.port == 80)
     #expect(parsed?.https == false)
     let body = String(data: parsed?.payload ?? Data(), encoding: .utf8) ?? ""
-    #expect(body.contains("GET /generate_204 HTTP/1.1"))
+    #expect(body.contains("HEAD /generate_204 HTTP/1.1"))
+    #expect(!body.lowercased().contains("connection: close"))
     #expect(body.contains("Host: www.gstatic.com"))
     #expect(URLTestProber.request(for: URL(string: "https://example.com/")!)?.https == true)
     let hello = URLTestProber.tlsClientHello(sni: "example.com")
@@ -138,12 +139,47 @@ private func anytlsNode(id: String, host: String, port: UInt16) -> OutboundNode 
 @Test func urlTestProbeMeasuresRespondingConnection() async {
     let peer = ScriptedOutbound(halfClose: false)
     peer.feed(Data("HTTP/1.1 204 No Content\r\n\r\n".utf8))
+    peer.feed(Data("HTTP/1.1 204 No Content\r\n\r\n".utf8))
     let result = await URLTestProber.probe(
         connection: peer,
         url: URL(string: "http://probe.example/generate_204")!,
         timeout: .seconds(5)
     )
     #expect(result != nil)
+    // Surge-style: a second HEAD on the kept-alive connection is the score.
+    let sent = String(data: peer.received, encoding: .utf8) ?? ""
+    #expect(sent.components(separatedBy: "HEAD /generate_204").count == 3)
+}
+
+/// A server that closes after one reply scores the full first round, as
+/// does a second round that never answers before the deadline.
+@Test func urlTestProbeFallsBackToFirstRound() async {
+    let closing = ScriptedOutbound(halfClose: false)
+    closing.feed(Data("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".utf8))
+    let closed = await URLTestProber.probe(
+        connection: closing,
+        url: URL(string: "http://probe.example/generate_204")!,
+        timeout: .seconds(5)
+    )
+    #expect(closed != nil)
+    let sent = String(data: closing.received, encoding: .utf8) ?? ""
+    #expect(sent.components(separatedBy: "HEAD /generate_204").count == 2)
+
+    let silent = ScriptedOutbound(halfClose: false)
+    silent.feed(Data("HTTP/1.1 204 No Content\r\n\r\n".utf8))
+    let stuck = await URLTestProber.probe(
+        connection: silent,
+        url: URL(string: "http://probe.example/generate_204")!,
+        timeout: .milliseconds(150)
+    )
+    #expect(stuck != nil)
+}
+
+@Test func urlTestProbeReadsKeepAlive() {
+    #expect(URLTestProber.keepsAlive(Data("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".utf8)))
+    #expect(!URLTestProber.keepsAlive(Data("HTTP/1.1 204 No Content\r\nConnection: Close\r\n\r\n".utf8)))
+    #expect(!URLTestProber.keepsAlive(Data("HTTP/1.0 204 No Content\r\n\r\n".utf8)))
+    #expect(URLTestProber.keepsAlive(Data("HTTP/1.0 204 No Content\r\nConnection: keep-alive\r\n\r\n".utf8)))
 }
 
 @Test func urlTestProbeTreatsEOFAndGarbageAsDead() async {

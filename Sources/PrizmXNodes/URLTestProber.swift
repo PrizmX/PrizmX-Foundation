@@ -2,11 +2,15 @@ import Foundation
 import os
 import PrizmXProtocols
 
-/// Clash/Surge url-test: time a request to `url` through the node.
+/// Surge url-test: time a request to `url` through the node.
 ///
-/// `http://` sends a real GET. `https://` completes a TLS ClientHello with SNI
-/// and waits for a ServerHello (full inner HTTP-over-TLS is not required to
-/// prove the node can reach the probe host).
+/// `http://` runs two HEAD rounds on one connection, like Surge: the first
+/// pays for DNS, the dial, the proxy handshake and the relay's connect to the
+/// probe host; the score is the second, a plain round trip. When the server
+/// won't keep the connection alive, the score is the first round's full time.
+/// `https://` completes a TLS ClientHello with SNI and waits for a ServerHello
+/// (full inner HTTP-over-TLS is not required to prove the node can reach the
+/// probe host); its single round includes the setup.
 /// UI delay test (Clash "delay"): the same request url-test groups send,
 /// through `node`. Bind `DNSClient.current` so node hostnames resolve.
 public enum NodeDelayTest: Sendable {
@@ -39,7 +43,8 @@ enum URLTestProber: Sendable {
         url: URL,
         timeout: Duration
     ) async -> Duration? {
-        let work = Task { await run(connection: connection, url: url) }
+        let firstRound = OSAllocatedUnfairLock<Duration?>(initialState: nil)
+        let work = Task { await run(connection: connection, url: url, firstRound: firstRound) }
         let outcome: Duration?? = await withCheckedContinuation { continuation in
             let slot = OSAllocatedUnfairLock<CheckedContinuation<Duration??, Never>?>(initialState: continuation)
             let take: @Sendable () -> CheckedContinuation<Duration??, Never>? = {
@@ -62,7 +67,8 @@ enum URLTestProber: Sendable {
         guard let finished = outcome else {
             work.cancel()
             Task { await connection.close() }
-            return nil
+            // A second round stuck past the deadline still leaves a score.
+            return firstRound.withLock { $0 }
         }
         return finished
     }
@@ -85,7 +91,7 @@ enum URLTestProber: Sendable {
         if let query = url.query, !query.isEmpty {
             path += "?\(query)"
         }
-        let header = "GET \(path) HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\nUser-Agent: PrizmX/url-test\r\n\r\n"
+        let header = "HEAD \(path) HTTP/1.1\r\nHost: \(host)\r\nUser-Agent: PrizmX/url-test\r\n\r\n"
         return (endpoint, Data(header.utf8), false)
     }
 
@@ -96,7 +102,44 @@ enum URLTestProber: Sendable {
         return data.prefix(prefix.count).elementsEqual(prefix.prefix(data.count))
     }
 
-    private static func run(connection: any OutboundConnection, url: URL) async -> Duration? {
+    /// The response head of a HEAD request, read up to its blank line.
+    /// `nil` on EOF, a non-HTTP reply, or bytes past the head (a body the
+    /// server should not have sent leaves the connection unusable).
+    static func readResponseHead(from connection: any OutboundConnection) async throws -> Data? {
+        let terminator = Data("\r\n\r\n".utf8)
+        var head = Data()
+        while head.count < 16 * 1024 {
+            let chunk = try await connection.readData(upTo: 4096)
+            // EOF proves nothing: Shadowsocks, for one, accepts the stream
+            // before reaching the target and just closes when it cannot.
+            guard !chunk.isEmpty else { return nil }
+            head.append(chunk)
+            guard isHTTPResponseStart(head) else { return nil }
+            if let end = head.range(of: terminator) {
+                return end.upperBound == head.endIndex ? head : nil
+            }
+        }
+        return nil
+    }
+
+    /// HTTP/1.1 keeps the connection unless told to close; 1.0 only on request.
+    static func keepsAlive(_ head: Data) -> Bool {
+        guard let text = String(data: head, encoding: .isoLatin1) else { return false }
+        let lines = text.lowercased().components(separatedBy: "\r\n")
+        let connection = lines.dropFirst()
+            .first { $0.hasPrefix("connection:") }
+            .map { $0.dropFirst("connection:".count).trimmingCharacters(in: .whitespaces) }
+        if lines.first?.hasPrefix("http/1.1") == true {
+            return connection != "close"
+        }
+        return connection == "keep-alive"
+    }
+
+    private static func run(
+        connection: any OutboundConnection,
+        url: URL,
+        firstRound: OSAllocatedUnfairLock<Duration?>
+    ) async -> Duration? {
         guard let request = request(for: url) else { return nil }
         let start = ContinuousClock.now
         do {
@@ -113,19 +156,28 @@ enum URLTestProber: Sendable {
                 }
             } else if let payload = request.payload {
                 try await connection.writeAll(payload)
-                // EOF proves nothing: Shadowsocks, for one, accepts the stream
-                // before reaching the target and just closes when it cannot.
-                let response = try await connection.readData(upTo: 256)
-                guard isHTTPResponseStart(response) else {
+                guard let head = try await readResponseHead(from: connection) else {
                     await connection.close()
                     return nil
                 }
+                let first = ContinuousClock.now - start
+                firstRound.withLock { $0 = first }
+                guard keepsAlive(head) else {
+                    await connection.close()
+                    return first
+                }
+                let second = ContinuousClock.now
+                try await connection.writeAll(payload)
+                let reply = try await connection.readData(upTo: 256)
+                let elapsed = ContinuousClock.now - second
+                await connection.close()
+                return isHTTPResponseStart(reply) ? elapsed : first
             }
             await connection.close()
             return ContinuousClock.now - start
         } catch {
             await connection.close()
-            return nil
+            return firstRound.withLock { $0 }
         }
     }
 
