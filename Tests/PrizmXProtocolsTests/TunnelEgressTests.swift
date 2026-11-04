@@ -48,6 +48,12 @@ struct TunnelEgressTests {
     /// comes back usable over it. Loopback stands in for the utun: the dial
     /// is either kept off it, or refused once ready (and counted as a loop).
     @Test func aDialOverTheAvoidedInterfaceIsNeverUsable() async throws {
+        try await TunnelEgress.$loopbackStandsInForTheTunnel.withValue(true) {
+            try await dialOverAvoidedLoopbackIsNeverUsable()
+        }
+    }
+
+    private func dialOverAvoidedLoopbackIsNeverUsable() async throws {
         TunnelEgress.avoid(nil)
         let listener = try NWListener(using: .tcp)
         listener.newConnectionHandler = { $0.start(queue: .global()) }
@@ -76,6 +82,12 @@ struct TunnelEgressTests {
     /// stays recognizable after its socket closes, for the tunnel-side
     /// check; in the app (a client of the tunnel) nothing is refused.
     @Test func extensionRemembersRefusedDialsAndTheAppRefusesNone() async throws {
+        try await TunnelEgress.$loopbackStandsInForTheTunnel.withValue(true) {
+            try await extensionRemembersRefusedDials()
+        }
+    }
+
+    private func extensionRemembersRefusedDials() async throws {
         TunnelEgress.avoid(nil)
         let listener = try NWListener(using: .tcp)
         listener.newConnectionHandler = { $0.start(queue: .global()) }

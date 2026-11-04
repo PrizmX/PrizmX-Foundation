@@ -44,8 +44,11 @@ private func sampleGeoIPData() -> Data {
             precondition(matcher.lookup(ipv4: address) == "CN")
         }
     }
-    // Debug-build budget: a few microseconds per walk (release is typically < 1 µs).
-    #expect(elapsed < .milliseconds(250))
+    // Regression net, not a microbenchmark: a debug walk is a few microseconds
+    // (release is typically < 1 µs), but a loaded CI runner has blown a 250 ms
+    // budget. A walk that became linear or touched disk would miss this by
+    // seconds.
+    #expect(elapsed < .seconds(2))
 }
 
 @Test func geoIPRouterSplitsDomesticTraffic() throws {

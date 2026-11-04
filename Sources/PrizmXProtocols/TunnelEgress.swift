@@ -91,12 +91,21 @@ public enum TunnelEgress {
         }
     }
 
+    /// Loopback stands in for the utun only in the test that sets this.
+    /// The production tunnel is never loopback, and other tests dial `::1`
+    /// while a suite avoids `lo0`. Counting those dials as loops fails them
+    /// when the suite runs in parallel, as CI does.
+    @TaskLocal static var loopbackStandsInForTheTunnel = false
+
     /// Checked when a connection is ready: false when, in the extension, it
     /// still runs through the avoided interface. The caller then fails the
     /// dial, so the flow it would open in the tunnel never starts another
     /// round.
     public static func admits(_ path: NWPath?, peer: @autoclosure () -> String) -> Bool {
-        guard let path, let used = path.availableInterfaces.first?.name else { return true }
+        guard let path, let iface = path.availableInterfaces.first else { return true }
+        let used = iface.name
+        let isLoopback = iface.type == .loopback
+        let countLoopback = loopbackStandsInForTheTunnel
         let key = refusedKey(path)
         let (looped, firstUse) = state.withLockUnchecked { state -> (Bool, Bool) in
             guard let name = state.name else { return (false, false) }
@@ -104,6 +113,8 @@ public enum TunnelEgress {
                 // The app's dial was prepared before the tunnel took the
                 // default route, or targets FakeIP: routed twice, not looped.
                 if state.isClient { return (false, false) }
+                // `lo0` is the test stand-in, not a tunnel another dial fell into.
+                if isLoopback, !countLoopback { return (false, false) }
                 if let key {
                     let now = ContinuousClock.now
                     state.refused = state.refused.filter { now - $0.value < refusedTTL }
