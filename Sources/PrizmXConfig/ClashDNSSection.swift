@@ -155,7 +155,10 @@ public struct ClashDNSSection: Sendable, Equatable {
             warn("enhanced-mode", "\(mode) is not supported; TUN always answers with fake IPs")
         }
         if dns.mapping?["fake-ip-range"] != nil {
-            warn("fake-ip-range", "ignored; fake IPs come from 198.18.0.0/16")
+            let range = dns.string(for: "fake-ip-range")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if range != "198.18.0.0/16" && range != "198.18.0.1/16" {
+                warn("fake-ip-range", "ignored; fake IPs come from 198.18.0.0/16")
+            }
         }
         if let mode = dns.string(for: "fake-ip-filter-mode"), mode.lowercased() != "blacklist" {
             warn("fake-ip-filter-mode", "\(mode) is not supported; fake-ip-filter lists names that skip fake IPs")
