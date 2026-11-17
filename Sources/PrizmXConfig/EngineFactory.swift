@@ -47,7 +47,8 @@ public enum EngineFactory: Sendable {
         }
 
         let dnsSection = configText.flatMap { ClashDNSSection.parse(from: $0) }
-        let overrideDNS = overrideDNS ?? DNSPreferenceStore.load().overrideDNS
+        let dnsPrefs = DNSPreferenceStore.load()
+        let overrideDNS = overrideDNS ?? dnsPrefs.overrideDNS
 
         // Geo data first: the DNS section (nameserver-policy, fallback-filter)
         // uses it as well as the rules. Nested rules count too: AND / OR /
@@ -80,8 +81,11 @@ public enum EngineFactory: Sendable {
             return domain.lowercased()
         }
         var seenFilters = Set(dnsSettings.fakeIPFilter)
+        let customFilters = dnsPrefs.fakeIPFilters
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         dnsSettings.fakeIPFilter.append(
-            contentsOf: nodeHosts.filter { seenFilters.insert($0).inserted }
+            contentsOf: (nodeHosts + customFilters).filter { seenFilters.insert($0).inserted }
         )
         let dns = DNSClient(
             settings: dnsSettings,

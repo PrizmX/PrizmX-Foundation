@@ -12,9 +12,17 @@ public enum DNSPreferenceStore: Sendable {
 
     public struct State: Sendable, Codable, Equatable {
         public var overrideDNS: Bool
+        public var fakeIPFilters: [String]
 
-        public init(overrideDNS: Bool = false) {
+        public init(overrideDNS: Bool = false, fakeIPFilters: [String] = []) {
             self.overrideDNS = overrideDNS
+            self.fakeIPFilters = fakeIPFilters
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            overrideDNS = try container.decodeIfPresent(Bool.self, forKey: .overrideDNS) ?? false
+            fakeIPFilters = try container.decodeIfPresent([String].self, forKey: .fakeIPFilters) ?? []
         }
     }
 
