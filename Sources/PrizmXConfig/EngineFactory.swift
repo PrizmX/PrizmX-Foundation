@@ -64,8 +64,16 @@ public enum EngineFactory: Sendable {
             ClashConfigParser.ruleSets(named: dnsSection?.ruleSetNames ?? [], configText: $0)
         } ?? [:]
 
+        var mergedDNSSection = dnsSection
+        if !overlay.hosts.isEmpty {
+            var section = mergedDNSSection ?? ClashDNSSection()
+            for (domain, addrs) in overlay.hosts {
+                section.hosts[domain] = addrs
+            }
+            mergedDNSSection = section
+        }
         var dnsSettings = DNSSettings.fromClash(
-            section: dnsSection,
+            section: mergedDNSSection,
             systemDNS: systemDNS,
             overrideDNS: overrideDNS,
             matchers: DNSMatchers(geoIP: geoIP, geosite: geosite, ruleSets: dnsRuleSets)
@@ -81,7 +89,7 @@ public enum EngineFactory: Sendable {
             return domain.lowercased()
         }
         var seenFilters = Set(dnsSettings.fakeIPFilter)
-        let customFilters = dnsPrefs.fakeIPFilters
+        let customFilters = (dnsPrefs.fakeIPFilters + overlay.fakeIPFilters)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         dnsSettings.fakeIPFilter.append(

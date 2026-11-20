@@ -27,17 +27,35 @@ public struct ScriptRequest: Sendable, Hashable {
     /// Injected as `$argument` when non-nil.
     public var argument: String?
     public var timeout: TimeInterval
+    /// Optional per-run environment override (e.g. fresh `$network` snapshot).
+    public var environment: ScriptEnvironmentContext?
 
     public init(
         name: String = "script",
         source: String,
         argument: String? = nil,
-        timeout: TimeInterval = ScriptEngine.defaultTimeout
+        timeout: TimeInterval = ScriptEngine.defaultTimeout,
+        environment: ScriptEnvironmentContext? = nil
     ) {
         self.name = name
         self.source = source
         self.argument = argument
         self.timeout = timeout
+        self.environment = environment
+    }
+
+    public static func == (lhs: ScriptRequest, rhs: ScriptRequest) -> Bool {
+        lhs.name == rhs.name
+            && lhs.source == rhs.source
+            && lhs.argument == rhs.argument
+            && lhs.timeout == rhs.timeout
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(source)
+        hasher.combine(argument)
+        hasher.combine(timeout)
     }
 }
 
@@ -67,9 +85,12 @@ public final class ScriptEngine: @unchecked Sendable {
     /// Upper bound for one `setTimeout` delay.
     public static let maxTimerDelay: TimeInterval = 60
 
+    public let environment: ScriptEnvironmentContext
     private let sessions = OSAllocatedUnfairLock(initialState: [ObjectIdentifier: Session]())
 
-    public init() {}
+    public init(environment: ScriptEnvironmentContext = .default) {
+        self.environment = environment
+    }
 
     public func evaluate(source: String, name: String = "script") async throws -> ScriptResult {
         try await evaluate(ScriptRequest(name: name, source: source))
@@ -106,6 +127,7 @@ public final class ScriptEngine: @unchecked Sendable {
 
         let session = Session(
             request: request,
+            environment: request.environment ?? environment,
             source: source,
             context: context,
             queue: queue,
@@ -192,6 +214,7 @@ private final class RunState: @unchecked Sendable {
 /// One `JSContext`. All methods except `state.finish` run on the engine queue.
 private final class Session: @unchecked Sendable {
     let request: ScriptRequest
+    let environment: ScriptEnvironmentContext
     let source: String
     let context: JSContext
     let queue: DispatchQueue
@@ -205,10 +228,13 @@ private final class Session: @unchecked Sendable {
     /// Callbacks live here, not in the work items: a cancelled work item
     /// stays queued until its deadline and must not pin the JS value.
     private var timers: [UInt32: (work: DispatchWorkItem, callback: JSValue)] = [:]
+    private var nextHTTPTask: UInt32 = 1
+    private var httpTasks: [UInt32: (task: Task<Void, Never>, callback: JSValue)] = [:]
     private var calledDone = false
 
     init(
         request: ScriptRequest,
+        environment: ScriptEnvironmentContext,
         source: String,
         context: JSContext,
         queue: DispatchQueue,
@@ -216,6 +242,7 @@ private final class Session: @unchecked Sendable {
         engine: ScriptEngine
     ) {
         self.request = request
+        self.environment = environment
         self.source = source
         self.context = context
         self.queue = queue
@@ -249,6 +276,38 @@ private final class Session: @unchecked Sendable {
         context.setObject(unsafeBitCast(setTimeout, to: AnyObject.self), forKeyedSubscript: "$__setTimeout" as NSString)
         context.setObject(unsafeBitCast(clearTimeout, to: AnyObject.self), forKeyedSubscript: "$__clearTimeout" as NSString)
 
+        let httpCall: @convention(block) (String?, JSValue?, JSValue?) -> Void = { [weak self] method, options, callback in
+            self?.startHTTP(method: method ?? "GET", options: options, callback: callback)
+        }
+        let storeRead: @convention(block) (String?) -> Any? = { [weak self] key in
+            guard let self, let key, !key.isEmpty else { return NSNull() }
+            return self.environment.persistentStore.read(key: key) ?? NSNull()
+        }
+        let storeWrite: @convention(block) (JSValue?, String?) -> Bool = { [weak self] value, key in
+            guard let self, let key, !key.isEmpty else { return false }
+            let stringValue: String?
+            if let value, !value.isUndefined, !value.isNull {
+                stringValue = value.toString()
+            } else {
+                stringValue = nil
+            }
+            return self.environment.persistentStore.write(stringValue, forKey: key)
+        }
+        let notifyPost: @convention(block) (String?, String?, String?) -> Void = { [weak self] title, subtitle, body in
+            guard let self else { return }
+            let t = title ?? ""
+            let s = subtitle ?? ""
+            let b = body ?? ""
+            let summary = [t, s, b].filter { !$0.isEmpty }.joined(separator: " — ")
+            self.logs.append("[notify] \(summary)")
+            self.environment.notificationHandler?(t, s, b)
+        }
+
+        context.setObject(unsafeBitCast(httpCall, to: AnyObject.self), forKeyedSubscript: "$__http" as NSString)
+        context.setObject(unsafeBitCast(storeRead, to: AnyObject.self), forKeyedSubscript: "$__storeRead" as NSString)
+        context.setObject(unsafeBitCast(storeWrite, to: AnyObject.self), forKeyedSubscript: "$__storeWrite" as NSString)
+        context.setObject(unsafeBitCast(notifyPost, to: AnyObject.self), forKeyedSubscript: "$__notify" as NSString)
+
         if let argument = request.argument {
             context.setObject(argument, forKeyedSubscript: "$argument" as NSString)
         }
@@ -262,9 +321,24 @@ private final class Session: @unchecked Sendable {
         context.setObject(
             [
                 "engine": "jsc",
+                "app": "PrizmX",
                 "system": Self.systemName,
+                "version": environment.version,
             ] as NSDictionary,
             forKeyedSubscript: "$environment" as NSString
+        )
+
+        var v4: [String: Any] = [:]
+        if let address = environment.network.v4PrimaryAddress { v4["primaryAddress"] = address }
+        if let iface = environment.network.v4PrimaryInterface { v4["primaryInterface"] = iface }
+        var wifi: [String: Any] = [:]
+        if let ssid = environment.network.wifiSSID { wifi["ssid"] = ssid }
+        context.setObject(
+            [
+                "v4": v4,
+                "wifi": wifi,
+            ] as NSDictionary,
+            forKeyedSubscript: "$network" as NSString
         )
 
         context.evaluateScript(Self.prelude, withSourceURL: URL(string: "prizmx://script/prelude"))
@@ -345,9 +419,112 @@ private final class Session: @unchecked Sendable {
         engine?.drop(self)
     }
 
+    private func startHTTP(method: String, options: JSValue?, callback: JSValue?) {
+        guard !state.isFinished else { return }
+        guard let parsed = Self.parseHTTPRequest(method: method, options: options, fallbackTimeout: request.timeout) else {
+            if let callback, !callback.isUndefined, !callback.isNull {
+                callback.call(withArguments: ["Invalid URL", NSNull(), ""])
+                if let exception = context.exception {
+                    fail(Self.message(from: exception))
+                }
+            }
+            return
+        }
+
+        let id = nextHTTPTask
+        nextHTTPTask = nextHTTPTask == UInt32.max ? 1 : nextHTTPTask + 1
+        pendingWork += 1
+        let handler = environment.httpClient
+        let callbackRef = callback ?? JSValue(undefinedIn: context)!
+        let task = Task.detached(priority: .utility) { [weak self] in
+            let outcome: Result<ScriptHTTPResponse, Error>
+            do {
+                let response = try await handler(parsed)
+                outcome = .success(response)
+            } catch {
+                outcome = .failure(error)
+            }
+            guard let self else { return }
+            self.queue.async { [weak self] in
+                guard let self, !self.state.isFinished,
+                      let entry = self.httpTasks.removeValue(forKey: id)
+                else { return }
+                self.pendingWork = max(0, self.pendingWork - 1)
+                if !entry.callback.isUndefined && !entry.callback.isNull {
+                    switch outcome {
+                    case .success(let response):
+                        let respObj: NSDictionary = [
+                            "status": response.status,
+                            "statusCode": response.status,
+                            "headers": response.headers,
+                        ]
+                        entry.callback.call(withArguments: [NSNull(), respObj, response.body])
+                    case .failure(let error):
+                        entry.callback.call(withArguments: [error.localizedDescription, NSNull(), ""])
+                    }
+                    if let exception = self.context.exception {
+                        self.fail(Self.message(from: exception))
+                        return
+                    }
+                }
+                self.finishIfIdle()
+            }
+        }
+        httpTasks[id] = (task, callbackRef)
+    }
+
+    private static func parseHTTPRequest(
+        method: String,
+        options: JSValue?,
+        fallbackTimeout: TimeInterval
+    ) -> ScriptHTTPRequest? {
+        guard let options, !options.isUndefined, !options.isNull else { return nil }
+        let urlString: String
+        var headers: [String: String] = [:]
+        var body: Data?
+        var timeout = fallbackTimeout
+
+        if options.isString {
+            urlString = options.toString() ?? ""
+        } else if let dict = options.toDictionary() {
+            urlString = (dict["url"] as? String) ?? ""
+            if let rawHeaders = dict["headers"] as? [AnyHashable: Any] {
+                for (key, value) in rawHeaders {
+                    headers[String(describing: key)] = String(describing: value)
+                }
+            }
+            if let bodyString = dict["body"] as? String {
+                body = Data(bodyString.utf8)
+            } else if let bodyObj = dict["body"], JSONSerialization.isValidJSONObject(bodyObj) {
+                body = try? JSONSerialization.data(withJSONObject: bodyObj)
+            }
+            if let rawTimeout = dict["timeout"] as? Double, rawTimeout.isFinite, rawTimeout > 0 {
+                timeout = rawTimeout
+            }
+        } else {
+            return nil
+        }
+
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https"
+        else { return nil }
+
+        return ScriptHTTPRequest(
+            method: method.uppercased(),
+            url: url,
+            headers: headers,
+            body: body,
+            timeout: timeout
+        )
+    }
+
     private func cancelTimers() {
         for entry in timers.values { entry.work.cancel() }
         timers.removeAll()
+        for entry in httpTasks.values { entry.task.cancel() }
+        httpTasks.removeAll()
         pendingWork = 0
     }
 
@@ -388,6 +565,31 @@ private final class Session: @unchecked Sendable {
       };
       globalThis.setTimeout = function (fn, ms) { return $__setTimeout(fn, Number(ms) || 0); };
       globalThis.clearTimeout = function (id) { $__clearTimeout(id); };
+      globalThis.$httpClient = {
+        get: function (opts, cb) { $__http("GET", opts, cb); },
+        post: function (opts, cb) { $__http("POST", opts, cb); },
+        put: function (opts, cb) { $__http("PUT", opts, cb); },
+        delete: function (opts, cb) { $__http("DELETE", opts, cb); },
+        head: function (opts, cb) { $__http("HEAD", opts, cb); }
+      };
+      globalThis.$persistentStore = {
+        read: function (key) {
+          var v = $__storeRead(String(key));
+          return v === null ? null : String(v);
+        },
+        write: function (value, key) {
+          return Boolean($__storeWrite(value, String(key)));
+        }
+      };
+      globalThis.$notification = {
+        post: function (title, subtitle, body) {
+          $__notify(
+            title === undefined || title === null ? "" : String(title),
+            subtitle === undefined || subtitle === null ? "" : String(subtitle),
+            body === undefined || body === null ? "" : String(body)
+          );
+        }
+      };
     })();
     """
 }

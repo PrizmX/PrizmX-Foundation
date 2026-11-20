@@ -15,17 +15,57 @@ public struct ProfileOverlay: Sendable, Hashable, Codable, Equatable {
     public var version: Int
     public var rules: [OverlayRule]
     public var groups: [OverlayGroup]
+    /// Static host overrides contributed by enabled Modules.
+    public var hosts: [String: [String]]
+    /// Extra FakeIP bypass patterns contributed by enabled Modules.
+    public var fakeIPFilters: [String]
 
-    public var isEmpty: Bool { rules.isEmpty && groups.isEmpty }
+    public var isEmpty: Bool {
+        rules.isEmpty && groups.isEmpty && hosts.isEmpty && fakeIPFilters.isEmpty
+    }
 
     public init(
         version: Int = ProfileOverlay.currentVersion,
         rules: [OverlayRule] = [],
-        groups: [OverlayGroup] = []
+        groups: [OverlayGroup] = [],
+        hosts: [String: [String]] = [:],
+        fakeIPFilters: [String] = []
     ) {
         self.version = version
         self.rules = rules
         self.groups = groups
+        self.hosts = hosts
+        self.fakeIPFilters = fakeIPFilters
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case version, rules, groups, hosts, fakeIPFilters
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decodeIfPresent(Int.self, forKey: .version) ?? Self.currentVersion
+        rules = try c.decodeIfPresent([OverlayRule].self, forKey: .rules) ?? []
+        groups = try c.decodeIfPresent([OverlayGroup].self, forKey: .groups) ?? []
+        hosts = try c.decodeIfPresent([String: [String]].self, forKey: .hosts) ?? [:]
+        fakeIPFilters = try c.decodeIfPresent([String].self, forKey: .fakeIPFilters) ?? []
+    }
+
+    /// Combines two overlays where `self` takes precedence over `other`.
+    public func merging(_ other: ProfileOverlay) -> ProfileOverlay {
+        var mergedHosts = other.hosts
+        for (domain, addrs) in hosts {
+            mergedHosts[domain] = addrs
+        }
+        var seen = Set<String>()
+        let mergedFilters = (fakeIPFilters + other.fakeIPFilters).filter { seen.insert($0).inserted }
+        return ProfileOverlay(
+            version: max(version, other.version),
+            rules: rules + other.rules,
+            groups: other.groups + groups,
+            hosts: mergedHosts,
+            fakeIPFilters: mergedFilters
+        )
     }
 
     /// Prepends overlay rules and merges overlay groups onto a parsed body.

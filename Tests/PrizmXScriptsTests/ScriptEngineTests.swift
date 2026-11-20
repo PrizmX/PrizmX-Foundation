@@ -2,6 +2,91 @@ import Foundation
 import Testing
 import PrizmXScripts
 
+@Test func httpClientGetAndPostRoundTrip() async throws {
+    let env = ScriptEnvironmentContext(
+        httpClient: { req in
+            let bodyText = req.body.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            return ScriptHTTPResponse(
+                status: 201,
+                headers: ["X-Method": req.method],
+                body: "\(req.method):\(req.url.path):\(req.headers["X-Test"] ?? "")|\(bodyText)"
+            )
+        }
+    )
+    let engine = ScriptEngine(environment: env)
+    let result = try await engine.evaluate(ScriptRequest(
+        name: "http-test",
+        source: """
+        $httpClient.post({
+          url: "https://example.com/ping",
+          headers: { "X-Test": "ok" },
+          body: "hello"
+        }, function(err, resp, data) {
+          if (err) { $done({ err: err }); return; }
+          $done({ status: resp.status, header: resp.headers["X-Method"], data: data });
+        });
+        """,
+        timeout: 2
+    ))
+    #expect(result.value == .object([
+        "status": .number(201),
+        "header": .string("POST"),
+        "data": .string("POST:/ping:ok|hello"),
+    ]))
+}
+
+@Test func persistentStorePersistsAcrossRuns() async throws {
+    let store = InMemoryScriptPersistentStore()
+    let env = ScriptEnvironmentContext(persistentStore: store)
+    let engine = ScriptEngine(environment: env)
+
+    _ = try await engine.evaluate(source: #"$done($persistentStore.write("42", "answer"))"#)
+    let second = try await engine.evaluate(source: #"$done($persistentStore.read("answer"))"#)
+    #expect(second.value == .string("42"))
+
+    _ = try await engine.evaluate(source: #"$done($persistentStore.write(null, "answer"))"#)
+    let third = try await engine.evaluate(source: #"$done($persistentStore.read("answer"))"#)
+    #expect(third.value == .null)
+}
+
+@Test func notificationAndNetworkContextExposed() async throws {
+    actor Box { var items: [(String, String, String)] = []; func add(_ x: (String, String, String)) { items.append(x) } }
+    let box = Box()
+    let env = ScriptEnvironmentContext(
+        notificationHandler: { t, s, b in Task { await box.add((t, s, b)) } },
+        network: ScriptNetworkInfo(v4PrimaryAddress: "192.168.1.9", v4PrimaryInterface: "en0", wifiSSID: "HomeWiFi"),
+        version: "0.0.15"
+    )
+    let result = try await ScriptEngine(environment: env).evaluate(
+        source: """
+        $notification.post("Title", "Sub", $network.wifi.ssid + "@" + $network.v4.primaryAddress);
+        $done({ ssid: $network.wifi.ssid, ver: $environment.version });
+        """
+    )
+    #expect(result.value == .object(["ssid": .string("HomeWiFi"), "ver": .string("0.0.15")]))
+    #expect(result.logs == ["[notify] Title — Sub — HomeWiFi@192.168.1.9"])
+}
+
+@Test func cronScheduleMatchesFiveAndSixFieldExpressions() throws {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(secondsFromGMT: 0)!
+    // 2026-11-20 14:30:15 UTC (Friday = weekday 6 in Calendar -> cron 5)
+    let date = DateComponents(calendar: cal, timeZone: cal.timeZone, year: 2026, month: 11, day: 20, hour: 14, minute: 30, second: 15).date!
+
+    let five = try CronSchedule.parse("*/15 14 * * 5")
+    #expect(five.matches(date, calendar: cal))
+
+    let six = try CronSchedule.parse("15 30 14 * * 1-5")
+    #expect(six.matches(date, calendar: cal))
+
+    let miss = try CronSchedule.parse("0 12 * * *")
+    #expect(!miss.matches(date, calendar: cal))
+
+    #expect(throws: CronSchedule.ParseError.invalidFieldCount(3)) {
+        _ = try CronSchedule.parse("* * *")
+    }
+}
+
 @Test func evaluatesLastExpression() async throws {
     let result = try await ScriptEngine().evaluate(source: "1 + 1")
     #expect(result.value == .number(2))
