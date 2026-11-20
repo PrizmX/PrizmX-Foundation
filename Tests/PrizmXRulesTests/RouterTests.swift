@@ -3,6 +3,17 @@ import Testing
 @testable import PrizmXRules
 import PrizmXProtocols
 
+@Test func processIdentityRequirementIncludesNestedRules() {
+    let process = RuleCondition(.processName("Example"))
+    let domain = RuleCondition(.domain("example.com"))
+    let nested = RuleCondition(.not(process))
+    let set = RuleSet(name: "Example", conditions: [domain, nested])
+    #expect(process.matcher.requiresProcessIdentity)
+    #expect(RouteRule.HostMatcher.and([domain, nested]).requiresProcessIdentity)
+    #expect(RouteRule.HostMatcher.ruleSet(set).requiresProcessIdentity)
+    #expect(!RouteRule.HostMatcher.or([domain]).requiresProcessIdentity)
+}
+
 @Test func exactDomainMatch() {
     let router = Router(
         rules: [RouteRule(.domain("ads.example.com"), policy: .reject)],

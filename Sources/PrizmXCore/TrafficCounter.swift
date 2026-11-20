@@ -17,6 +17,23 @@ public struct TrafficByteCount: Sendable, Hashable, Codable, Equatable {
     }
 }
 
+/// One 1-second throughput sample captured inside the tunnel/engine process.
+public struct RateSample: Sendable, Hashable, Codable, Equatable {
+    public var timestamp: Date
+    public var uploadBytesPerSecond: Double
+    public var downloadBytesPerSecond: Double
+
+    public init(
+        timestamp: Date,
+        uploadBytesPerSecond: Double,
+        downloadBytesPerSecond: Double
+    ) {
+        self.timestamp = timestamp
+        self.uploadBytesPerSecond = uploadBytesPerSecond
+        self.downloadBytesPerSecond = downloadBytesPerSecond
+    }
+}
+
 /// Throughput snapshot exchanged over tunnel IPC.
 public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     public var uploadBytesPerSecond: Double
@@ -61,6 +78,9 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
     /// Member each url-test / fallback group currently routes through, as
     /// the engine decided it (the app does not probe and cannot know).
     public var groupSelections: [String: String]
+    /// Rolling 60-second throughput samples retained inside the engine so
+    /// newly launched or resumed UI surfaces immediately render real history.
+    public var rateHistory: [RateSample]
 
     public init(
         uploadBytesPerSecond: Double = 0,
@@ -87,7 +107,8 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         exitBytes: [String: TrafficByteCount] = [:],
         exitTCPBytes: [String: UInt64] = [:],
         exitUDPBytes: [String: UInt64] = [:],
-        groupSelections: [String: String] = [:]
+        groupSelections: [String: String] = [:],
+        rateHistory: [RateSample] = []
     ) {
         self.uploadBytesPerSecond = uploadBytesPerSecond
         self.downloadBytesPerSecond = downloadBytesPerSecond
@@ -114,6 +135,7 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         self.exitTCPBytes = exitTCPBytes
         self.exitUDPBytes = exitUDPBytes
         self.groupSelections = groupSelections
+        self.rateHistory = rateHistory
     }
 
     public static let zero = TrafficSnapshot()
@@ -175,8 +197,33 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
             exitTCPBytes: mergeCount(exitTCPBytes, other.exitTCPBytes),
             exitUDPBytes: mergeCount(exitUDPBytes, other.exitUDPBytes),
             // Both engines probe the same groups; this side's (the tunnel's) wins.
-            groupSelections: other.groupSelections.merging(groupSelections) { _, mine in mine }
+            groupSelections: other.groupSelections.merging(groupSelections) { _, mine in mine },
+            rateHistory: Self.mergeRateHistory(rateHistory, other.rateHistory)
         )
+    }
+
+    private static func mergeRateHistory(
+        _ primary: [RateSample],
+        _ secondary: [RateSample]
+    ) -> [RateSample] {
+        if primary.isEmpty { return secondary }
+        if secondary.isEmpty { return primary }
+        let count = max(primary.count, secondary.count)
+        let primaryOffset = count - primary.count
+        let secondaryOffset = count - secondary.count
+        var merged: [RateSample] = []
+        merged.reserveCapacity(count)
+        for idx in 0..<count {
+            let p = idx >= primaryOffset ? primary[idx - primaryOffset] : nil
+            let s = idx >= secondaryOffset ? secondary[idx - secondaryOffset] : nil
+            let timestamp = p?.timestamp ?? s?.timestamp ?? Date()
+            merged.append(RateSample(
+                timestamp: timestamp,
+                uploadBytesPerSecond: (p?.uploadBytesPerSecond ?? 0) + (s?.uploadBytesPerSecond ?? 0),
+                downloadBytesPerSecond: (p?.downloadBytesPerSecond ?? 0) + (s?.downloadBytesPerSecond ?? 0)
+            ))
+        }
+        return Array(merged.suffix(60))
     }
 
     enum CodingKeys: String, CodingKey {
@@ -189,7 +236,7 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         case appTCPBytes, appUDPBytes, domainTCPBytes, domainUDPBytes
         case policyTCPBytes, policyUDPBytes
         case exitBytes, exitTCPBytes, exitUDPBytes
-        case groupSelections
+        case groupSelections, rateHistory
     }
 
     public init(from decoder: Decoder) throws {
@@ -225,6 +272,7 @@ public struct TrafficSnapshot: Sendable, Hashable, Codable, Equatable {
         exitTCPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .exitTCPBytes) ?? [:]
         exitUDPBytes = try container.decodeIfPresent([String: UInt64].self, forKey: .exitUDPBytes) ?? [:]
         groupSelections = try container.decodeIfPresent([String: String].self, forKey: .groupSelections) ?? [:]
+        rateHistory = try container.decodeIfPresent([RateSample].self, forKey: .rateHistory) ?? []
     }
 }
 
@@ -310,6 +358,7 @@ public final class TrafficCounter: Sendable {
         var exitTCP: [String: UInt64] = [:]
         var exitUDP: [String: UInt64] = [:]
         var nextSerial: UInt64 = 0
+        var rateHistory: [RateSample] = []
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: State())
@@ -323,6 +372,8 @@ public final class TrafficCounter: Sendable {
     private let domainCap = 1024
     /// IPC payload bound per snapshot for the ranking maps.
     private let snapshotMapCap = 32
+    /// Rolling 1-second samples retained in the engine process.
+    private let rateHistoryCap = 60
 
     public init() {}
 
@@ -486,6 +537,14 @@ public final class TrafficCounter: Sendable {
             state.sampleAt = now
             state.sampleUp = state.uplinkBytes
             state.sampleDown = state.downlinkBytes
+            state.rateHistory.append(RateSample(
+                timestamp: Date(),
+                uploadBytesPerSecond: upRate,
+                downloadBytesPerSecond: downRate
+            ))
+            if state.rateHistory.count > rateHistoryCap {
+                state.rateHistory.removeFirst(state.rateHistory.count - rateHistoryCap)
+            }
             let topApps = Self.top(state.apps, cap: snapshotMapCap)
             let topDomains = Self.top(state.domains, cap: snapshotMapCap)
             let topPolicies = Self.top(state.policy, cap: snapshotMapCap)
@@ -514,7 +573,8 @@ public final class TrafficCounter: Sendable {
                 policyUDPBytes: Self.slice(state.policyUDP, keys: Set(topPolicies.keys)),
                 exitBytes: topExits,
                 exitTCPBytes: Self.slice(state.exitTCP, keys: Set(topExits.keys)),
-                exitUDPBytes: Self.slice(state.exitUDP, keys: Set(topExits.keys))
+                exitUDPBytes: Self.slice(state.exitUDP, keys: Set(topExits.keys)),
+                rateHistory: state.rateHistory
             )
         }
     }

@@ -65,6 +65,124 @@ public enum GeoAssetStore: Sendable {
         }
     }
 
+    public struct AssetInfo: Sendable, Equatable {
+        public var name: String
+        public var relativePath: String
+        public var exists: Bool
+        public var byteSize: Int64?
+        public var updatedAt: Date?
+
+        public init(
+            name: String,
+            relativePath: String,
+            exists: Bool,
+            byteSize: Int64? = nil,
+            updatedAt: Date? = nil
+        ) {
+            self.name = name
+            self.relativePath = relativePath
+            self.exists = exists
+            self.byteSize = byteSize
+            self.updatedAt = updatedAt
+        }
+    }
+
+    public struct Status: Sendable, Equatable {
+        public var geoIP: AssetInfo
+        public var geosite: AssetInfo
+        public var asn: AssetInfo
+
+        public var all: [AssetInfo] { [geoIP, geosite, asn] }
+    }
+
+    public struct RefreshResult: Sendable, Equatable {
+        public var geoIPUpdated: Bool
+        public var geositeUpdated: Bool
+        public var asnUpdated: Bool
+
+        public var updatedCount: Int {
+            [geoIPUpdated, geositeUpdated, asnUpdated].filter { $0 }.count
+        }
+    }
+
+    /// Reads local file metadata for GeoIP, Geosite and ASN databases without
+    /// loading their payloads into memory.
+    public static func inspectStatus(
+        root: URL? = TunnelConfigStorage.containerURL(),
+        fileManager: FileManager = .default
+    ) -> Status {
+        func info(name: String, relativePath: String) -> AssetInfo {
+            guard let url = root?.appendingPathComponent(relativePath),
+                  fileManager.fileExists(atPath: url.path)
+            else {
+                return AssetInfo(name: name, relativePath: relativePath, exists: false)
+            }
+            let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            return AssetInfo(
+                name: name,
+                relativePath: relativePath,
+                exists: true,
+                byteSize: values?.fileSize.map(Int64.init),
+                updatedAt: values?.contentModificationDate
+            )
+        }
+        return Status(
+            geoIP: info(name: "GeoIP", relativePath: geoIPRelativePath),
+            geosite: info(name: "Geosite", relativePath: geositeRelativePath),
+            asn: info(name: "GeoLite2-ASN", relativePath: asnRelativePath)
+        )
+    }
+
+    /// Forces a fresh validated download of Geo databases into `root`.
+    /// Existing files remain untouched if a download fails.
+    public static func refreshAll(
+        root: URL? = TunnelConfigStorage.containerURL(),
+        sources: Sources = .default,
+        session: URLSession? = nil
+    ) async -> RefreshResult {
+        guard let root else {
+            return RefreshResult(geoIPUpdated: false, geositeUpdated: false, asnUpdated: false)
+        }
+        let ownSession: URLSession?
+        let activeSession: URLSession
+        if let session {
+            ownSession = nil
+            activeSession = session
+        } else {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = 20
+            config.httpAdditionalHeaders = ["Connection": "close"]
+            let created = URLSession(configuration: config)
+            ownSession = created
+            activeSession = created
+        }
+        defer { ownSession?.finishTasksAndInvalidate() }
+
+        async let geoIP = download(
+            to: root.appendingPathComponent(geoIPRelativePath),
+            kind: .geoIP,
+            sources: sources.geoIP,
+            session: activeSession
+        )
+        async let geosite = download(
+            to: root.appendingPathComponent(geositeRelativePath),
+            kind: .geosite,
+            sources: sources.geosite,
+            session: activeSession
+        )
+        async let asn = download(
+            to: root.appendingPathComponent(asnRelativePath),
+            kind: .asn,
+            sources: sources.asn,
+            session: activeSession
+        )
+        return await RefreshResult(
+            geoIPUpdated: geoIP,
+            geositeUpdated: geosite,
+            asnUpdated: asn
+        )
+    }
+
     /// Ensures the requested databases exist under `root` (App Group by default).
     /// Missing files are downloaded; a failed download leaves that path nil so
     /// the tunnel still starts (those rules simply never match).

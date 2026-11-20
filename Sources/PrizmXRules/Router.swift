@@ -127,6 +127,22 @@ public struct RouteRule: Hashable, Sendable {
         indirect case not(RuleCondition)
         /// `RULE-SET`: a rule provider's payload.
         case ruleSet(RuleSet)
+
+        /// True when any branch depends on process attribution, including under NOT.
+        public var requiresProcessIdentity: Bool {
+            switch self {
+            case .processName, .processPath, .processNameRegex, .processPathRegex:
+                true
+            case .and(let conditions), .or(let conditions):
+                conditions.contains { $0.matcher.requiresProcessIdentity }
+            case .not(let condition):
+                condition.matcher.requiresProcessIdentity
+            case .ruleSet(let set):
+                set.conditions.contains { $0.matcher.requiresProcessIdentity }
+            default:
+                false
+            }
+        }
     }
 
     /// The host matcher.

@@ -525,7 +525,7 @@ public struct ClashConfigParser: ConfigParserProtocol, Sendable {
             ))
             return nil
         }
-        let icon = node.string(for: "icon")
+        let icon = node.string(for: "icon")?.trimmingCharacters(in: .whitespacesAndNewlines)
         return PolicyGroup(
             name: name,
             mode: type.lowercased() == "smart" ? .urlTest : ConfigMapping.groupMode(clashType: type),

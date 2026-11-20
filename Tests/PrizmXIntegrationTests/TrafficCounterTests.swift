@@ -3,6 +3,30 @@ import Testing
 import PrizmXCore
 import PrizmXProtocols
 
+@Test func trafficCounterRetainsRolling60SecondRateHistoryAndMerges() {
+    let counter = TrafficCounter()
+    for i in 0..<70 {
+        counter.addBytes(up: UInt64(i + 1) * 10, down: UInt64(i + 1) * 20, route: FlowRoute(["Proxies"]))
+        _ = counter.snapshot()
+    }
+    let snapshot = counter.snapshot()
+    #expect(snapshot.rateHistory.count == 60)
+    #expect(snapshot.rateHistory.last?.uploadBytesPerSecond ?? 0 >= 0)
+
+    let a = TrafficSnapshot(rateHistory: [
+        RateSample(timestamp: Date(timeIntervalSince1970: 10), uploadBytesPerSecond: 100, downloadBytesPerSecond: 200),
+        RateSample(timestamp: Date(timeIntervalSince1970: 11), uploadBytesPerSecond: 300, downloadBytesPerSecond: 400),
+    ])
+    let b = TrafficSnapshot(rateHistory: [
+        RateSample(timestamp: Date(timeIntervalSince1970: 11), uploadBytesPerSecond: 50, downloadBytesPerSecond: 60),
+    ])
+    let merged = a.merging(b)
+    #expect(merged.rateHistory.count == 2)
+    #expect(merged.rateHistory[0].uploadBytesPerSecond == 100)
+    #expect(merged.rateHistory[1].uploadBytesPerSecond == 350)
+    #expect(merged.rateHistory[1].downloadBytesPerSecond == 460)
+}
+
 @Test func trafficCounterSplitsDirectAndPolicy() {
     let counter = TrafficCounter()
     counter.addBytes(up: 100, down: 900, route: FlowRoute([FlowRoute.direct]))

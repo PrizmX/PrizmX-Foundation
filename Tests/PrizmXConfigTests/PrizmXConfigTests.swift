@@ -80,6 +80,29 @@ private let singboxJSON = """
 private let expectedRuleCount = 5
 private let expectedNodeCount = 2
 
+@Test func clashGroupIconURLParsesPerGroup() throws {
+    let yaml = """
+    proxies:
+      - name: HK-01
+        type: ss
+        server: hk.example.com
+        port: 8388
+        cipher: aes-256-gcm
+        password: test
+    proxy-groups:
+      - name: HBO
+        icon: https://raw.githubusercontent.com/mjk0108/surge-icon/main/HBO_Max.png.png
+        url: http://www.gstatic.com/generate_204
+        type: select
+        proxies:
+          - HK-01
+    rules:
+      - MATCH,HBO
+    """
+    let (_, manager) = try ConfigAdapter.parse(rawString: yaml)
+    #expect(manager.group(named: "HBO")?.iconURL == URL(string: "https://raw.githubusercontent.com/mjk0108/surge-icon/main/HBO_Max.png.png"))
+}
+
 @Test func clashYAMLRestoresRouterAndNodes() throws {
     let (router, nodes) = try ClashConfigParser().parse(rawString: clashYAML)
     #expect(router.rules.count == expectedRuleCount)

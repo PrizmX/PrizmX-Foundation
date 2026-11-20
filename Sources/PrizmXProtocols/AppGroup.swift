@@ -15,7 +15,12 @@ import Foundation
 ///   Foundation iOS target correct for when it gains the tunnel.)
 public enum PrizmXAppGroup: Sendable {
     #if os(macOS)
-    public static let identifier = "N49M3Z72D3.group.app.prizmx"
+    public static let identifier: String = {
+        switch Bundle.main.bundleIdentifier {
+        case "app.prizmx", "app.prizmx.packet-tunnel": "N49M3Z72D3.group.app.prizmx.store"
+        default: "N49M3Z72D3.group.app.prizmx"
+        }
+    }()
     #else
     public static let identifier = "group.app.prizmx"
     #endif
