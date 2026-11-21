@@ -9,18 +9,55 @@ public enum ModuleFormat: String, Sendable, Codable, Equatable, Hashable {
     case stoverride
 }
 
+/// Non-MITM script declared inside a module (cron or network-changed event).
+public struct ModuleScript: Sendable, Equatable, Hashable, Codable {
+    public enum Kind: String, Sendable, Codable, Equatable, Hashable {
+        case cron
+        case event
+    }
+
+    public var name: String
+    public var kind: Kind
+    /// Cron expression (for `.cron`) or event name (for `.event`).
+    public var pattern: String
+    public var scriptURL: URL
+    public var argument: String
+    public var timeout: TimeInterval
+
+    public init(
+        name: String,
+        kind: Kind,
+        pattern: String,
+        scriptURL: URL,
+        argument: String = "",
+        timeout: TimeInterval = 10
+    ) {
+        self.name = name
+        self.kind = kind
+        self.pattern = pattern
+        self.scriptURL = scriptURL
+        self.argument = argument
+        self.timeout = timeout
+    }
+}
+
 /// Parsed representation of one Surge `.sgmodule` or Stash `.stoverride` file.
-/// Non-MITM sections (rules, hosts, fake-ip-filter) are extracted cleanly;
-/// MITM / URL Rewrite / HTTP Script sections are reported in `skipped`.
+/// Non-MITM sections (rules, hosts, fake-ip-filter, cron/event scripts) are
+/// extracted cleanly; MITM / URL Rewrite / HTTP Script sections are reported
+/// in `skipped`.
 public struct ParsedModule: Sendable, Equatable {
     public var format: ModuleFormat
     public var name: String
     public var summary: String
     public var category: String?
+    public var author: String?
+    public var homepage: URL?
     public var defaultArguments: [String: String]
-    public var rules: [OverlayRule]
+    /// Validated Clash/Surge rule lines compiled via `ClashConfigParser.parseRule`.
+    public var rawRules: [String]
     public var hosts: [String: [String]]
     public var fakeIPFilters: [String]
+    public var scripts: [ModuleScript]
     public var skipped: [String]
 
     public init(
@@ -28,28 +65,33 @@ public struct ParsedModule: Sendable, Equatable {
         name: String,
         summary: String = "",
         category: String? = nil,
+        author: String? = nil,
+        homepage: URL? = nil,
         defaultArguments: [String: String] = [:],
-        rules: [OverlayRule] = [],
+        rawRules: [String] = [],
         hosts: [String: [String]] = [:],
         fakeIPFilters: [String] = [],
+        scripts: [ModuleScript] = [],
         skipped: [String] = []
     ) {
         self.format = format
         self.name = name
         self.summary = summary
         self.category = category
+        self.author = author
+        self.homepage = homepage
         self.defaultArguments = defaultArguments
-        self.rules = rules
+        self.rawRules = rawRules
         self.hosts = hosts
         self.fakeIPFilters = fakeIPFilters
+        self.scripts = scripts
         self.skipped = skipped
     }
 
     /// Converts this module's active non-MITM sections into a `ProfileOverlay`.
     public var overlay: ProfileOverlay {
         ProfileOverlay(
-            rules: rules,
-            groups: [],
+            rawRules: rawRules,
             hosts: hosts,
             fakeIPFilters: fakeIPFilters
         )
@@ -111,9 +153,10 @@ public enum ModuleParser: Sendable {
         var name = fallbackName
         var summary = ""
         var category: String?
+        var author: String?
+        var homepage: URL?
         var defaultArgs: [String: String] = [:]
 
-        // First pass: extract #! metadata & default arguments.
         for rawLine in text.split(whereSeparator: { $0.isNewline }) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard line.hasPrefix("#!") else { continue }
@@ -128,6 +171,10 @@ public enum ModuleParser: Sendable {
                 summary = val
             case "category":
                 if !val.isEmpty { category = val }
+            case "author":
+                if !val.isEmpty { author = val }
+            case "homepage":
+                homepage = URL(string: val)
             case "arguments":
                 for pair in val.split(separator: ",") {
                     guard let colon = pair.firstIndex(of: ":") else { continue }
@@ -142,11 +189,13 @@ public enum ModuleParser: Sendable {
 
         let effectiveArgs = defaultArgs.merging(argumentOverrides) { _, override in override }
         let expanded = substituteArguments(effectiveArgs, in: text)
+        let ruleParser = ClashConfigParser()
 
         var section = ""
-        var rules: [OverlayRule] = []
+        var rawRules: [String] = []
         var hosts: [String: [String]] = [:]
         var fakeIPFilters: [String] = []
+        var scripts: [ModuleScript] = []
         var skipped: [String] = []
         var skippedSections = Set<String>()
 
@@ -164,8 +213,9 @@ public enum ModuleParser: Sendable {
 
             switch section {
             case "rule":
-                if let rule = parseRuleLine(line) {
-                    rules.append(rule)
+                let normalizedRule = normalizeSurgeRule(line)
+                if (try? ruleParser.parseRule(normalizedRule)) != nil {
+                    rawRules.append(normalizedRule)
                 } else {
                     skipped.append("[Rule] unsupported: \(line)")
                 }
@@ -188,6 +238,13 @@ public enum ModuleParser: Sendable {
                         }
                     }
                 }
+            case "script":
+                switch parseSurgeScriptLine(line) {
+                case .parsed(let script):
+                    scripts.append(script)
+                case .skipped(let reason):
+                    skipped.append(reason)
+                }
             case "mitm":
                 if skippedSections.insert("mitm").inserted {
                     skipped.append("[MITM] skipped (requires MITM / PrizmX Pro)")
@@ -195,10 +252,6 @@ public enum ModuleParser: Sendable {
             case "url rewrite", "header rewrite", "body rewrite", "map local":
                 if skippedSections.insert(section).inserted {
                     skipped.append("[\(section)] skipped (requires MITM / PrizmX Pro)")
-                }
-            case "script":
-                if skippedSections.insert("script").inserted {
-                    skipped.append("[Script] in modules requires MITM or manual script import")
                 }
             default:
                 break
@@ -210,10 +263,13 @@ public enum ModuleParser: Sendable {
             name: name,
             summary: summary,
             category: category,
+            author: author,
+            homepage: homepage,
             defaultArguments: defaultArgs,
-            rules: rules,
+            rawRules: rawRules,
             hosts: hosts,
-            fakeIPFilters: Array(NSOrderedSet(array: fakeIPFilters)) as? [String] ?? fakeIPFilters,
+            fakeIPFilters: deduplicate(fakeIPFilters),
+            scripts: scripts,
             skipped: skipped
         )
     }
@@ -239,8 +295,11 @@ public enum ModuleParser: Sendable {
         let name = root.string(for: "name") ?? fallbackName
         let summary = root.string(for: "desc") ?? root.string(for: "description") ?? ""
         let category = root.string(for: "category")
+        let author = root.string(for: "author")
+        let homepage = root.string(for: "homepage").flatMap(URL.init(string:))
+        let ruleParser = ClashConfigParser()
 
-        var rules: [OverlayRule] = []
+        var rawRules: [String] = []
         var hosts: [String: [String]] = [:]
         var fakeIPFilters: [String] = []
         var skipped: [String] = []
@@ -248,8 +307,9 @@ public enum ModuleParser: Sendable {
         if let ruleList = map["rules"]?.sequence {
             for item in ruleList {
                 guard let line = item.string?.trimmingCharacters(in: .whitespaces), !line.isEmpty else { continue }
-                if let rule = parseRuleLine(line) {
-                    rules.append(rule)
+                let normalizedRule = normalizeSurgeRule(line)
+                if (try? ruleParser.parseRule(normalizedRule)) != nil {
+                    rawRules.append(normalizedRule)
                 } else {
                     skipped.append("rules: unsupported \(line)")
                 }
@@ -287,8 +347,8 @@ public enum ModuleParser: Sendable {
                 skipped.append("http.script skipped (requires MITM / PrizmX Pro)")
             }
         }
-        if map["script-providers"] != nil || map["tiles"] != nil {
-            skipped.append("script-providers/tiles skipped")
+        if map["tiles"] != nil {
+            skipped.append("tiles skipped")
         }
 
         return ParsedModule(
@@ -296,15 +356,108 @@ public enum ModuleParser: Sendable {
             name: name,
             summary: summary,
             category: category,
+            author: author,
+            homepage: homepage,
             defaultArguments: [:],
-            rules: rules,
+            rawRules: rawRules,
             hosts: hosts,
-            fakeIPFilters: fakeIPFilters,
+            fakeIPFilters: deduplicate(fakeIPFilters),
+            scripts: [],
             skipped: skipped
         )
     }
 
     // MARK: - Helpers
+
+    private enum ScriptLineResult {
+        case parsed(ModuleScript)
+        case skipped(String)
+    }
+
+    private static func parseSurgeScriptLine(_ line: String) -> ScriptLineResult {
+        guard let eq = line.firstIndex(of: "=") else {
+            return .skipped("[Script] malformed: \(line)")
+        }
+        let name = line[..<eq].trimmingCharacters(in: .whitespaces)
+        let rhs = String(line[line.index(after: eq)...])
+        let params = parseKeyValueList(rhs)
+        let type = (params["type"] ?? "").lowercased()
+
+        switch type {
+        case "http-request", "http-response":
+            return .skipped("[Script] \(name) skipped (requires MITM / PrizmX Pro)")
+        case "cron":
+            guard let urlStr = params["script-path"], let url = URL(string: urlStr),
+                  let cronExp = params["cronexp"], !cronExp.isEmpty
+            else {
+                return .skipped("[Script] \(name) missing script-path or cronexp")
+            }
+            let timeout = params["timeout"].flatMap(TimeInterval.init) ?? 10
+            return .parsed(ModuleScript(
+                name: name,
+                kind: .cron,
+                pattern: cronExp,
+                scriptURL: url,
+                argument: params["argument"] ?? "",
+                timeout: timeout
+            ))
+        case "event":
+            guard let urlStr = params["script-path"], let url = URL(string: urlStr) else {
+                return .skipped("[Script] \(name) missing script-path")
+            }
+            let eventName = params["event-name"] ?? "network-changed"
+            let timeout = params["timeout"].flatMap(TimeInterval.init) ?? 10
+            return .parsed(ModuleScript(
+                name: name,
+                kind: .event,
+                pattern: eventName,
+                scriptURL: url,
+                argument: params["argument"] ?? "",
+                timeout: timeout
+            ))
+        default:
+            return .skipped("[Script] \(name) (type=\(type.isEmpty ? "unknown" : type)) skipped")
+        }
+    }
+
+    /// Parses Surge comma-separated `key=value` attributes respecting double quotes.
+    private static func parseKeyValueList(_ input: String) -> [String: String] {
+        var result: [String: String] = [:]
+        var current = ""
+        var inQuotes = false
+        var tokens: [String] = []
+        let quote: Character = "\""
+        for ch in input {
+            if ch == quote {
+                inQuotes.toggle()
+            } else if ch == "," && !inQuotes {
+                tokens.append(current)
+                current = ""
+                continue
+            }
+            current.append(ch)
+        }
+        if !current.isEmpty { tokens.append(current) }
+        for token in tokens {
+            guard let eq = token.firstIndex(of: "=") else { continue }
+            let key = token[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+            var val = token[token.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            if val.first == quote && val.last == quote && val.count >= 2 {
+                val = String(val.dropFirst().dropLast())
+            }
+            if !key.isEmpty { result[key] = val }
+        }
+        return result
+    }
+
+    /// Normalizes Surge rule aliases (`DEST-PORT` → `DST-PORT`) before Clash rule validation.
+    private static func normalizeSurgeRule(_ line: String) -> String {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.uppercased().hasPrefix("DEST-PORT,") {
+            return "DST-PORT," + trimmed.dropFirst("DEST-PORT,".count)
+        }
+        return trimmed
+    }
 
     private static func substituteArguments(_ args: [String: String], in text: String) -> String {
         guard !args.isEmpty else { return text }
@@ -315,31 +468,9 @@ public enum ModuleParser: Sendable {
         return result
     }
 
-    private static func parseRuleLine(_ line: String) -> OverlayRule? {
-        let parts = line.split(separator: ",", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        guard let rawType = parts.first?.uppercased(), !rawType.isEmpty else { return nil }
-        if rawType == "MATCH" || rawType == "FINAL" {
-            guard parts.count >= 2, !parts[1].isEmpty else { return nil }
-            return OverlayRule(type: .matchAll, payload: "", policy: parts[1])
-        }
-        guard parts.count >= 3 else { return nil }
-        let payload = parts[1]
-        let policy = parts[2]
-        guard !payload.isEmpty, !policy.isEmpty else { return nil }
-
-        let kind: OverlayRule.Kind? = switch rawType {
-        case "DOMAIN": .domain
-        case "DOMAIN-SUFFIX": .domainSuffix
-        case "DOMAIN-KEYWORD": .domainKeyword
-        case "IP-CIDR", "IP-CIDR6": .ipCIDR
-        case "GEOIP": .geoIP
-        case "GEOSITE": .geosite
-        case "PROCESS-NAME": .processName
-        default: nil
-        }
-        guard let kind else { return nil }
-        return OverlayRule(type: kind, payload: payload, policy: policy)
+    private static func deduplicate(_ list: [String]) -> [String] {
+        var seen = Set<String>()
+        return list.filter { seen.insert($0).inserted }
     }
 
     private static func parseHostLine(_ line: String) -> (String, [String])? {
@@ -347,7 +478,6 @@ public enum ModuleParser: Sendable {
         let host = line[..<eq].trimmingCharacters(in: .whitespaces)
         let rawVal = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
         guard !host.isEmpty, !rawVal.isEmpty else { return nil }
-        // Skip Surge "server:..." DNS forwarder syntax in [Host]; keep IP/CNAME targets.
         if rawVal.lowercased().hasPrefix("server:") { return nil }
         let values = rawVal.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }

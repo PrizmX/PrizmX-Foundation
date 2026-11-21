@@ -306,7 +306,67 @@ private final class Session: @unchecked Sendable {
         context.setObject(unsafeBitCast(httpCall, to: AnyObject.self), forKeyedSubscript: "$__http" as NSString)
         context.setObject(unsafeBitCast(storeRead, to: AnyObject.self), forKeyedSubscript: "$__storeRead" as NSString)
         context.setObject(unsafeBitCast(storeWrite, to: AnyObject.self), forKeyedSubscript: "$__storeWrite" as NSString)
+        let base64Encode: @convention(block) (String?) -> String = { input in
+            Data((input ?? "").utf8).base64EncodedString()
+        }
+        let base64Decode: @convention(block) (String?) -> String = { input in
+            guard let input, let data = Data(base64Encoded: input, options: .ignoreUnknownCharacters) else {
+                return ""
+            }
+            return String(decoding: data, as: UTF8.self)
+        }
+
         context.setObject(unsafeBitCast(notifyPost, to: AnyObject.self), forKeyedSubscript: "$__notify" as NSString)
+        context.setObject(unsafeBitCast(base64Encode, to: AnyObject.self), forKeyedSubscript: "$__btoa" as NSString)
+        let prizmxRouteTest: @convention(block) (String?, Double) -> Any = { [weak self] host, rawPort in
+            guard let self,
+                  let host = host?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !host.isEmpty,
+                  let handler = self.environment.prizmx.routeTest
+            else { return NSNull() }
+            let port = rawPort.isFinite && rawPort >= 1 && rawPort <= 65535 ? Int(rawPort) : 443
+            guard let match = handler(host, port) else { return NSNull() }
+            var dict: [String: Any] = [
+                "host": match.host,
+                "port": match.port,
+                "rule": match.rule,
+                "policy": match.policy,
+            ]
+            if let resolved = match.resolvedNode {
+                dict["resolvedNode"] = resolved
+            }
+            return dict as NSDictionary
+        }
+        let prizmxPolicies: @convention(block) () -> NSArray = { [weak self] in
+            guard let self, let list = self.environment.prizmx.policies?() else { return [] }
+            return list.map { item -> NSDictionary in
+                var dict: [String: Any] = [
+                    "name": item.name,
+                    "mode": item.mode,
+                    "members": item.members,
+                ]
+                if let selected = item.selected {
+                    dict["selected"] = selected
+                }
+                return dict as NSDictionary
+            } as NSArray
+        }
+        let prizmxSelectPolicy: @convention(block) (String?, String?) -> Bool = { [weak self] group, member in
+            guard let self, let group, let member, !group.isEmpty, !member.isEmpty,
+                  let handler = self.environment.prizmx.selectPolicy
+            else { return false }
+            return handler(group, member)
+        }
+        let prizmxEgress: @convention(block) () -> NSDictionary = { [weak self] in
+            guard let self, let info = self.environment.prizmx.egress?() else { return [:] }
+            return info as NSDictionary
+        }
+
+        context.setObject(unsafeBitCast(base64Decode, to: AnyObject.self), forKeyedSubscript: "$__atob" as NSString)
+        context.setObject(unsafeBitCast(prizmxRouteTest, to: AnyObject.self), forKeyedSubscript: "$__prizmxRouteTest" as NSString)
+        context.setObject(unsafeBitCast(prizmxPolicies, to: AnyObject.self), forKeyedSubscript: "$__prizmxPolicies" as NSString)
+        context.setObject(unsafeBitCast(prizmxSelectPolicy, to: AnyObject.self), forKeyedSubscript: "$__prizmxSelectPolicy" as NSString)
+        context.setObject(unsafeBitCast(prizmxEgress, to: AnyObject.self), forKeyedSubscript: "$__prizmxEgress" as NSString)
 
         if let argument = request.argument {
             context.setObject(argument, forKeyedSubscript: "$argument" as NSString)
@@ -565,12 +625,16 @@ private final class Session: @unchecked Sendable {
       };
       globalThis.setTimeout = function (fn, ms) { return $__setTimeout(fn, Number(ms) || 0); };
       globalThis.clearTimeout = function (id) { $__clearTimeout(id); };
+      globalThis.btoa = function (s) { return $__btoa(String(s)); };
+      globalThis.atob = function (s) { return $__atob(String(s)); };
       globalThis.$httpClient = {
         get: function (opts, cb) { $__http("GET", opts, cb); },
         post: function (opts, cb) { $__http("POST", opts, cb); },
         put: function (opts, cb) { $__http("PUT", opts, cb); },
+        patch: function (opts, cb) { $__http("PATCH", opts, cb); },
         delete: function (opts, cb) { $__http("DELETE", opts, cb); },
-        head: function (opts, cb) { $__http("HEAD", opts, cb); }
+        head: function (opts, cb) { $__http("HEAD", opts, cb); },
+        options: function (opts, cb) { $__http("OPTIONS", opts, cb); }
       };
       globalThis.$persistentStore = {
         read: function (key) {
@@ -589,6 +653,45 @@ private final class Session: @unchecked Sendable {
             body === undefined || body === null ? "" : String(body)
           );
         }
+      };
+      // Quantumult X compatibility shims (non-MITM APIs).
+      globalThis.$prefs = {
+        valueForKey: function (key) { return $persistentStore.read(key); },
+        setValueForKey: function (value, key) { return $persistentStore.write(value, key); },
+        removeValueForKey: function (key) { return $persistentStore.write(null, key); }
+      };
+      globalThis.$notify = function (title, subtitle, body) {
+        $notification.post(title, subtitle, body);
+      };
+      globalThis.$task = {
+        fetch: function (req) {
+          return new Promise(function (resolve, reject) {
+            var method = (req && req.method ? String(req.method) : "GET").toUpperCase();
+            $__http(method, req, function (err, resp, body) {
+              if (err) {
+                reject({ error: String(err) });
+              } else {
+                resolve({
+                  statusCode: resp ? resp.status : 0,
+                  headers: resp ? resp.headers : {},
+                  body: body
+                });
+              }
+            });
+          });
+        }
+      };
+      // PrizmX-specific progressive extensions.
+      globalThis.$prizmx = {
+        version: ($environment && $environment.version) || "1.0",
+        routeTest: function (host, port) {
+          return $__prizmxRouteTest(String(host || ""), port === undefined ? 443 : Number(port));
+        },
+        policies: function () { return $__prizmxPolicies(); },
+        selectPolicy: function (group, member) {
+          return Boolean($__prizmxSelectPolicy(String(group || ""), String(member || "")));
+        },
+        egress: function () { return $__prizmxEgress(); }
       };
     })();
     """

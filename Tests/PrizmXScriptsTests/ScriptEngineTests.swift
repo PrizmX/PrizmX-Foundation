@@ -87,6 +87,83 @@ import PrizmXScripts
     }
 }
 
+@Test func qxCompatibilityShimsAndBase64Work() async throws {
+    let kv = InMemoryScriptPersistentStore()
+    let env = ScriptEnvironmentContext(
+        httpClient: { req in
+            ScriptHTTPResponse(status: 200, headers: ["X-OK": "1"], body: "\(req.method):\(req.url.host ?? "")")
+        },
+        persistentStore: kv
+    )
+    let engine = ScriptEngine(environment: env)
+    let result = try await engine.evaluate(ScriptRequest(
+        name: "qx-shim",
+        source: """
+        $prefs.setValueForKey(btoa("hello"), "k");
+        var decoded = atob($prefs.valueForKey("k"));
+        $notify("QX", "Sub", decoded);
+        $task.fetch({ url: "https://example.org/", method: "PATCH" }).then(function (resp) {
+          $done({ decoded: decoded, status: resp.statusCode, body: resp.body });
+        });
+        """,
+        timeout: 2
+    ))
+    #expect(result.value == .object([
+        "decoded": .string("hello"),
+        "status": .number(200),
+        "body": .string("PATCH:example.org"),
+    ]))
+    #expect(result.logs == ["[notify] QX — Sub — hello"])
+}
+
+@Test func prizmxNamespaceExposesRouteTestPoliciesAndSelection() async throws {
+    let env = ScriptEnvironmentContext(
+        version: "0.0.15",
+        prizmx: ScriptPrizmXBridge(
+            routeTest: { host, port in
+                ScriptRouteMatch(
+                    host: host,
+                    port: port,
+                    rule: "DOMAIN-SUFFIX,claude.ai,AI",
+                    policy: "AI",
+                    resolvedNode: "US-01"
+                )
+            },
+            policies: {
+                [ScriptPolicySummary(name: "AI", mode: "select", selected: "US-01", members: ["US-01", "JP-01"])]
+            },
+            selectPolicy: { group, member in
+                group == "AI" && member == "JP-01"
+            },
+            egress: {
+                ["ip": "203.0.113.10", "mode": "rule"]
+            }
+        )
+    )
+    let result = try await ScriptEngine(environment: env).evaluate(
+        source: """
+        var r = $prizmx.routeTest("api.claude.ai", 443);
+        var p = $prizmx.policies();
+        var switched = $prizmx.selectPolicy("AI", "JP-01");
+        var e = $prizmx.egress();
+        $done({
+          policy: r.policy,
+          node: r.resolvedNode,
+          groupCount: p.length,
+          switched: switched,
+          ip: e.ip
+        });
+        """
+    )
+    #expect(result.value == .object([
+        "policy": .string("AI"),
+        "node": .string("US-01"),
+        "groupCount": .number(1),
+        "switched": .bool(true),
+        "ip": .string("203.0.113.10"),
+    ]))
+}
+
 @Test func evaluatesLastExpression() async throws {
     let result = try await ScriptEngine().evaluate(source: "1 + 1")
     #expect(result.value == .number(2))

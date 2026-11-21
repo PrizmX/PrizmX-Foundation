@@ -135,6 +135,71 @@ public struct ScriptNetworkInfo: Sendable, Equatable {
     }
 }
 
+/// Result of `$prizmx.routeTest(host, port)`.
+public struct ScriptRouteMatch: Sendable, Equatable {
+    public var host: String
+    public var port: Int
+    public var rule: String
+    public var policy: String
+    public var resolvedNode: String?
+
+    public init(
+        host: String,
+        port: Int,
+        rule: String,
+        policy: String,
+        resolvedNode: String? = nil
+    ) {
+        self.host = host
+        self.port = port
+        self.rule = rule
+        self.policy = policy
+        self.resolvedNode = resolvedNode
+    }
+}
+
+/// One policy group summary returned by `$prizmx.policies()`.
+public struct ScriptPolicySummary: Sendable, Equatable {
+    public var name: String
+    public var mode: String
+    public var selected: String?
+    public var members: [String]
+
+    public init(
+        name: String,
+        mode: String,
+        selected: String? = nil,
+        members: [String] = []
+    ) {
+        self.name = name
+        self.mode = mode
+        self.selected = selected
+        self.members = members
+    }
+}
+
+/// PrizmX-specific host bridge exposed as JS `$prizmx`.
+public struct ScriptPrizmXBridge: Sendable {
+    public var routeTest: (@Sendable (_ host: String, _ port: Int) -> ScriptRouteMatch?)?
+    public var policies: (@Sendable () -> [ScriptPolicySummary])?
+    public var selectPolicy: (@Sendable (_ group: String, _ member: String) -> Bool)?
+    public var egress: (@Sendable () -> [String: String])?
+
+    public init(
+        routeTest: (@Sendable (_ host: String, _ port: Int) -> ScriptRouteMatch?)? = nil,
+        policies: (@Sendable () -> [ScriptPolicySummary])? = nil,
+        selectPolicy: (@Sendable (_ group: String, _ member: String) -> Bool)? = nil,
+        egress: (@Sendable () -> [String: String])? = nil
+    ) {
+        self.routeTest = routeTest
+        self.policies = policies
+        self.selectPolicy = selectPolicy
+        self.egress = egress
+    }
+
+    public static let empty = ScriptPrizmXBridge()
+}
+
 /// Host capabilities injected into `ScriptEngine`.
 public struct ScriptEnvironmentContext: Sendable {
     public var httpClient: ScriptHTTPHandler
@@ -142,19 +207,22 @@ public struct ScriptEnvironmentContext: Sendable {
     public var notificationHandler: ScriptNotificationHandler?
     public var network: ScriptNetworkInfo
     public var version: String
+    public var prizmx: ScriptPrizmXBridge
 
     public init(
         httpClient: @escaping ScriptHTTPHandler = ScriptEnvironmentContext.defaultHTTPClient,
         persistentStore: any ScriptPersistentStorage = InMemoryScriptPersistentStore(),
         notificationHandler: ScriptNotificationHandler? = nil,
         network: ScriptNetworkInfo = ScriptNetworkInfo(),
-        version: String = "1.0"
+        version: String = "1.0",
+        prizmx: ScriptPrizmXBridge = .empty
     ) {
         self.httpClient = httpClient
         self.persistentStore = persistentStore
         self.notificationHandler = notificationHandler
         self.network = network
         self.version = version
+        self.prizmx = prizmx
     }
 
     public static let `default` = ScriptEnvironmentContext()

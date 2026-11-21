@@ -14,6 +14,9 @@ public struct ProfileOverlay: Sendable, Hashable, Codable, Equatable {
 
     public var version: Int
     public var rules: [OverlayRule]
+    /// Raw Clash/Surge rule lines contributed by Modules (supports full
+    /// matcher syntax: no-resolve, DOMAIN-WILDCARD, DST-PORT, IP-ASN, AND/OR/NOT).
+    public var rawRules: [String]
     public var groups: [OverlayGroup]
     /// Static host overrides contributed by enabled Modules.
     public var hosts: [String: [String]]
@@ -21,31 +24,34 @@ public struct ProfileOverlay: Sendable, Hashable, Codable, Equatable {
     public var fakeIPFilters: [String]
 
     public var isEmpty: Bool {
-        rules.isEmpty && groups.isEmpty && hosts.isEmpty && fakeIPFilters.isEmpty
+        rules.isEmpty && rawRules.isEmpty && groups.isEmpty && hosts.isEmpty && fakeIPFilters.isEmpty
     }
 
     public init(
         version: Int = ProfileOverlay.currentVersion,
         rules: [OverlayRule] = [],
+        rawRules: [String] = [],
         groups: [OverlayGroup] = [],
         hosts: [String: [String]] = [:],
         fakeIPFilters: [String] = []
     ) {
         self.version = version
         self.rules = rules
+        self.rawRules = rawRules
         self.groups = groups
         self.hosts = hosts
         self.fakeIPFilters = fakeIPFilters
     }
 
     enum CodingKeys: String, CodingKey {
-        case version, rules, groups, hosts, fakeIPFilters
+        case version, rules, rawRules, groups, hosts, fakeIPFilters
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         version = try c.decodeIfPresent(Int.self, forKey: .version) ?? Self.currentVersion
         rules = try c.decodeIfPresent([OverlayRule].self, forKey: .rules) ?? []
+        rawRules = try c.decodeIfPresent([String].self, forKey: .rawRules) ?? []
         groups = try c.decodeIfPresent([OverlayGroup].self, forKey: .groups) ?? []
         hosts = try c.decodeIfPresent([String: [String]].self, forKey: .hosts) ?? [:]
         fakeIPFilters = try c.decodeIfPresent([String].self, forKey: .fakeIPFilters) ?? []
@@ -62,6 +68,7 @@ public struct ProfileOverlay: Sendable, Hashable, Codable, Equatable {
         return ProfileOverlay(
             version: max(version, other.version),
             rules: rules + other.rules,
+            rawRules: rawRules + other.rawRules,
             groups: other.groups + groups,
             hosts: mergedHosts,
             fakeIPFilters: mergedFilters
@@ -71,7 +78,10 @@ public struct ProfileOverlay: Sendable, Hashable, Codable, Equatable {
     /// Prepends overlay rules and merges overlay groups onto a parsed body.
     public func apply(to parsed: (Router, NodeManager)) throws -> (Router, NodeManager) {
         guard !isEmpty else { return parsed }
-        let compiledRules = try rules.map { try $0.compile() }
+        let parser = ClashConfigParser()
+        let compiledLocal = try rules.map { try $0.compile() }
+        let compiledRaw = rawRules.flatMap { (try? parser.parseRule($0)) ?? [] }
+        let compiledRules = compiledLocal + compiledRaw
         let nodes = Array(parsed.1.nodesByID.values)
         var groups = parsed.1.groups
         for item in self.groups {
