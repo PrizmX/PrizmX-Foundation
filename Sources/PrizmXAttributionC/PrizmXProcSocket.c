@@ -10,9 +10,14 @@
 #include <unistd.h>
 
 #include <libproc.h>
+#include <net/if.h>
 #include <netinet/in_pcb.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <stddef.h>
 #include <sys/proc_info.h>
 #include <sys/socketvar.h>
+#include <uuid/uuid.h>
 
 static const struct in_sockinfo *inet_info(const struct socket_info *soi) {
     if (soi->soi_kind == SOCKINFO_TCP) {
@@ -122,17 +127,39 @@ static int fill_pcblist_n(
     if (out == NULL || max_count <= 0) {
         return 0;
     }
+    char *buf = NULL;
     size_t len = 0;
-    if (sysctlbyname(mib, NULL, &len, NULL, 0) != 0 || len < 16) {
-        return 0;
-    }
-    char *buf = malloc(len);
-    if (buf == NULL) {
-        return 0;
-    }
-    if (sysctlbyname(mib, buf, &len, NULL, 0) != 0) {
+    // The socket table can grow between the size probe and the read (e.g. a
+    // burst of reconnects on wake). Reserve headroom and retry on ENOMEM so a
+    // transient growth does not silently drop every TCP row.
+    for (int attempt = 0; attempt < 4; attempt++) {
+        size_t probe = 0;
+        if (sysctlbyname(mib, NULL, &probe, NULL, 0) != 0 || probe < 16) {
+            return -1;
+        }
+        size_t alloc = probe + (probe >> 2) + 4096;
+        if (attempt > 0) {
+            alloc += (size_t)attempt * (probe >> 1);
+        }
+        buf = malloc(alloc);
+        if (buf == NULL) {
+            return -1;
+        }
+        size_t got = alloc;
+        if (sysctlbyname(mib, buf, &got, NULL, 0) == 0) {
+            len = got;
+            break;
+        }
+        int err = errno;
         free(buf);
-        return 0;
+        buf = NULL;
+        if (err != ENOMEM) {
+            return -1;
+        }
+    }
+    if (buf == NULL || len < 16) {
+        free(buf);
+        return -1;
     }
     uint32_t hdr_len = *(uint32_t *)(void *)buf;
     if (hdr_len < 8 || hdr_len > len) {
@@ -204,6 +231,162 @@ static int fill_pcblist_n(
     return written;
 }
 
+// Kernel ABI for `kern.skywalk.stats.flow` (XNU `bsd/skywalk/os_stats_private.h`
+// and `bsd/skywalk/nexus/os_nexus_private.h`). Network.framework (`NWConnection`
+// / modern `URLSession`) connections over utun use Skywalk user-space channels
+// (`flowsw` / `libusrtcp`) and do not appear in `net.inet.*.pcblist_n` or
+// `PROC_PIDLISTFDS` socket entries.
+#define PRIZMX_SFLOWF_DESTROYED 0x40000000u
+#define PRIZMX_SFLOWF_LINGERING 0x80000000u
+
+struct prizmx_sk_flow_key {
+    uint16_t fk_mask;
+    uint8_t fk_ipver;
+    uint8_t fk_proto;
+    uint16_t fk_sport;
+    uint16_t fk_dport;
+    uint8_t fk_src[16];
+    uint8_t fk_dst[16];
+    uint64_t fk_pad[1];
+} __attribute__((__aligned__(16)));
+
+struct prizmx_sk_flow_track {
+    uint64_t sft_bytes;
+    uint64_t sft_packets;
+    uint64_t sft_spackets;
+    uint32_t sft_state;
+    uint32_t sft_rtt;
+    uint32_t sft_seq;
+    uint16_t sft_max_win;
+    uint8_t sft_wscale;
+};
+
+struct prizmx_sk_activity_bitmap {
+    uint64_t start;
+    uint64_t bitmap[2];
+};
+
+struct prizmx_sk_stats_flow {
+    uuid_t sf_nx_uuid;
+    uuid_t sf_uuid;
+    char sf_if_name[IFNAMSIZ];
+    uint32_t sf_if_index;
+    uint32_t sf_bucket_idx;
+    pid_t sf_pid;
+    pid_t sf_epid;
+    char sf_proc_name[32];
+    char sf_eproc_name[32];
+    uint32_t sf_flags;
+    uint16_t sf_nx_port;
+    uint8_t sf_protocol;
+    uint32_t sf_svc_class;
+    uint32_t sf_adv_idx;
+    struct prizmx_sk_flow_key sf_key __attribute__((__aligned__(16)));
+    struct prizmx_sk_flow_track sf_ltrack;
+    struct prizmx_sk_flow_track sf_rtrack;
+    struct prizmx_sk_activity_bitmap sf_activity;
+};
+
+_Static_assert(sizeof(struct prizmx_sk_flow_key) == 48, "flow_key ABI mismatch");
+_Static_assert(offsetof(struct prizmx_sk_stats_flow, sf_key) == 144, "sk_stats_flow.sf_key ABI mismatch");
+_Static_assert(sizeof(struct prizmx_sk_stats_flow) == 304, "sk_stats_flow ABI mismatch");
+
+/// Best-effort append of Skywalk user-space flows (`kern.skywalk.stats.flow`,
+/// root-only). Returns 0 when unavailable (non-root EPERM, unsupported OS, or
+/// ABI size mismatch) so callers keep their BSD `pcblist_n` results intact.
+static int fill_skywalk_flows(
+    prizmx_socket_row *out,
+    int max_count,
+    pid_t skip_pid
+) {
+    if (out == NULL || max_count <= 0) {
+        return 0;
+    }
+    char *buf = NULL;
+    size_t len = 0;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        size_t probe = 0;
+        if (sysctlbyname("kern.skywalk.stats.flow", NULL, &probe, NULL, 0) != 0 || probe == 0) {
+            return 0;
+        }
+        size_t alloc = probe + (probe >> 2) + 4096;
+        if (attempt > 0) {
+            alloc += (size_t)attempt * (probe >> 1);
+        }
+        buf = malloc(alloc);
+        if (buf == NULL) {
+            return 0;
+        }
+        size_t got = alloc;
+        if (sysctlbyname("kern.skywalk.stats.flow", buf, &got, NULL, 0) == 0) {
+            len = got;
+            break;
+        }
+        int err = errno;
+        free(buf);
+        buf = NULL;
+        if (err != ENOMEM) {
+            return 0;
+        }
+    }
+    if (buf == NULL || len < sizeof(struct prizmx_sk_stats_flow)) {
+        free(buf);
+        return 0;
+    }
+    // Guard against future macOS struct size changes: only parse exact multiples.
+    if ((len % sizeof(struct prizmx_sk_stats_flow)) != 0) {
+        free(buf);
+        return 0;
+    }
+    size_t count = len / sizeof(struct prizmx_sk_stats_flow);
+    const struct prizmx_sk_stats_flow *flows = (const struct prizmx_sk_stats_flow *)(const void *)buf;
+    int written = 0;
+    for (size_t i = 0; i < count && written < max_count; i++) {
+        const struct prizmx_sk_stats_flow *f = &flows[i];
+        if ((f->sf_flags & (PRIZMX_SFLOWF_DESTROYED | PRIZMX_SFLOWF_LINGERING)) != 0) {
+            continue;
+        }
+        pid_t pid = f->sf_epid > 0 ? f->sf_epid : f->sf_pid;
+        if (pid <= 0 || pid == skip_pid) {
+            continue;
+        }
+        uint8_t proto = f->sf_key.fk_proto != 0 ? f->sf_key.fk_proto : f->sf_protocol;
+        if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
+            continue;
+        }
+        uint16_t lport = ntohs(f->sf_key.fk_sport);
+        if (lport == 0) {
+            continue;
+        }
+        uint16_t rport = ntohs(f->sf_key.fk_dport);
+        uint8_t ipver = f->sf_key.fk_ipver;
+        // XNU `flow_req2key` stores `IPVERSION` (4) for IPv4 and `IPV6_VERSION`
+        // (0x60) for IPv6 (accept literal 6 too just in case).
+        int is_v6 = (ipver == IPV6_VERSION || ipver == 6);
+        if (ipver != IPVERSION && !is_v6) {
+            continue;
+        }
+        prizmx_socket_row *row = &out[written];
+        memset(row, 0, sizeof(*row));
+        row->pid = pid;
+        row->transport = proto;
+        row->local_port = lport;
+        row->remote_port = rport;
+        if (is_v6) {
+            row->is_ipv6 = 1;
+            memcpy(row->local_addr, f->sf_key.fk_src, 16);
+            memcpy(row->remote_addr, f->sf_key.fk_dst, 16);
+        } else {
+            row->is_ipv6 = 0;
+            memcpy(row->local_addr, f->sf_key.fk_src, 4);
+            memcpy(row->remote_addr, f->sf_key.fk_dst, 4);
+        }
+        written += 1;
+    }
+    free(buf);
+    return written;
+}
+
 static int list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid, int guard_filtered) {
     if (out == NULL || max_count <= 0) {
         errno = EINVAL;
@@ -219,6 +402,11 @@ static int list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid,
         skip_pid,
         &claimed_tcp
     );
+    if (tcp < 0) {
+        // Do not mask a failed TCP read with a non-empty UDP table; return 0
+        // so callers fall back to libproc instead of caching a TCP-less view.
+        return 0;
+    }
     int udp = 0;
     if (tcp < max_count) {
         udp = fill_pcblist_n(
@@ -229,6 +417,9 @@ static int list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid,
             skip_pid,
             &claimed_udp
         );
+        if (udp < 0) {
+            return 0;
+        }
     }
     int written = tcp + udp;
     if (written >= max_count) {
@@ -240,6 +431,14 @@ static int list_pcblist_n(prizmx_socket_row *out, int max_count, pid_t skip_pid,
     // useless for attribution — report failure so callers use libproc instead.
     if (guard_filtered && claimed >= 16 && written < claimed / 4) {
         return 0;
+    }
+    // Append Skywalk user-space flows (NWConnection / channel-flow, root-only).
+    if (written < max_count) {
+        int skywalk = fill_skywalk_flows(out + written, max_count - written, skip_pid);
+        written += skywalk;
+        if (written >= max_count) {
+            return max_count;
+        }
     }
     return written;
 }

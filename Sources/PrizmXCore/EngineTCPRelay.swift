@@ -29,11 +29,15 @@ public protocol InboundStream: Sendable {
     /// keeps delivering its remaining upload. Only called when
     /// `supportsHalfClose` is true.
     func closeWrite() async
+    /// True when the inbound stream was already reset/aborted with no
+    /// buffered client data left to relay.
+    var isAborted: Bool { get }
     var supportsHalfClose: Bool { get }
 }
 
 extension InboundStream {
     public func closeWrite() async { await close() }
+    public var isAborted: Bool { false }
     public var supportsHalfClose: Bool { false }
     public var clientAddress: String { "" }
     public var clientPort: UInt16 { 0 }
@@ -47,6 +51,13 @@ extension InboundStream {
 /// Packet Tunnel (SwiftTCP) and mixed-port paths.
 public enum EngineTCPRelay: Sendable {
     public static func pipe(stream: some InboundStream, engine: Engine) async {
+        // A stream already aborted before relay starts (e.g. client RST or
+        // wake resetFlows while queued) has no live socket to attribute and
+        // no bytes to forward: skip dialing and do not pollute Inspector.
+        if stream.isAborted {
+            await stream.close()
+            return
+        }
         // Before sniffing: the client socket is surely still open now, while
         // a sniff can wait for its first bytes (or the budget) and a client
         // that gives up meanwhile leaves no socket to match.
@@ -84,29 +95,57 @@ public enum EngineTCPRelay: Sendable {
             await stream.close()
             return
         }
+        if attribution == nil, stream.isTunnelInbound, let remote = stream.socketRemote {
+            TunnelLog.write(
+                .debug,
+                "attribution miss tcp \(stream.clientAddress):\(stream.clientPort) -> \(remote.address):\(remote.port) (\(stream.endpoint))"
+            )
+        }
         // A mixed-port client the local table cannot see (a root / system
-        // account process, from the app) gets a later lookup.
-        let lateQuery: (clientPort: UInt16, listenPort: UInt16)?
+        // account process, from the app) gets a later lookup. Start it now so
+        // the XPC read runs in parallel with sniffing / DNS / outbound open,
+        // before a short-lived or failing flow closes its client socket.
+        let lateResult = OSAllocatedUnfairLock<FlowAttribution?>(initialState: nil)
+        let lateTask: Task<FlowAttribution?, Never>?
         if attribution == nil, isLocalClient, !stream.isTunnelInbound,
-           stream.clientPort > 0, let listenPort = stream.listenPort {
-            lateQuery = (stream.clientPort, listenPort)
+           stream.clientPort > 0, let listenPort = stream.listenPort,
+           let attributor = engine.flowAttributor {
+            let clientPort = stream.clientPort
+            lateTask = Task {
+                let resolved = await attributor.attributeLate(
+                    transport: .tcp,
+                    localPort: clientPort,
+                    remotePort: listenPort,
+                    since: lookedUpAt
+                )
+                if let resolved {
+                    lateResult.withLock { $0 = resolved }
+                }
+                return resolved
+            }
         } else {
-            lateQuery = nil
+            lateTask = nil
         }
         let prepared = await Self.prepare(stream: stream)
         let inbound = prepared.stream
+        if inbound.isAborted {
+            lateTask?.cancel()
+            await inbound.close()
+            return
+        }
         let target = prepared.endpoint
         let outbound: any OutboundConnection
         let rule: String
         let policy: String
         do {
+            let resolvedApp = attribution ?? lateResult.withLock { $0 }
             let context = RouteContext(
                 network: .tcp,
                 sourceHost: Self.sourceHost(inbound.clientAddress),
                 sourcePort: inbound.clientPort == 0 ? nil : inbound.clientPort,
                 inboundPort: inbound.listenPort,
-                processName: attribution?.processName,
-                processPath: attribution?.executablePath,
+                processName: resolvedApp?.processName,
+                processPath: resolvedApp?.executablePath,
                 destinationAddress: prepared.dialedAddress
             )
             let dispatched = try await engine.resolveAndDispatch(
@@ -121,6 +160,7 @@ public enum EngineTCPRelay: Sendable {
                 try await outbound.open()
             }
         } catch {
+            lateTask?.cancel()
             TunnelLog.write(.error, "open \(target) failed: \(error.localizedDescription)")
             await inbound.close()
             return
@@ -131,6 +171,23 @@ public enum EngineTCPRelay: Sendable {
         let flowID = UUID()
         let startedAt = Date()
         let sourceHost = inbound.clientAddress.isEmpty ? nil : inbound.clientAddress
+        // If a TUN flow missed attribution at entry (e.g. during the ~150ms
+        // window right after utun / Skywalk flowswitch attaches on start or
+        // wake), re-check once now that outbound setup has elapsed.
+        let retriedTUNAttribution: FlowAttribution?
+        if attribution == nil, stream.isTunnelInbound, let attributor = engine.flowAttributor {
+            let remote = stream.socketRemote
+            retriedTUNAttribution = attributor.attributeFresh(
+                transport: .tcp,
+                localAddress: stream.clientAddress,
+                localPort: stream.clientPort,
+                remoteAddress: remote?.address ?? "",
+                remotePort: remote?.port ?? stream.listenPort ?? stream.endpoint.port
+            )
+        } else {
+            retriedTUNAttribution = nil
+        }
+        let initialAttribution = attribution ?? retriedTUNAttribution ?? lateResult.withLock { $0 }
         engine.traffic.flowDidBegin(
             FlowRecord(
                 id: flowID,
@@ -139,27 +196,40 @@ public enum EngineTCPRelay: Sendable {
                 route: route,
                 closed: false,
                 rule: rule,
-                attribution: attribution,
+                attribution: initialAttribution,
                 sourceHost: sourceHost
             )
         )
         TunnelLog.write(
             .debug,
-            "flow opened \(target) via \(route)\(attribution.map { " app=\($0.accountingKey)" } ?? "")"
+            "flow opened \(target) via \(route)\(initialAttribution.map { " app=\($0.accountingKey)" } ?? "")"
         )
         // Read per chunk, so bytes after a late attribution count for the app.
-        let app = OSAllocatedUnfairLock(initialState: attribution)
-        if let lateQuery, let attributor = engine.flowAttributor {
+        let app = OSAllocatedUnfairLock(initialState: initialAttribution)
+        if initialAttribution == nil, let lateTask {
             Task {
-                guard let late = await attributor.attributeLate(
-                    transport: .tcp,
-                    localPort: lateQuery.clientPort,
-                    remotePort: lateQuery.listenPort,
-                    since: lookedUpAt
-                ) else { return }
+                guard let late = await lateTask.value else { return }
                 engine.traffic.flowDidAttribute(id: flowID, late)
                 app.withLock { $0 = late }
                 TunnelLog.write(.debug, "flow attributed late \(target) app=\(late.accountingKey)")
+            }
+        } else if initialAttribution == nil, stream.isTunnelInbound, let attributor = engine.flowAttributor {
+            let clientAddress = stream.clientAddress
+            let clientPort = stream.clientPort
+            let remoteAddress = stream.socketRemote?.address ?? ""
+            let remotePort = stream.socketRemote?.port ?? stream.listenPort ?? stream.endpoint.port
+            Task {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard let late = attributor.attributeFresh(
+                    transport: .tcp,
+                    localAddress: clientAddress,
+                    localPort: clientPort,
+                    remoteAddress: remoteAddress,
+                    remotePort: remotePort
+                ) else { return }
+                engine.traffic.flowDidAttribute(id: flowID, late)
+                app.withLock { $0 = late }
+                TunnelLog.write(.debug, "flow attributed late (tun) \(target) app=\(late.accountingKey)")
             }
         }
         let started = ContinuousClock.now
@@ -418,6 +488,7 @@ final class PrefixedInboundStream: InboundStream, @unchecked Sendable {
     var isTunnelInbound: Bool { inner.isTunnelInbound }
     var listenPort: UInt16? { inner.listenPort }
     var socketRemote: (address: String, port: UInt16)? { inner.socketRemote }
+    var isAborted: Bool { buffered.withLock { $0.prefix.isEmpty } && inner.isAborted }
     var supportsHalfClose: Bool { inner.supportsHalfClose }
     private let inner: any InboundStream
     private struct Buffered {

@@ -65,7 +65,8 @@ public enum AttributionProbe {
             "net.inet.tcp.pcblist",
             "net.inet.tcp.pcblist_n",
             "net.inet.udp.pcblist",
-            "net.inet.udp.pcblist_n"
+            "net.inet.udp.pcblist_n",
+            "kern.skywalk.stats.flow"
         ]
         let samples = names.map { name -> AttributionProbeReport.SysctlSample in
             var errnoValue: Int32 = 0

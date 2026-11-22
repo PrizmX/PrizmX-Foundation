@@ -63,6 +63,11 @@ public final class TUNTCPStream: InboundStream, @unchecked Sendable {
     /// Half-close: FIN toward the app; its remaining upload is still read.
     public var supportsHalfClose: Bool { true }
 
+    /// True once the flow was reset before delivering any buffered data.
+    public var isAborted: Bool {
+        lock.withLock { reset && buffer.isEmpty }
+    }
+
     public func closeWrite() async {
         await sendFIN()
     }

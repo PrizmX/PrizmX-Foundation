@@ -87,6 +87,70 @@ private let cloudd = FlowAttribution(pid: 745, processName: "cloudd")
     #expect(attributor.queries.withLock { $0 } == [LateOnlyAttributor.Query(clientPort: 50_000, listenPort: 7_890)])
 }
 
+@Test func relayStartsLateAttributionDuringSniffBeforeOutboundOpens() async throws {
+    let server = try ClosingServer()
+    defer { server.stop() }
+    let attributor = LateOnlyAttributor()
+    let engine = Engine(
+        router: Router(rules: [RouteRule(.matchAll, policy: .direct)], default: .direct),
+        nodeManager: NodeManager(nodes: [], groups: []),
+        flowAttributor: attributor
+    )
+    let sawLateDuringRead = OSAllocatedUnfairLock(initialState: false)
+    let stream = SlowSniffLoopbackStream(
+        endpoint: Endpoint(host: .ipv4(IPv4Address(127, 0, 0, 1)), port: server.port)
+    ) {
+        // Poll briefly while sniff holds `read()`: late attribution should
+        // already be in flight before `prepare` returns or `outbound.open()` runs.
+        for _ in 0..<50 {
+            if !attributor.queries.withLock({ $0 }).isEmpty {
+                sawLateDuringRead.withLock { $0 = true }
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    await EngineTCPRelay.pipe(stream: stream, engine: engine)
+    #expect(sawLateDuringRead.withLock { $0 })
+    #expect(engine.traffic.snapshot().recentFlows.first?.attribution == cloudd)
+}
+
+@Test func relaySkipsAbortedStreamWithoutRecordingAFailedFlow() async throws {
+    let server = try ClosingServer()
+    defer { server.stop() }
+    let engine = Engine(
+        router: Router(rules: [RouteRule(.matchAll, policy: .direct)], default: .direct),
+        nodeManager: NodeManager(nodes: [], groups: [])
+    )
+    let closed = OSAllocatedUnfairLock(initialState: false)
+    let stream = AbortedInboundStream(
+        endpoint: Endpoint(domain: "push.apple.com", port: 5223),
+        onClose: { closed.withLock { $0 = true } }
+    )
+    await EngineTCPRelay.pipe(stream: stream, engine: engine)
+    #expect(closed.withLock { $0 })
+    let snapshot = engine.traffic.snapshot()
+    #expect(snapshot.activeFlows.isEmpty)
+    #expect(snapshot.recentFlows.isEmpty)
+}
+
+@Test func relayRetriesTUNAttributionAfterOutboundOpens() async throws {
+    let server = try ClosingServer()
+    defer { server.stop() }
+    let attributor = SecondTryAttributor()
+    let engine = Engine(
+        router: Router(rules: [RouteRule(.matchAll, policy: .direct)], default: .direct),
+        nodeManager: NodeManager(nodes: [], groups: []),
+        flowAttributor: attributor
+    )
+    let stream = TUNClientStream(
+        endpoint: Endpoint(host: .ipv4(IPv4Address(127, 0, 0, 1)), port: server.port)
+    )
+    await EngineTCPRelay.pipe(stream: stream, engine: engine)
+    #expect(engine.traffic.snapshot().recentFlows.first?.attribution == cloudd)
+    #expect(attributor.attempts.withLock { $0 } >= 2)
+}
+
 /// Nothing locally (a root client, as the app sees it); the
 /// tunnel's view answers.
 private final class LateOnlyAttributor: FlowAttributing, Sendable {
@@ -124,6 +188,78 @@ private final class LoopbackClientStream: InboundStream, @unchecked Sendable {
     var clientAddress: String { "127.0.0.1" }
     var clientPort: UInt16 { 50_000 }
     var listenPort: UInt16? { 7_890 }
+
+    init(endpoint: Endpoint) {
+        self.endpoint = endpoint
+    }
+
+    func read() async throws -> Data? { nil }
+    func write(_ data: Data) async throws {}
+    func close() async {}
+}
+
+private final class SlowSniffLoopbackStream: InboundStream, @unchecked Sendable {
+    let endpoint: Endpoint
+    var clientAddress: String { "127.0.0.1" }
+    var clientPort: UInt16 { 50_001 }
+    var listenPort: UInt16? { 7_890 }
+    private let onRead: @Sendable () async -> Void
+
+    init(endpoint: Endpoint, onRead: @escaping @Sendable () async -> Void) {
+        self.endpoint = endpoint
+        self.onRead = onRead
+    }
+
+    func read() async throws -> Data? {
+        await onRead()
+        return nil
+    }
+    func write(_ data: Data) async throws {}
+    func close() async {}
+}
+
+private final class AbortedInboundStream: InboundStream, @unchecked Sendable {
+    let endpoint: Endpoint
+    var clientAddress: String { "198.18.0.1" }
+    var clientPort: UInt16 { 50_002 }
+    var isTunnelInbound: Bool { true }
+    var isAborted: Bool { true }
+    private let onClose: @Sendable () -> Void
+
+    init(endpoint: Endpoint, onClose: @escaping @Sendable () -> Void) {
+        self.endpoint = endpoint
+        self.onClose = onClose
+    }
+
+    func read() async throws -> Data? { nil }
+    func write(_ data: Data) async throws {}
+    func close() async { onClose() }
+}
+
+private final class SecondTryAttributor: FlowAttributing, Sendable {
+    let attempts = OSAllocatedUnfairLock(initialState: 0)
+
+    func attribute(
+        transport: FlowTransport,
+        localAddress: String,
+        localPort: UInt16,
+        remoteAddress: String,
+        remotePort: UInt16
+    ) -> FlowAttribution? {
+        let n = attempts.withLock { count -> Int in
+            count += 1
+            return count
+        }
+        return n >= 2 ? cloudd : nil
+    }
+}
+
+private final class TUNClientStream: InboundStream, @unchecked Sendable {
+    let endpoint: Endpoint
+    var clientAddress: String { "198.18.0.1" }
+    var clientPort: UInt16 { 50_080 }
+    var isTunnelInbound: Bool { true }
+    var socketRemote: (address: String, port: UInt16)? { ("127.0.0.1", endpoint.port) }
 
     init(endpoint: Endpoint) {
         self.endpoint = endpoint

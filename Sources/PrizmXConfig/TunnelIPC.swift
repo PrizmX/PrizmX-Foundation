@@ -12,6 +12,7 @@ public enum TunnelIPC: Sendable {
 
     public enum Method: String, Sendable, Codable {
         case fetchMetrics
+        case fetchProxyClients
         case selectNode
         case setOutboundMode
         case setCaptureMode
@@ -61,22 +62,28 @@ public enum TunnelIPC: Sendable {
         public var version: Int
         public var ok: Bool
         public var metrics: TrafficSnapshot?
+        public var proxyClients: [LoopbackClient]?
         public var error: String?
 
         public init(
             ok: Bool,
             metrics: TrafficSnapshot? = nil,
+            proxyClients: [LoopbackClient]? = nil,
             error: String? = nil,
             version: Int = TunnelIPC.protocolVersion
         ) {
             self.version = version
             self.ok = ok
             self.metrics = metrics
+            self.proxyClients = proxyClients
             self.error = error
         }
 
-        public static func success(metrics: TrafficSnapshot? = nil) -> Response {
-            Response(ok: true, metrics: metrics)
+        public static func success(
+            metrics: TrafficSnapshot? = nil,
+            proxyClients: [LoopbackClient]? = nil
+        ) -> Response {
+            Response(ok: true, metrics: metrics, proxyClients: proxyClients)
         }
 
         public static func failure(_ message: String) -> Response {
@@ -114,6 +121,17 @@ public enum TunnelIPC: Sendable {
         }
         if response.ok {
             return TrafficSnapshot()
+        }
+        throw TunnelIPCError.ipcFailed(response.error ?? "provider error")
+    }
+
+    public static func proxyClients(from data: Data?) throws -> [LoopbackClient] {
+        let response = try decodeResponse(from: data)
+        if let proxyClients = response.proxyClients {
+            return proxyClients
+        }
+        if response.ok {
+            return []
         }
         throw TunnelIPCError.ipcFailed(response.error ?? "provider error")
     }
